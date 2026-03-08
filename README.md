@@ -1,6 +1,6 @@
 # ai-hist
 
-Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), and [Relaycast](https://relaycast.dev) conversation history into a local SQLite database with full-text search.
+Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), and [Agent Relay](https://github.com/AgentWorkforce/relay) conversation history into a local SQLite database with full-text search.
 
 **Zero dependencies** — Python 3.8+ standard library only. Single file.
 
@@ -94,11 +94,11 @@ ai-hist supports three sources:
 |--------|-----|------------|
 | Claude Code | Local JSONL (`~/.claude/history.jsonl`) | `display`, `timestamp`, `project`, `sessionId` |
 | Codex CLI | Local JSONL (`~/.codex/history.jsonl`) | `text`, `ts`, `session_id` |
-| Relaycast | API (`https://api.relaycast.dev/v1`) | `sender`, `content`, `channel`, `timestamp` |
+| [Agent Relay](https://github.com/AgentWorkforce/relay) | API (`https://api.relaycast.dev/v1`) | `sender`, `content`, `channel`, `timestamp` |
 
 **Claude Code & Codex** are synced from local JSONL files incrementally (byte-offset tracking in `.sync-state.json`).
 
-**Relaycast** is synced via the [Relaycast API](https://relaycast.dev), pulling workspace messages with cursor-based pagination. Configure with:
+**Agent Relay** is synced via the [Relaycast API](https://github.com/AgentWorkforce/relay), pulling workspace messages with cursor-based pagination. Configure with:
 
 ```bash
 export RELAYCAST_API_KEY="rk_live_..."
