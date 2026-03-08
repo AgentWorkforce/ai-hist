@@ -530,6 +530,31 @@ class TestCmdShow:
         assert "Session:   sess-abc" in captured.out
         assert "Project:   /proj/x" in captured.out
         assert "full prompt text here\nwith newlines" in captured.out
+        # Resume hint
+        assert "claude --resume sess-abc" in captured.out
+        assert "cd /proj/x" in captured.out
+        # Context hint
+        assert "ai-hist context 1" in captured.out
+
+    def test_show_claude_session_count(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("first", 1700000001000, "/proj", "sess-cnt"),
+            make_claude_entry("second", 1700000002000, "/proj", "sess-cnt"),
+        ])
+        capsys.readouterr()
+        args = SimpleNamespace(id=1)
+        ai_hist.cmd_show(args)
+        captured = capsys.readouterr()
+        assert "Session has 2 entries" in captured.out
+        assert "ai-hist session sess-cnt" in captured.out
+
+    def test_show_codex_resume_hint(self, tmp_env, capsys):
+        seed_db(tmp_env, codex_lines=[make_codex_entry("codex prompt", 1700000001, "cx-sess")])
+        capsys.readouterr()
+        args = SimpleNamespace(id=1)
+        ai_hist.cmd_show(args)
+        captured = capsys.readouterr()
+        assert "codex --resume cx-sess" in captured.out
 
     def test_show_nonexistent_entry(self, tmp_env, capsys):
         seed_db(tmp_env)
@@ -540,7 +565,6 @@ class TestCmdShow:
         assert "No entry with id 999" in captured.out
 
     def test_show_entry_without_session_or_project(self, tmp_env, capsys):
-        # Use a codex entry with no session_id to test (none) display
         tmp_env.codex_hist.write_text(
             json.dumps({"text": "nosession", "ts": 1700000001}) + "\n"
         )
@@ -551,6 +575,92 @@ class TestCmdShow:
         captured = capsys.readouterr()
         assert "Session:   (none)" in captured.out
         assert "Project:   (none)" in captured.out
+        assert "ai-hist context 1" in captured.out
+        # No resume hint when no session
+        assert "resume" not in captured.out.lower().split("context")[0]
+
+
+class TestCmdContext:
+    def test_context_same_session(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("before", 1700000001000, "/proj", "sess-ctx"),
+            make_claude_entry("target", 1700000002000, "/proj", "sess-ctx"),
+            make_claude_entry("after", 1700000003000, "/proj", "sess-ctx"),
+            make_claude_entry("other session", 1700000002500, "/proj", "sess-other"),
+        ])
+        capsys.readouterr()
+        args = SimpleNamespace(id=2, window=5)
+        ai_hist.cmd_context(args)
+        captured = capsys.readouterr()
+        assert "sess-ctx" in captured.out
+        assert "3 entries" in captured.out
+        assert "before" in captured.out
+        assert "target" in captured.out
+        assert "after" in captured.out
+        # Current entry marked with >>>
+        assert ">>>" in captured.out
+
+    def test_context_nearby_other_sessions(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("mine", 1700000001000, "/proj", "sess-a"),
+            make_claude_entry("nearby", 1700000002000, "/proj", "sess-b"),
+        ])
+        capsys.readouterr()
+        args = SimpleNamespace(id=1, window=5)
+        ai_hist.cmd_context(args)
+        captured = capsys.readouterr()
+        assert "Nearby" in captured.out
+        assert "nearby" in captured.out
+
+    def test_context_nonexistent(self, tmp_env, capsys):
+        seed_db(tmp_env)
+        capsys.readouterr()
+        args = SimpleNamespace(id=999, window=5)
+        ai_hist.cmd_context(args)
+        captured = capsys.readouterr()
+        assert "No entry with id 999" in captured.out
+
+    def test_context_no_session(self, tmp_env, capsys):
+        tmp_env.codex_hist.write_text(
+            json.dumps({"text": "lone wolf", "ts": 1700000001}) + "\n"
+        )
+        ai_hist.cmd_sync()
+        capsys.readouterr()
+        args = SimpleNamespace(id=1, window=5)
+        ai_hist.cmd_context(args)
+        captured = capsys.readouterr()
+        # No session section, but no crash
+        assert "Session" not in captured.out or "Nearby" in captured.out
+
+    def test_context_custom_window(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("target", 1700000001000, "/proj", "sess-w"),
+            make_claude_entry("far away", 1700000601000, "/proj", "sess-other"),  # 10 min later
+        ])
+        capsys.readouterr()
+        # 5 min window — should NOT include the far entry
+        args = SimpleNamespace(id=1, window=5)
+        ai_hist.cmd_context(args)
+        captured = capsys.readouterr()
+        assert "far away" not in captured.out
+        capsys.readouterr()
+        # 15 min window — should include it
+        args = SimpleNamespace(id=1, window=15)
+        ai_hist.cmd_context(args)
+        captured = capsys.readouterr()
+        assert "far away" in captured.out
+
+    def test_context_no_nearby(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("alone", 1700000001000, "/proj", "sess-alone"),
+        ])
+        capsys.readouterr()
+        args = SimpleNamespace(id=1, window=5)
+        ai_hist.cmd_context(args)
+        captured = capsys.readouterr()
+        # Session shown, no nearby section
+        assert "sess-alone" in captured.out
+        assert "Nearby" not in captured.out
 
 
 class TestCmdSession:
@@ -778,6 +888,26 @@ class TestMain:
             ai_hist.main()
         captured = capsys.readouterr()
         assert "filtered" in captured.out
+
+    def test_context_command(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("ctx target", 1700000001000, "/proj", "sess-c"),
+        ])
+        capsys.readouterr()
+        with patch("sys.argv", ["ai-hist", "context", "1"]):
+            ai_hist.main()
+        captured = capsys.readouterr()
+        assert "ctx target" in captured.out
+
+    def test_context_command_with_window(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("target", 1700000001000, "/proj", "sess-w"),
+        ])
+        capsys.readouterr()
+        with patch("sys.argv", ["ai-hist", "context", "1", "--window", "10"]):
+            ai_hist.main()
+        captured = capsys.readouterr()
+        assert "target" in captured.out
 
 
 # ---------------------------------------------------------------------------

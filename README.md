@@ -40,18 +40,32 @@ ai-hist recent                             # last 20
 ai-hist recent 50                          # last 50
 ai-hist recent --source claude --project my-app
 
-# Drill into a specific entry (shows full prompt + metadata)
+# Drill into a specific entry (shows full prompt + metadata + resume command)
 ai-hist show 4521
+
+# See surrounding context (same session + nearby entries)
+ai-hist context 4521
+ai-hist context 4521 --window 15   # ±15 min window (default: 5)
 
 # View all prompts in a session
 ai-hist session abc-1234-def
 ai-hist session abc-1234-def --full   # no truncation
 
+# Resume a conversation directly
+cd /path/to/project && claude --resume <session_id>   # shown by `show`
+
 # Stats overview
 ai-hist stats
 ```
 
-Search results include entry IDs (`#NNN`) you can pass to `show` or use to find the `session_id` for `session`.
+Search results include entry IDs (`#NNN`) — use them to drill deeper:
+
+```
+ai-hist search "deploy" → find #4521
+ai-hist show 4521       → see full prompt, session info, resume command
+ai-hist context 4521    → see what else was happening in that session + nearby
+ai-hist session <id>    → browse the full conversation
+```
 
 Example output from `ai-hist stats`:
 

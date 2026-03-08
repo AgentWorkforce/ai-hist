@@ -234,8 +234,8 @@ def cmd_show(args):
         "FROM history WHERE id = ?",
         (args.id,),
     ).fetchone()
-    conn.close()
     if not row:
+        conn.close()
         print(f"No entry with id {args.id}")
         return
     id_, source, session_id, project, prompt, ts_ms = row
@@ -248,6 +248,67 @@ def cmd_show(args):
     print(f"  Prompt:")
     print()
     print(prompt)
+
+    # Hints
+    print()
+    if session_id:
+        session_count = conn.execute(
+            "SELECT COUNT(*) FROM history WHERE session_id = ?", (session_id,)
+        ).fetchone()[0]
+        print(f"  Session has {session_count} entries: ai-hist session {session_id}")
+        if source == "claude" and project:
+            print(f"  Resume:  cd {project} && claude --resume {session_id}")
+        elif source == "codex" and session_id:
+            print(f"  Resume:  codex --resume {session_id}")
+    print(f"  Context: ai-hist context {id_}")
+    conn.close()
+
+
+def cmd_context(args):
+    """Show entries around a given ID: same session + nearby in time."""
+    conn = sqlite3.connect(str(DB_PATH))
+    row = conn.execute(
+        "SELECT id, source, session_id, project, timestamp_ms "
+        "FROM history WHERE id = ?",
+        (args.id,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        print(f"No entry with id {args.id}")
+        return
+    id_, source, session_id, project, ts_ms = row
+
+    # Same session
+    if session_id:
+        session_rows = conn.execute(
+            "SELECT id, source, project, prompt, timestamp_ms "
+            "FROM history WHERE session_id = ? ORDER BY timestamp_ms ASC",
+            (session_id,),
+        ).fetchall()
+        if session_rows:
+            print(f"  === Session {session_id} ({len(session_rows)} entries) ===\n")
+            for r in session_rows:
+                marker = " >>>" if r[0] == id_ else "    "
+                print(f"{marker}{fmt_row(*r)}")
+            print()
+
+    # Nearby in time (±5 min), excluding same session
+    window_ms = args.window * 60 * 1000
+    nearby_sql = (
+        "SELECT id, source, project, prompt, timestamp_ms "
+        "FROM history WHERE timestamp_ms BETWEEN ? AND ? "
+        "AND (session_id IS NULL OR session_id != ?) "
+        "ORDER BY timestamp_ms ASC"
+    )
+    nearby_rows = conn.execute(
+        nearby_sql, (ts_ms - window_ms, ts_ms + window_ms, session_id or "")
+    ).fetchall()
+    if nearby_rows:
+        print(f"  === Nearby ({args.window}min window, other sessions) ===\n")
+        for r in nearby_rows:
+            print(f"    {fmt_row(*r)}")
+
+    conn.close()
 
 
 def cmd_session(args):
@@ -334,6 +395,10 @@ def main():
     se.add_argument("session_id", help="Session ID")
     se.add_argument("--full", action="store_true", help="Show full prompt text (no truncation)")
 
+    cx = sub.add_parser("context", help="Show entries around an ID (same session + nearby)")
+    cx.add_argument("id", type=int, help="Entry ID to get context for")
+    cx.add_argument("--window", type=int, default=5, help="Time window in minutes (default: 5)")
+
     sub.add_parser("stats", help="Show summary statistics")
 
     w = sub.add_parser("watch", help="Continuous sync loop")
@@ -342,7 +407,8 @@ def main():
     args = p.parse_args()
     cmds = {
         "sync": cmd_sync, "search": cmd_search, "recent": cmd_recent,
-        "show": cmd_show, "session": cmd_session, "stats": cmd_stats, "watch": cmd_watch,
+        "show": cmd_show, "session": cmd_session, "context": cmd_context,
+        "stats": cmd_stats, "watch": cmd_watch,
     }
 
     if args.command in cmds:
