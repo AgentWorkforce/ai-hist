@@ -12,6 +12,8 @@ import os
 import sqlite3
 import sys
 import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 # --- Configuration -----------------------------------------------------------
@@ -82,6 +84,172 @@ PARSERS = {
     "claude": parse_claude,
     "codex": parse_codex,
 }
+
+# --- Relaycast API -----------------------------------------------------------
+
+RELAYCAST_BASE = os.environ.get("RELAYCAST_BASE_URL", "https://api.relaycast.dev")
+RELAYCAST_API_KEY = os.environ.get("RELAYCAST_API_KEY", "")
+RELAYCAST_WORKSPACE_ID = os.environ.get("RELAYCAST_WORKSPACE_ID", "")
+
+
+def relaycast_get(path: str, params: dict = None) -> dict:  # pragma: no cover
+    """Make a GET request to the Relaycast API."""
+    url = f"{RELAYCAST_BASE}/v1/{path}"
+    if params:
+        qs = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
+        if qs:
+            url += f"?{qs}"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {RELAYCAST_API_KEY}",
+        "Accept": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+def sync_relaycast(conn: sqlite3.Connection, state: dict):
+    """Sync messages from Relaycast API into the history table."""
+    if not RELAYCAST_API_KEY or not RELAYCAST_WORKSPACE_ID:
+        return
+
+    relay_state = state.get("relay", {})
+    inserted = 0
+    errors = 0
+
+    try:
+        # Sync channel messages
+        resp = relaycast_get("channels")
+        channels = resp.get("data", []) if resp.get("ok") else []
+
+        for ch in channels:
+            ch_name = ch.get("name", "")
+            last_id = relay_state.get(f"ch:{ch_name}")
+            params = {"limit": "100"}
+            if last_id:
+                params["after"] = last_id
+
+            max_id = last_id
+            while True:
+                resp = relaycast_get(f"channels/{ch_name}/messages", params)
+                messages = resp.get("data", []) if resp.get("ok") else []
+                if not messages:
+                    break
+                for msg in messages:
+                    row = _relay_msg_to_row(msg, f"#{ch_name}")
+                    if row:
+                        try:
+                            cur = conn.execute(
+                                "INSERT OR IGNORE INTO history "
+                                "(source, session_id, project, prompt, timestamp_ms) "
+                                "VALUES (:source, :session_id, :project, :prompt, :timestamp_ms)",
+                                row,
+                            )
+                            if cur.rowcount > 0:
+                                inserted += 1
+                        except sqlite3.Error:
+                            errors += 1
+                    mid = msg.get("id", "")
+                    if mid and (not max_id or mid > max_id):
+                        max_id = mid
+                # If we got fewer than limit, we're done
+                if len(messages) < 100:
+                    break
+                params["after"] = messages[-1].get("id", "")
+
+            if max_id:
+                relay_state[f"ch:{ch_name}"] = max_id
+
+        # Sync DM conversations
+        try:
+            resp = relaycast_get("dm/conversations/all")
+            conversations = resp.get("data", []) if resp.get("ok") else []
+        except urllib.error.HTTPError:
+            conversations = []
+
+        for conv in conversations:
+            conv_id = conv.get("id", "")
+            if not conv_id:
+                continue
+            last_id = relay_state.get(f"dm:{conv_id}")
+            params = {"limit": "100"}
+            if last_id:
+                params["after"] = last_id
+
+            max_id = last_id
+            while True:
+                resp = relaycast_get(f"dm/conversations/{conv_id}/messages", params)
+                messages = resp.get("data", []) if resp.get("ok") else []
+                if not messages:
+                    break
+                for msg in messages:
+                    row = _relay_msg_to_row(msg, f"dm:{conv_id}")
+                    if row:
+                        try:
+                            cur = conn.execute(
+                                "INSERT OR IGNORE INTO history "
+                                "(source, session_id, project, prompt, timestamp_ms) "
+                                "VALUES (:source, :session_id, :project, :prompt, :timestamp_ms)",
+                                row,
+                            )
+                            if cur.rowcount > 0:
+                                inserted += 1
+                        except sqlite3.Error:
+                            errors += 1
+                    mid = msg.get("id", "")
+                    if mid and (not max_id or mid > max_id):
+                        max_id = mid
+                if len(messages) < 100:
+                    break
+                params["after"] = messages[-1].get("id", "")
+
+            if max_id:
+                relay_state[f"dm:{conv_id}"] = max_id
+
+        conn.commit()
+        state["relay"] = relay_state
+        print(f"  [relay] +{inserted:,} rows" + (f" ({errors} errors)" if errors else ""))
+
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+        print(f"  [relay] API error: {e}")
+    except Exception as e:
+        print(f"  [relay] error: {e}")
+
+
+def _relay_msg_to_row(msg: dict, channel: str):
+    """Convert a Relaycast message to a history row."""
+    text = msg.get("text", "")
+    if not text:
+        return None
+    sender = msg.get("from_name") or msg.get("from_id") or ""
+    created_at = msg.get("created_at", "")
+    # Parse ISO timestamp to ms
+    ts_ms = _iso_to_ms(created_at) if created_at else 0
+    # Prefix with sender for searchability
+    prompt = f"[{sender}] {text}" if sender else text
+    return {
+        "source": "relay",
+        "session_id": msg.get("thread_id") or channel,
+        "project": RELAYCAST_WORKSPACE_ID,
+        "prompt": prompt,
+        "timestamp_ms": ts_ms,
+    }
+
+
+def _iso_to_ms(iso_str: str) -> int:
+    """Parse ISO 8601 datetime string to milliseconds since epoch."""
+    # Handle common formats: 2026-03-07T20:13:00.000Z or 2026-03-07T20:13:00Z
+    iso_str = iso_str.rstrip("Z").split("+")[0]
+    frac = 0
+    if "." in iso_str:
+        base, frac_str = iso_str.rsplit(".", 1)
+        frac = int(frac_str.ljust(3, "0")[:3])
+        iso_str = base
+    try:
+        t = time.strptime(iso_str, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return 0
+    return int(time.mktime(t)) * 1000 + frac
+
 
 # --- Core --------------------------------------------------------------------
 
@@ -166,6 +334,9 @@ def cmd_sync(args=None):
         conn.commit()
         state[name] = file_size
         print(f"  [{name}] +{inserted:,} rows" + (f" ({errors} errors)" if errors else ""))
+
+    # Sync Relaycast (opt-in via env vars)
+    sync_relaycast(conn, state)
 
     save_state(state)
     total = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
@@ -379,13 +550,13 @@ def main():
 
     s = sub.add_parser("search", help="Full-text search prompts")
     s.add_argument("query", nargs="+", help="Search terms")
-    s.add_argument("--source", choices=["claude", "codex"], help="Filter by source")
+    s.add_argument("--source", choices=["claude", "codex", "relay"], help="Filter by source")
     s.add_argument("--project", help="Filter by project path (substring match)")
     s.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
 
     r = sub.add_parser("recent", help="Show most recent entries")
     r.add_argument("n", nargs="?", type=int, default=20, help="Number of entries (default: 20)")
-    r.add_argument("--source", choices=["claude", "codex"], help="Filter by source")
+    r.add_argument("--source", choices=["claude", "codex", "relay"], help="Filter by source")
     r.add_argument("--project", help="Filter by project path (substring match)")
 
     sh = sub.add_parser("show", help="Show full details for an entry by ID")

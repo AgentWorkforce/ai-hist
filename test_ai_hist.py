@@ -7,6 +7,7 @@ import os
 import sqlite3
 import sys
 import time
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -935,3 +936,427 @@ class TestFTSIntegration:
         ai_hist.cmd_search(args)
         captured = capsys.readouterr()
         assert "some prompt" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Relaycast tests
+# ---------------------------------------------------------------------------
+
+class TestIsoToMs:
+    def test_basic_iso(self):
+        ms = ai_hist._iso_to_ms("2026-03-07T20:13:00Z")
+        assert ms > 0
+
+    def test_iso_with_fractional(self):
+        ms = ai_hist._iso_to_ms("2026-03-07T20:13:00.123Z")
+        assert ms % 1000 == 123
+
+    def test_iso_with_short_frac(self):
+        ms = ai_hist._iso_to_ms("2026-03-07T20:13:00.5Z")
+        assert ms % 1000 == 500
+
+    def test_iso_with_timezone_offset(self):
+        ms = ai_hist._iso_to_ms("2026-03-07T20:13:00+00:00")
+        assert ms > 0
+
+    def test_iso_invalid(self):
+        assert ai_hist._iso_to_ms("not a date") == 0
+
+    def test_iso_empty(self):
+        assert ai_hist._iso_to_ms("") == 0
+
+
+class TestRelayMsgToRow:
+    def test_channel_message(self, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+        msg = {
+            "id": "msg1",
+            "from_name": "Lead",
+            "text": "deploy to prod",
+            "created_at": "2026-03-07T20:13:00.000Z",
+            "thread_id": "thread1",
+        }
+        row = ai_hist._relay_msg_to_row(msg, "#general")
+        assert row["source"] == "relay"
+        assert row["prompt"] == "[Lead] deploy to prod"
+        assert row["session_id"] == "thread1"
+        assert row["project"] == "ws_test"
+        assert row["timestamp_ms"] > 0
+
+    def test_message_without_thread(self, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+        msg = {"from_name": "Bot", "text": "hello", "created_at": "2026-03-07T20:13:00Z"}
+        row = ai_hist._relay_msg_to_row(msg, "#ops")
+        assert row["session_id"] == "#ops"
+
+    def test_message_with_from_id_fallback(self, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+        msg = {"from_id": "agent-123", "text": "working", "created_at": "2026-03-07T20:13:00Z"}
+        row = ai_hist._relay_msg_to_row(msg, "#ch")
+        assert "[agent-123]" in row["prompt"]
+
+    def test_empty_text_returns_none(self, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+        msg = {"from_name": "Bot", "text": "", "created_at": "2026-03-07T20:13:00Z"}
+        assert ai_hist._relay_msg_to_row(msg, "#ch") is None
+
+    def test_missing_text_returns_none(self, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+        msg = {"from_name": "Bot", "created_at": "2026-03-07T20:13:00Z"}
+        assert ai_hist._relay_msg_to_row(msg, "#ch") is None
+
+    def test_no_sender(self, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+        msg = {"text": "anonymous msg", "created_at": "2026-03-07T20:13:00Z"}
+        row = ai_hist._relay_msg_to_row(msg, "#ch")
+        assert row["prompt"] == "anonymous msg"
+
+
+class TestSyncRelaycast:
+    def test_skips_when_no_env_vars(self, tmp_env, capsys, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_API_KEY", "")
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "")
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {}
+        ai_hist.sync_relaycast(conn, state)
+        conn.close()
+        captured = capsys.readouterr()
+        # Should produce no output — silently skipped
+        assert "[relay]" not in captured.out
+
+    def test_sync_channel_messages(self, tmp_env, capsys, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_API_KEY", "rk_test_123")
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+
+        call_log = []
+        def mock_get(path, params=None):
+            call_log.append(path)
+            if path == "channels":
+                return {"ok": True, "data": [{"name": "general"}]}
+            if path == "channels/general/messages":
+                return {"ok": True, "data": [
+                    {"id": "m1", "from_name": "Lead", "text": "hello team",
+                     "created_at": "2026-03-07T10:00:00Z"},
+                    {"id": "m2", "from_name": "Worker", "text": "on it",
+                     "created_at": "2026-03-07T10:01:00Z"},
+                ]}
+            if path == "dm/conversations/all":
+                return {"ok": True, "data": []}
+            return {"ok": True, "data": []}
+
+        monkeypatch.setattr(ai_hist, "relaycast_get", mock_get)
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {}
+        ai_hist.sync_relaycast(conn, state)
+        total = conn.execute("SELECT COUNT(*) FROM history WHERE source = 'relay'").fetchone()[0]
+        conn.close()
+        assert total == 2
+        captured = capsys.readouterr()
+        assert "+2" in captured.out
+        assert "relay" in state
+
+    def test_sync_dm_messages(self, tmp_env, capsys, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_API_KEY", "rk_test_123")
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+
+        def mock_get(path, params=None):
+            if path == "channels":
+                return {"ok": True, "data": []}
+            if path == "dm/conversations/all":
+                return {"ok": True, "data": [{"id": "conv1"}]}
+            if path == "dm/conversations/conv1/messages":
+                return {"ok": True, "data": [
+                    {"id": "dm1", "from_name": "Alice", "text": "hey",
+                     "created_at": "2026-03-07T10:00:00Z"},
+                ]}
+            return {"ok": True, "data": []}
+
+        monkeypatch.setattr(ai_hist, "relaycast_get", mock_get)
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {}
+        ai_hist.sync_relaycast(conn, state)
+        total = conn.execute("SELECT COUNT(*) FROM history WHERE source = 'relay'").fetchone()[0]
+        conn.close()
+        assert total == 1
+        assert "dm:conv1" in state.get("relay", {})
+
+    def test_sync_incremental_with_after(self, tmp_env, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_API_KEY", "rk_test_123")
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+
+        calls = []
+        def mock_get(path, params=None):
+            calls.append((path, params))
+            if path == "channels":
+                return {"ok": True, "data": [{"name": "ops"}]}
+            if path == "channels/ops/messages":
+                return {"ok": True, "data": []}
+            if path == "dm/conversations/all":
+                return {"ok": True, "data": []}
+            return {"ok": True, "data": []}
+
+        monkeypatch.setattr(ai_hist, "relaycast_get", mock_get)
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {"relay": {"ch:ops": "last-known-id"}}
+        ai_hist.sync_relaycast(conn, state)
+        conn.close()
+        # Check that after param was passed
+        msg_calls = [(p, pr) for p, pr in calls if "messages" in p]
+        assert any(pr and pr.get("after") == "last-known-id" for _, pr in msg_calls)
+
+    def test_sync_handles_api_error(self, tmp_env, capsys, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_API_KEY", "rk_test_123")
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+
+        def mock_get(path, params=None):
+            raise urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(ai_hist, "relaycast_get", mock_get)
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {}
+        ai_hist.sync_relaycast(conn, state)
+        conn.close()
+        captured = capsys.readouterr()
+        assert "API error" in captured.out
+
+    def test_sync_handles_dm_403(self, tmp_env, capsys, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_API_KEY", "rk_test_123")
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+
+        def mock_get(path, params=None):
+            if path == "channels":
+                return {"ok": True, "data": []}
+            if path == "dm/conversations/all":
+                raise urllib.error.HTTPError(
+                    "url", 403, "Forbidden", {}, None)
+            return {"ok": True, "data": []}
+
+        monkeypatch.setattr(ai_hist, "relaycast_get", mock_get)
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {}
+        ai_hist.sync_relaycast(conn, state)
+        conn.close()
+        captured = capsys.readouterr()
+        assert "+0" in captured.out  # Gracefully handled
+
+    def test_sync_pagination(self, tmp_env, capsys, monkeypatch):
+        """Test that pagination continues when 100 messages returned."""
+        monkeypatch.setattr(ai_hist, "RELAYCAST_API_KEY", "rk_test_123")
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+
+        page1 = [{"id": f"m{i}", "from_name": "Bot", "text": f"msg {i}",
+                   "created_at": "2026-03-07T10:00:00Z"} for i in range(100)]
+        page2 = [{"id": "m100", "from_name": "Bot", "text": "last msg",
+                   "created_at": "2026-03-07T10:01:00Z"}]
+        call_count = {"ch": 0}
+
+        def mock_get(path, params=None):
+            if path == "channels":
+                return {"ok": True, "data": [{"name": "big"}]}
+            if path == "channels/big/messages":
+                call_count["ch"] += 1
+                if call_count["ch"] == 1:
+                    return {"ok": True, "data": page1}
+                return {"ok": True, "data": page2}
+            if path == "dm/conversations/all":
+                return {"ok": True, "data": []}
+            return {"ok": True, "data": []}
+
+        monkeypatch.setattr(ai_hist, "relaycast_get", mock_get)
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {}
+        ai_hist.sync_relaycast(conn, state)
+        total = conn.execute("SELECT COUNT(*) FROM history WHERE source = 'relay'").fetchone()[0]
+        conn.close()
+        assert total == 101
+        assert call_count["ch"] == 2
+
+    def test_sync_dm_pagination(self, tmp_env, monkeypatch):
+        """Test DM pagination and incremental after."""
+        monkeypatch.setattr(ai_hist, "RELAYCAST_API_KEY", "rk_test_123")
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+
+        page1 = [{"id": f"dm{i}", "from_name": "A", "text": f"dm {i}",
+                   "created_at": "2026-03-07T10:00:00Z"} for i in range(100)]
+        page2 = [{"id": "dm100", "from_name": "A", "text": "last",
+                   "created_at": "2026-03-07T10:01:00Z"}]
+        call_count = {"dm": 0}
+
+        def mock_get(path, params=None):
+            if path == "channels":
+                return {"ok": True, "data": []}
+            if path == "dm/conversations/all":
+                return {"ok": True, "data": [{"id": "c1"}]}
+            if path == "dm/conversations/c1/messages":
+                call_count["dm"] += 1
+                if call_count["dm"] == 1:
+                    return {"ok": True, "data": page1}
+                return {"ok": True, "data": page2}
+            return {"ok": True, "data": []}
+
+        monkeypatch.setattr(ai_hist, "relaycast_get", mock_get)
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {"relay": {"dm:c1": "old-id"}}  # incremental
+        ai_hist.sync_relaycast(conn, state)
+        conn.close()
+        assert call_count["dm"] == 2
+
+    def test_sync_skips_empty_conv_id(self, tmp_env, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_API_KEY", "rk_test_123")
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+
+        def mock_get(path, params=None):
+            if path == "channels":
+                return {"ok": True, "data": []}
+            if path == "dm/conversations/all":
+                return {"ok": True, "data": [{"id": ""}, {"id": "valid"}]}
+            if path == "dm/conversations/valid/messages":
+                return {"ok": True, "data": [
+                    {"id": "x1", "from_name": "A", "text": "hi",
+                     "created_at": "2026-03-07T10:00:00Z"}
+                ]}
+            return {"ok": True, "data": []}
+
+        monkeypatch.setattr(ai_hist, "relaycast_get", mock_get)
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {}
+        ai_hist.sync_relaycast(conn, state)
+        total = conn.execute("SELECT COUNT(*) FROM history WHERE source = 'relay'").fetchone()[0]
+        conn.close()
+        assert total == 1  # Only the valid conv
+
+    def test_sync_handles_sqlite_error_relay(self, tmp_env, capsys, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_API_KEY", "rk_test_123")
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+
+        def mock_get(path, params=None):
+            if path == "channels":
+                return {"ok": True, "data": [{"name": "ch"}]}
+            if path == "channels/ch/messages":
+                return {"ok": True, "data": [
+                    {"id": "m1", "from_name": "X", "text": "fail",
+                     "created_at": "2026-03-07T10:00:00Z"}
+                ]}
+            if path == "dm/conversations/all":
+                return {"ok": True, "data": []}
+            return {"ok": True, "data": []}
+
+        monkeypatch.setattr(ai_hist, "relaycast_get", mock_get)
+        original_connect = sqlite3.connect
+
+        class FaultyConn:
+            def __init__(self, conn):
+                self._conn = conn
+                self._ready = False
+            def executescript(self, sql):
+                return self._conn.executescript(sql)
+            def execute(self, sql, params=None):
+                if sql.startswith("INSERT OR IGNORE") and self._ready and "relay" in str(params):
+                    raise sqlite3.OperationalError("simulated")
+                result = self._conn.execute(sql, params) if params else self._conn.execute(sql)
+                if "PRAGMA" in sql:
+                    self._ready = True
+                return result
+            def commit(self):
+                return self._conn.commit()
+            def close(self):
+                return self._conn.close()
+
+        conn = FaultyConn(sqlite3.connect(str(tmp_env.db_path)))
+        ai_hist.init_db(conn)
+        state = {}
+        ai_hist.sync_relaycast(conn, state)
+        conn.close()
+        captured = capsys.readouterr()
+        assert "1 errors" in captured.out
+
+    def test_sync_dm_empty_after_cursor(self, tmp_env, monkeypatch):
+        """Cover the break when DM messages return empty after cursor."""
+        monkeypatch.setattr(ai_hist, "RELAYCAST_API_KEY", "rk_test_123")
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+
+        def mock_get(path, params=None):
+            if path == "channels":
+                return {"ok": True, "data": []}
+            if path == "dm/conversations/all":
+                return {"ok": True, "data": [{"id": "c2"}]}
+            if path == "dm/conversations/c2/messages":
+                return {"ok": True, "data": []}  # empty → break
+            return {"ok": True, "data": []}
+
+        monkeypatch.setattr(ai_hist, "relaycast_get", mock_get)
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {"relay": {"dm:c2": "prev-id"}}
+        ai_hist.sync_relaycast(conn, state)
+        conn.close()
+
+    def test_sync_dm_sqlite_error(self, tmp_env, capsys, monkeypatch):
+        """Cover the sqlite error branch in DM insert path."""
+        monkeypatch.setattr(ai_hist, "RELAYCAST_API_KEY", "rk_test_123")
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+
+        def mock_get(path, params=None):
+            if path == "channels":
+                return {"ok": True, "data": []}
+            if path == "dm/conversations/all":
+                return {"ok": True, "data": [{"id": "c3"}]}
+            if path == "dm/conversations/c3/messages":
+                return {"ok": True, "data": [
+                    {"id": "d1", "from_name": "X", "text": "fail dm",
+                     "created_at": "2026-03-07T10:00:00Z"}
+                ]}
+            return {"ok": True, "data": []}
+
+        monkeypatch.setattr(ai_hist, "relaycast_get", mock_get)
+
+        class FaultyDmConn:
+            def __init__(self, conn):
+                self._conn = conn
+                self._ready = False
+            def executescript(self, sql):
+                return self._conn.executescript(sql)
+            def execute(self, sql, params=None):
+                if sql.startswith("INSERT OR IGNORE") and self._ready and "relay" in str(params):
+                    raise sqlite3.OperationalError("dm insert fail")
+                result = self._conn.execute(sql, params) if params else self._conn.execute(sql)
+                if "PRAGMA" in sql:
+                    self._ready = True
+                return result
+            def commit(self):
+                return self._conn.commit()
+            def close(self):
+                return self._conn.close()
+
+        conn = FaultyDmConn(sqlite3.connect(str(tmp_env.db_path)))
+        ai_hist.init_db(conn)
+        state = {}
+        ai_hist.sync_relaycast(conn, state)
+        conn.close()
+        captured = capsys.readouterr()
+        assert "errors" in captured.out
+
+    def test_sync_handles_generic_exception(self, tmp_env, capsys, monkeypatch):
+        monkeypatch.setattr(ai_hist, "RELAYCAST_API_KEY", "rk_test_123")
+        monkeypatch.setattr(ai_hist, "RELAYCAST_WORKSPACE_ID", "ws_test")
+
+        def mock_get(path, params=None):
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr(ai_hist, "relaycast_get", mock_get)
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {}
+        ai_hist.sync_relaycast(conn, state)
+        conn.close()
+        captured = capsys.readouterr()
+        assert "error" in captured.out.lower()

@@ -1,8 +1,8 @@
 # ai-hist
 
-Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex CLI](https://github.com/openai/codex) conversation history into a local SQLite database with full-text search.
+Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), and [Relaycast](https://relaycast.dev) conversation history into a local SQLite database with full-text search.
 
-**Zero dependencies** — Python 3.8+ standard library only. Single file. ~200 lines.
+**Zero dependencies** — Python 3.8+ standard library only. Single file.
 
 ## Install
 
@@ -33,6 +33,7 @@ ai-hist sync
 # Full-text search
 ai-hist search "authentication bug"
 ai-hist search "refactor" --source claude --limit 10
+ai-hist search "deploy" --source relay
 ai-hist search "deploy" --project relay
 
 # Recent prompts
@@ -87,16 +88,24 @@ Top 10 projects:
 
 ## How it works
 
-Both Claude Code and Codex CLI store conversation history as JSONL files:
+ai-hist supports three sources:
 
-| Source | File | Key fields |
-|--------|------|------------|
-| Claude Code | `~/.claude/history.jsonl` | `display`, `timestamp`, `project`, `sessionId` |
-| Codex CLI | `~/.codex/history.jsonl` | `text`, `ts`, `session_id` |
+| Source | How | Key fields |
+|--------|-----|------------|
+| Claude Code | Local JSONL (`~/.claude/history.jsonl`) | `display`, `timestamp`, `project`, `sessionId` |
+| Codex CLI | Local JSONL (`~/.codex/history.jsonl`) | `text`, `ts`, `session_id` |
+| Relaycast | API (`https://api.relaycast.dev/v1`) | `sender`, `content`, `channel`, `timestamp` |
 
-`ai-hist sync` reads these files incrementally (tracking byte offsets in `.sync-state.json`) and inserts rows into a SQLite database with an [FTS5](https://www.sqlite.org/fts5.html) full-text search index.
+**Claude Code & Codex** are synced from local JSONL files incrementally (byte-offset tracking in `.sync-state.json`).
 
-Deduplication uses `INSERT OR IGNORE` on a `UNIQUE(source, timestamp_ms, prompt)` constraint.
+**Relaycast** is synced via the [Relaycast API](https://relaycast.dev), pulling workspace messages with cursor-based pagination. Configure with:
+
+```bash
+export RELAYCAST_API_KEY="rk_live_..."
+export RELAYCAST_WORKSPACE_ID="ws_abc123"
+```
+
+All sources are indexed with [FTS5](https://www.sqlite.org/fts5.html) full-text search. Deduplication uses `INSERT OR IGNORE` on a `UNIQUE(source, timestamp_ms, prompt)` constraint.
 
 ## Database location
 
@@ -162,7 +171,7 @@ ai-hist watch --interval 30  # syncs every 30s
 ```sql
 CREATE TABLE history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,          -- 'claude' or 'codex'
+    source TEXT NOT NULL,          -- 'claude', 'codex', or 'relay'
     session_id TEXT,
     project TEXT,
     prompt TEXT NOT NULL,
