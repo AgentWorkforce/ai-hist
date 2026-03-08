@@ -98,7 +98,7 @@ ai-hist supports three sources:
 
 **Claude Code & Codex** are synced from local JSONL files incrementally (byte-offset tracking in `.sync-state.json`).
 
-**Agent Relay** is synced via the [Relaycast API](https://github.com/AgentWorkforce/relay), pulling workspace messages with cursor-based pagination. Configure with:
+**Agent Relay** is synced via the [Relaycast API](https://github.com/AgentWorkforce/relaycast), pulling workspace messages with cursor-based pagination. Configure with:
 
 ```bash
 export RELAYCAST_API_KEY="rk_live_..."
