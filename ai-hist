@@ -101,13 +101,16 @@ def save_state(state: dict):
     STATE_PATH.write_text(json.dumps(state, indent=2))
 
 
-def fmt_row(source, project, prompt, ts_ms):
+def fmt_row(id_, source, project, prompt, ts_ms, verbose=False):
     """Format a single row for display."""
     dt = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts_ms / 1000))
     proj = f" [{project}]" if project else ""
-    display = prompt[:120] + "..." if len(prompt) > 120 else prompt
-    display = display.replace("\n", " ")
-    return f"  {dt}  ({source}){proj}  {display}"
+    if verbose:
+        display = prompt
+    else:
+        display = prompt[:120] + "..." if len(prompt) > 120 else prompt
+        display = display.replace("\n", " ")
+    return f"  #{id_:<5} {dt}  ({source}){proj}  {display}"
 
 
 # --- Commands ----------------------------------------------------------------
@@ -177,7 +180,7 @@ def cmd_search(args):
     query = " ".join(f'"{t}"' for t in args.query)
 
     sql = (
-        "SELECT h.source, h.project, h.prompt, h.timestamp_ms "
+        "SELECT h.id, h.source, h.project, h.prompt, h.timestamp_ms "
         "FROM history_fts f JOIN history h ON f.rowid = h.id "
         "WHERE history_fts MATCH ? "
     )
@@ -185,6 +188,9 @@ def cmd_search(args):
     if args.source:
         sql += "AND h.source = ? "
         params.append(args.source)
+    if args.project:
+        sql += "AND h.project LIKE ? "
+        params.append(f"%{args.project}%")
     sql += "ORDER BY h.timestamp_ms DESC LIMIT ?"
     params.append(args.limit)
 
@@ -201,14 +207,64 @@ def cmd_search(args):
 def cmd_recent(args):
     """Show N most recent entries."""
     conn = sqlite3.connect(str(DB_PATH))
-    rows = conn.execute(
-        "SELECT source, project, prompt, timestamp_ms "
-        "FROM history ORDER BY timestamp_ms DESC LIMIT ?",
-        (args.n,),
-    ).fetchall()
+    sql = "SELECT id, source, project, prompt, timestamp_ms FROM history "
+    params: list = []
+    wheres = []
+    if args.source:
+        wheres.append("source = ?")
+        params.append(args.source)
+    if args.project:
+        wheres.append("project LIKE ?")
+        params.append(f"%{args.project}%")
+    if wheres:
+        sql += "WHERE " + " AND ".join(wheres) + " "
+    sql += "ORDER BY timestamp_ms DESC LIMIT ?"
+    params.append(args.n)
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
     for row in rows:
         print(fmt_row(*row))
+
+
+def cmd_show(args):
+    """Show the full prompt for a given entry ID."""
+    conn = sqlite3.connect(str(DB_PATH))
+    row = conn.execute(
+        "SELECT id, source, session_id, project, prompt, timestamp_ms "
+        "FROM history WHERE id = ?",
+        (args.id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        print(f"No entry with id {args.id}")
+        return
+    id_, source, session_id, project, prompt, ts_ms = row
+    dt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_ms / 1000))
+    print(f"  ID:        {id_}")
+    print(f"  Source:    {source}")
+    print(f"  Session:   {session_id or '(none)'}")
+    print(f"  Project:   {project or '(none)'}")
+    print(f"  Time:      {dt}")
+    print(f"  Prompt:")
+    print()
+    print(prompt)
+
+
+def cmd_session(args):
+    """Show all prompts in a given session."""
+    conn = sqlite3.connect(str(DB_PATH))
+    rows = conn.execute(
+        "SELECT id, source, project, prompt, timestamp_ms "
+        "FROM history WHERE session_id = ? ORDER BY timestamp_ms ASC",
+        (args.session_id,),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        print(f"No entries for session {args.session_id}")
+        return
+    print(f"  Session {args.session_id} ({len(rows)} entries):\n")
+    for row in rows:
+        print(fmt_row(*row, verbose=args.full))
 
 
 def cmd_stats(args=None):
@@ -263,10 +319,20 @@ def main():
     s = sub.add_parser("search", help="Full-text search prompts")
     s.add_argument("query", nargs="+", help="Search terms")
     s.add_argument("--source", choices=["claude", "codex"], help="Filter by source")
+    s.add_argument("--project", help="Filter by project path (substring match)")
     s.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
 
     r = sub.add_parser("recent", help="Show most recent entries")
     r.add_argument("n", nargs="?", type=int, default=20, help="Number of entries (default: 20)")
+    r.add_argument("--source", choices=["claude", "codex"], help="Filter by source")
+    r.add_argument("--project", help="Filter by project path (substring match)")
+
+    sh = sub.add_parser("show", help="Show full details for an entry by ID")
+    sh.add_argument("id", type=int, help="Entry ID (shown as #NNN in search/recent)")
+
+    se = sub.add_parser("session", help="Show all prompts in a session")
+    se.add_argument("session_id", help="Session ID")
+    se.add_argument("--full", action="store_true", help="Show full prompt text (no truncation)")
 
     sub.add_parser("stats", help="Show summary statistics")
 
@@ -274,7 +340,10 @@ def main():
     w.add_argument("--interval", type=int, default=60, help="Seconds between syncs (default: 60)")
 
     args = p.parse_args()
-    cmds = {"sync": cmd_sync, "search": cmd_search, "recent": cmd_recent, "stats": cmd_stats, "watch": cmd_watch}
+    cmds = {
+        "sync": cmd_sync, "search": cmd_search, "recent": cmd_recent,
+        "show": cmd_show, "session": cmd_session, "stats": cmd_stats, "watch": cmd_watch,
+    }
 
     if args.command in cmds:
         cmds[args.command](args)

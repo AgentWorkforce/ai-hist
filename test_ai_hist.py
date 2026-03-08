@@ -152,12 +152,10 @@ class TestInitDb:
         db = tmp_path / "test.db"
         conn = sqlite3.connect(str(db))
         ai_hist.init_db(conn)
-        # Check history table exists
         tables = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='history'"
         ).fetchone()
         assert tables is not None
-        # Check FTS table exists
         fts = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='history_fts'"
         ).fetchone()
@@ -191,31 +189,41 @@ class TestLoadSaveState:
 
 class TestFmtRow:
     def test_with_project(self):
-        result = ai_hist.fmt_row("claude", "/my/project", "hello", 1700000000000)
+        result = ai_hist.fmt_row(1, "claude", "/my/project", "hello", 1700000000000)
         assert "(claude)" in result
         assert "[/my/project]" in result
         assert "hello" in result
+        assert "#1" in result
 
     def test_without_project(self):
-        result = ai_hist.fmt_row("codex", None, "world", 1700000000000)
+        result = ai_hist.fmt_row(2, "codex", None, "world", 1700000000000)
         assert "(codex)" in result
         assert "[" not in result
 
     def test_long_prompt_truncated(self):
         long_prompt = "x" * 200
-        result = ai_hist.fmt_row("claude", None, long_prompt, 1700000000000)
+        result = ai_hist.fmt_row(3, "claude", None, long_prompt, 1700000000000)
         assert result.endswith("...")
-        # 120 chars + "..."
         assert "x" * 120 in result
 
     def test_newlines_replaced(self):
-        result = ai_hist.fmt_row("claude", None, "line1\nline2", 1700000000000)
+        result = ai_hist.fmt_row(4, "claude", None, "line1\nline2", 1700000000000)
         assert "\n" not in result
         assert "line1 line2" in result
 
     def test_short_prompt_not_truncated(self):
-        result = ai_hist.fmt_row("claude", None, "short", 1700000000000)
+        result = ai_hist.fmt_row(5, "claude", None, "short", 1700000000000)
         assert "..." not in result
+
+    def test_verbose_no_truncation(self):
+        long_prompt = "x" * 200
+        result = ai_hist.fmt_row(6, "claude", None, long_prompt, 1700000000000, verbose=True)
+        assert "..." not in result
+        assert "x" * 200 in result
+
+    def test_verbose_preserves_newlines(self):
+        result = ai_hist.fmt_row(7, "claude", None, "line1\nline2", 1700000000000, verbose=True)
+        assert "line1\nline2" in result
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +259,6 @@ class TestCmdSync:
     def test_incremental_sync(self, tmp_env, capsys):
         tmp_env.claude_hist.write_text(make_claude_entry("first", 1700000001000) + "\n")
         ai_hist.cmd_sync()
-        # Append more
         with open(tmp_env.claude_hist, "a") as f:
             f.write(make_claude_entry("second", 1700000002000) + "\n")
         ai_hist.cmd_sync()
@@ -261,13 +268,12 @@ class TestCmdSync:
     def test_sync_up_to_date(self, tmp_env, capsys):
         tmp_env.claude_hist.write_text(make_claude_entry("first", 1700000001000) + "\n")
         ai_hist.cmd_sync()
-        capsys.readouterr()  # clear
+        capsys.readouterr()
         ai_hist.cmd_sync()
         captured = capsys.readouterr()
         assert "up to date" in captured.out
 
     def test_sync_missing_source(self, tmp_env, capsys):
-        # Neither file exists
         ai_hist.cmd_sync()
         captured = capsys.readouterr()
         assert "not found" in captured.out
@@ -292,7 +298,6 @@ class TestCmdSync:
         assert "1 errors" in captured.out
 
     def test_sync_skips_none_rows(self, tmp_env, capsys):
-        # Entry with empty display → parser returns None
         tmp_env.claude_hist.write_text(
             json.dumps({"display": "", "timestamp": 123}) + "\n"
             + make_claude_entry("real", 1700000001000) + "\n"
@@ -302,13 +307,10 @@ class TestCmdSync:
         assert "+1" in captured.out
 
     def test_sync_dedup_on_reinsert(self, tmp_env, capsys):
-        """INSERT OR IGNORE prevents dupes even if offset is reset."""
         tmp_env.claude_hist.write_text(make_claude_entry("dupe", 1700000001000) + "\n")
         ai_hist.cmd_sync()
-        # Reset state to force re-read
         ai_hist.save_state({})
         ai_hist.cmd_sync()
-        # Should still be 1 total
         conn = sqlite3.connect(str(tmp_env.db_path))
         count = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
         conn.close()
@@ -321,7 +323,6 @@ class TestCmdSync:
         assert nested.exists()
 
     def test_sync_handles_sqlite_error_on_insert(self, tmp_env, capsys, monkeypatch):
-        """Cover the sqlite3.Error except branch on insert."""
         tmp_env.claude_hist.write_text(
             make_claude_entry("will fail", 1700000001000) + "\n"
             + make_claude_entry("also fails", 1700000002000) + "\n"
@@ -329,7 +330,6 @@ class TestCmdSync:
         original_connect = sqlite3.connect
 
         class FaultyConnection:
-            """Wraps a real connection but makes execute raise on INSERT."""
             def __init__(self, conn):
                 self._conn = conn
                 self._initialized = False
@@ -341,7 +341,6 @@ class TestCmdSync:
                 if sql.startswith("INSERT OR IGNORE INTO history") and self._initialized:
                     raise sqlite3.OperationalError("simulated error")
                 result = self._conn.execute(sql, params) if params else self._conn.execute(sql)
-                # After init_db calls complete, start failing inserts
                 if "PRAGMA" in sql:
                     self._initialized = True
                 return result
@@ -369,15 +368,16 @@ class TestCmdSearch:
             make_claude_entry("add new feature", 1700000002000, "/proj"),
         ])
         capsys.readouterr()
-        args = SimpleNamespace(query=["authentication"], source=None, limit=20)
+        args = SimpleNamespace(query=["authentication"], source=None, project=None, limit=20)
         ai_hist.cmd_search(args)
         captured = capsys.readouterr()
         assert "authentication" in captured.out
+        assert "#" in captured.out  # ID is shown
 
     def test_search_no_results(self, tmp_env, capsys):
         seed_db(tmp_env, claude_lines=[make_claude_entry("hello", 1700000001000)])
         capsys.readouterr()
-        args = SimpleNamespace(query=["zzzznonexistent"], source=None, limit=20)
+        args = SimpleNamespace(query=["zzzznonexistent"], source=None, project=None, limit=20)
         ai_hist.cmd_search(args)
         captured = capsys.readouterr()
         assert "No results." in captured.out
@@ -388,17 +388,29 @@ class TestCmdSearch:
             codex_lines=[make_codex_entry("shared term", 1700000002)],
         )
         capsys.readouterr()
-        args = SimpleNamespace(query=["shared"], source="codex", limit=20)
+        args = SimpleNamespace(query=["shared"], source="codex", project=None, limit=20)
         ai_hist.cmd_search(args)
         captured = capsys.readouterr()
         assert "(codex)" in captured.out
         assert "(claude)" not in captured.out
 
+    def test_search_filter_by_project(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("in relay", 1700000001000, "/proj/relay"),
+            make_claude_entry("in dashboard", 1700000002000, "/proj/dashboard"),
+        ])
+        capsys.readouterr()
+        args = SimpleNamespace(query=["in"], source=None, project="relay", limit=20)
+        ai_hist.cmd_search(args)
+        captured = capsys.readouterr()
+        assert "relay" in captured.out
+        assert "dashboard" not in captured.out
+
     def test_search_respects_limit(self, tmp_env, capsys):
         lines = [make_claude_entry(f"test query {i}", 1700000000000 + i * 1000) for i in range(10)]
         seed_db(tmp_env, claude_lines=lines)
         capsys.readouterr()
-        args = SimpleNamespace(query=["test"], source=None, limit=3)
+        args = SimpleNamespace(query=["test"], source=None, project=None, limit=3)
         ai_hist.cmd_search(args)
         captured = capsys.readouterr()
         result_lines = [l for l in captured.out.strip().split("\n") if l.strip()]
@@ -409,7 +421,7 @@ class TestCmdSearch:
             make_claude_entry("fix the authentication bug", 1700000001000),
         ])
         capsys.readouterr()
-        args = SimpleNamespace(query=["fix", "bug"], source=None, limit=20)
+        args = SimpleNamespace(query=["fix", "bug"], source=None, project=None, limit=20)
         ai_hist.cmd_search(args)
         captured = capsys.readouterr()
         assert "authentication" in captured.out
@@ -419,7 +431,7 @@ class TestCmdSearch:
             make_claude_entry("deploy agent-relay to prod", 1700000001000, "/proj"),
         ])
         capsys.readouterr()
-        args = SimpleNamespace(query=["agent-relay"], source=None, limit=20)
+        args = SimpleNamespace(query=["agent-relay"], source=None, project=None, limit=20)
         ai_hist.cmd_search(args)
         captured = capsys.readouterr()
         assert "agent-relay" in captured.out
@@ -430,7 +442,7 @@ class TestCmdRecent:
         lines = [make_claude_entry(f"prompt {i}", 1700000000000 + i * 1000) for i in range(5)]
         seed_db(tmp_env, claude_lines=lines)
         capsys.readouterr()
-        args = SimpleNamespace(n=20)
+        args = SimpleNamespace(n=20, source=None, project=None)
         ai_hist.cmd_recent(args)
         captured = capsys.readouterr()
         result_lines = [l for l in captured.out.strip().split("\n") if l.strip()]
@@ -440,7 +452,7 @@ class TestCmdRecent:
         lines = [make_claude_entry(f"prompt {i}", 1700000000000 + i * 1000) for i in range(10)]
         seed_db(tmp_env, claude_lines=lines)
         capsys.readouterr()
-        args = SimpleNamespace(n=3)
+        args = SimpleNamespace(n=3, source=None, project=None)
         ai_hist.cmd_recent(args)
         captured = capsys.readouterr()
         result_lines = [l for l in captured.out.strip().split("\n") if l.strip()]
@@ -452,7 +464,7 @@ class TestCmdRecent:
             make_claude_entry("new prompt", 1700000099000),
         ])
         capsys.readouterr()
-        args = SimpleNamespace(n=2)
+        args = SimpleNamespace(n=2, source=None, project=None)
         ai_hist.cmd_recent(args)
         captured = capsys.readouterr()
         lines = captured.out.strip().split("\n")
@@ -460,12 +472,136 @@ class TestCmdRecent:
         assert "old prompt" in lines[1]
 
     def test_recent_empty_db(self, tmp_env, capsys):
-        seed_db(tmp_env)  # no entries
+        seed_db(tmp_env)
         capsys.readouterr()
-        args = SimpleNamespace(n=10)
+        args = SimpleNamespace(n=10, source=None, project=None)
         ai_hist.cmd_recent(args)
         captured = capsys.readouterr()
         assert captured.out.strip() == ""
+
+    def test_recent_filter_by_source(self, tmp_env, capsys):
+        seed_db(tmp_env,
+            claude_lines=[make_claude_entry("claude msg", 1700000001000)],
+            codex_lines=[make_codex_entry("codex msg", 1700000002)],
+        )
+        capsys.readouterr()
+        args = SimpleNamespace(n=20, source="claude", project=None)
+        ai_hist.cmd_recent(args)
+        captured = capsys.readouterr()
+        assert "(claude)" in captured.out
+        assert "(codex)" not in captured.out
+
+    def test_recent_filter_by_project(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("in relay", 1700000001000, "/proj/relay"),
+            make_claude_entry("in dash", 1700000002000, "/proj/dashboard"),
+        ])
+        capsys.readouterr()
+        args = SimpleNamespace(n=20, source=None, project="dashboard")
+        ai_hist.cmd_recent(args)
+        captured = capsys.readouterr()
+        assert "dash" in captured.out
+        assert "relay" not in captured.out
+
+    def test_recent_filter_by_source_and_project(self, tmp_env, capsys):
+        seed_db(tmp_env,
+            claude_lines=[make_claude_entry("c relay", 1700000001000, "/proj/relay")],
+            codex_lines=[make_codex_entry("x msg", 1700000002)],
+        )
+        capsys.readouterr()
+        args = SimpleNamespace(n=20, source="claude", project="relay")
+        ai_hist.cmd_recent(args)
+        captured = capsys.readouterr()
+        assert "c relay" in captured.out
+        assert len([l for l in captured.out.strip().split("\n") if l.strip()]) == 1
+
+
+class TestCmdShow:
+    def test_show_existing_entry(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("full prompt text here\nwith newlines", 1700000001000, "/proj/x", "sess-abc"),
+        ])
+        capsys.readouterr()
+        args = SimpleNamespace(id=1)
+        ai_hist.cmd_show(args)
+        captured = capsys.readouterr()
+        assert "ID:" in captured.out
+        assert "Source:    claude" in captured.out
+        assert "Session:   sess-abc" in captured.out
+        assert "Project:   /proj/x" in captured.out
+        assert "full prompt text here\nwith newlines" in captured.out
+
+    def test_show_nonexistent_entry(self, tmp_env, capsys):
+        seed_db(tmp_env)
+        capsys.readouterr()
+        args = SimpleNamespace(id=999)
+        ai_hist.cmd_show(args)
+        captured = capsys.readouterr()
+        assert "No entry with id 999" in captured.out
+
+    def test_show_entry_without_session_or_project(self, tmp_env, capsys):
+        # Use a codex entry with no session_id to test (none) display
+        tmp_env.codex_hist.write_text(
+            json.dumps({"text": "nosession", "ts": 1700000001}) + "\n"
+        )
+        ai_hist.cmd_sync()
+        capsys.readouterr()
+        args = SimpleNamespace(id=1)
+        ai_hist.cmd_show(args)
+        captured = capsys.readouterr()
+        assert "Session:   (none)" in captured.out
+        assert "Project:   (none)" in captured.out
+
+
+class TestCmdSession:
+    def test_session_shows_all_prompts(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("first in session", 1700000001000, "/proj", "sess-xyz"),
+            make_claude_entry("second in session", 1700000002000, "/proj", "sess-xyz"),
+            make_claude_entry("different session", 1700000003000, "/proj", "sess-other"),
+        ])
+        capsys.readouterr()
+        args = SimpleNamespace(session_id="sess-xyz", full=False)
+        ai_hist.cmd_session(args)
+        captured = capsys.readouterr()
+        assert "sess-xyz" in captured.out
+        assert "2 entries" in captured.out
+        assert "first in session" in captured.out
+        assert "second in session" in captured.out
+        assert "different session" not in captured.out
+
+    def test_session_not_found(self, tmp_env, capsys):
+        seed_db(tmp_env)
+        capsys.readouterr()
+        args = SimpleNamespace(session_id="nonexistent", full=False)
+        ai_hist.cmd_session(args)
+        captured = capsys.readouterr()
+        assert "No entries for session nonexistent" in captured.out
+
+    def test_session_full_flag(self, tmp_env, capsys):
+        long_prompt = "x" * 200
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry(long_prompt, 1700000001000, "/proj", "sess-full"),
+        ])
+        capsys.readouterr()
+        args = SimpleNamespace(session_id="sess-full", full=True)
+        ai_hist.cmd_session(args)
+        captured = capsys.readouterr()
+        assert "x" * 200 in captured.out
+        assert "..." not in captured.out
+
+    def test_session_chronological_order(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("later", 1700000099000, "/proj", "sess-order"),
+            make_claude_entry("earlier", 1700000001000, "/proj", "sess-order"),
+        ])
+        capsys.readouterr()
+        args = SimpleNamespace(session_id="sess-order", full=False)
+        ai_hist.cmd_session(args)
+        captured = capsys.readouterr()
+        lines = [l for l in captured.out.strip().split("\n") if l.strip() and "(" in l and "#" in l]
+        assert "earlier" in lines[0]
+        assert "later" in lines[1]
 
 
 class TestCmdStats:
@@ -494,7 +630,6 @@ class TestCmdStats:
         ai_hist.cmd_stats()
         captured = capsys.readouterr()
         assert "Total entries: 0" in captured.out
-        # No date range when empty
         assert "Date range:" not in captured.out
 
     def test_stats_no_projects(self, tmp_env, capsys):
@@ -507,7 +642,6 @@ class TestCmdStats:
 
 class TestCmdWatch:
     def test_watch_runs_sync_and_stops(self, tmp_env, capsys):
-        """Watch should call sync and sleep; we interrupt after first iteration."""
         call_count = 0
 
         def mock_sleep(seconds):
@@ -524,7 +658,6 @@ class TestCmdWatch:
         assert "Watching every 1s" in captured.out
 
     def test_watch_handles_sync_error(self, tmp_env, capsys):
-        """Watch should catch sync errors and continue."""
         call_count = 0
 
         def failing_sync(args=None):
@@ -594,14 +727,57 @@ class TestMain:
         captured = capsys.readouterr()
         assert "flagtest" in captured.out
 
+    def test_search_with_project_flag(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("in relay", 1700000001000, "/proj/relay"),
+            make_claude_entry("in dash", 1700000002000, "/proj/dash"),
+        ])
+        capsys.readouterr()
+        with patch("sys.argv", ["ai-hist", "search", "in", "--project", "relay"]):
+            ai_hist.main()
+        captured = capsys.readouterr()
+        assert "relay" in captured.out
+        assert "dash" not in captured.out
+
+    def test_show_command(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[make_claude_entry("show me", 1700000001000)])
+        capsys.readouterr()
+        with patch("sys.argv", ["ai-hist", "show", "1"]):
+            ai_hist.main()
+        captured = capsys.readouterr()
+        assert "show me" in captured.out
+
+    def test_session_command(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[make_claude_entry("sess prompt", 1700000001000, "/p", "s1")])
+        capsys.readouterr()
+        with patch("sys.argv", ["ai-hist", "session", "s1"]):
+            ai_hist.main()
+        captured = capsys.readouterr()
+        assert "sess prompt" in captured.out
+
+    def test_session_command_with_full(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[make_claude_entry("x" * 200, 1700000001000, "/p", "s2")])
+        capsys.readouterr()
+        with patch("sys.argv", ["ai-hist", "session", "s2", "--full"]):
+            ai_hist.main()
+        captured = capsys.readouterr()
+        assert "x" * 200 in captured.out
+
     def test_watch_command_dispatches(self, tmp_env):
-        """Verify watch command is dispatched (interrupt immediately)."""
         def mock_watch(args):
-            assert args.interval == 60  # default
+            assert args.interval == 60
 
         with patch.object(ai_hist, "cmd_watch", mock_watch):
             with patch("sys.argv", ["ai-hist", "watch"]):
                 ai_hist.main()
+
+    def test_recent_with_source_and_project(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[make_claude_entry("filtered", 1700000001000, "/proj/x")])
+        capsys.readouterr()
+        with patch("sys.argv", ["ai-hist", "recent", "5", "--source", "claude", "--project", "proj"]):
+            ai_hist.main()
+        captured = capsys.readouterr()
+        assert "filtered" in captured.out
 
 
 # ---------------------------------------------------------------------------
@@ -625,8 +801,7 @@ class TestFTSIntegration:
             make_claude_entry("some prompt", 1700000001000, "/unique/project/path"),
         ])
         capsys.readouterr()
-        # FTS5 indexes project too
-        args = SimpleNamespace(query=["unique"], source=None, limit=20)
+        args = SimpleNamespace(query=["unique"], source=None, project=None, limit=20)
         ai_hist.cmd_search(args)
         captured = capsys.readouterr()
         assert "some prompt" in captured.out
