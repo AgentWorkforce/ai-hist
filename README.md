@@ -7,6 +7,7 @@ Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-cod
 ## Install
 
 ```bash
+mkdir -p ~/.local/bin
 curl -o ~/.local/bin/ai-hist https://raw.githubusercontent.com/khaliqgant/ai-hist/main/ai-hist
 chmod +x ~/.local/bin/ai-hist
 ```
@@ -15,6 +16,7 @@ Or clone and symlink:
 
 ```bash
 git clone https://github.com/khaliqgant/ai-hist.git
+mkdir -p ~/.local/bin
 ln -s "$(pwd)/ai-hist/ai-hist" ~/.local/bin/ai-hist
 ```
 
