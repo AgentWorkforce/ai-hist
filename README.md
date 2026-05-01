@@ -56,7 +56,7 @@ ai-hist session abc-1234-def --full   # no truncation
 
 # Resume a conversation directly (the exact command is shown by `ai-hist show <id>`)
 cd /path/to/project && claude --resume <session_id>          # claude
-codex --resume                                                # codex (interactive picker)
+codex --resume <session_id>                                   # codex
 cd /path/to/project && cursor-agent --resume=<session_id>    # cursor
 
 # Stats overview
