@@ -41,13 +41,40 @@ def tmp_env(tmp_path, monkeypatch):
         "codex": codex_hist,
     })
 
+    # Point cursor at an empty tmp dir so it never reads real ~/.cursor.
+    cursor_root = tmp_path / "cursor_projects"
+    monkeypatch.setattr(ai_hist, "CURSOR_ROOT", cursor_root)
+
     return SimpleNamespace(
         db_path=db_path,
         state_path=state_path,
         claude_hist=claude_hist,
         codex_hist=codex_hist,
+        cursor_root=cursor_root,
         tmp_path=tmp_path,
     )
+
+
+def make_cursor_session(cursor_root: Path, project: str, session_id: str, prompts: list,
+                        wrap_user_query: bool = True) -> Path:
+    """Create a fake cursor agent-transcripts jsonl. Returns the file path."""
+    session_dir = cursor_root / project / "agent-transcripts" / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    jsonl = session_dir / f"{session_id}.jsonl"
+    lines = []
+    for p in prompts:
+        text = f"<user_query>\n{p}\n</user_query>" if wrap_user_query else p
+        lines.append(json.dumps({
+            "role": "user",
+            "message": {"content": [{"type": "text", "text": text}]},
+        }))
+        # Add an assistant response so we exercise the role filter.
+        lines.append(json.dumps({
+            "role": "assistant",
+            "message": {"content": [{"type": "text", "text": "ok"}]},
+        }))
+    jsonl.write_text("\n".join(lines) + "\n")
+    return jsonl
 
 
 def make_claude_entry(display, timestamp=1700000000000, project="/proj", session_id="s1"):
@@ -555,7 +582,9 @@ class TestCmdShow:
         args = SimpleNamespace(id=1)
         ai_hist.cmd_show(args)
         captured = capsys.readouterr()
-        assert "codex --resume cx-sess" in captured.out
+        # codex --resume opens an interactive picker; no session_id arg
+        assert "codex --resume" in captured.out
+        assert "codex --resume cx-sess" not in captured.out
 
     def test_show_nonexistent_entry(self, tmp_env, capsys):
         seed_db(tmp_env)
@@ -1360,3 +1389,215 @@ class TestSyncRelaycast:
         conn.close()
         captured = capsys.readouterr()
         assert "error" in captured.out.lower()
+
+
+# ---------------------------------------------------------------------------
+# Cursor tests
+# ---------------------------------------------------------------------------
+
+class TestParseCursorLine:
+    def test_strips_user_query_wrapper(self):
+        line = json.dumps({
+            "role": "user",
+            "message": {"content": [{"type": "text",
+                                       "text": "<user_query>\nfix the bug\n</user_query>"}]},
+        })
+        assert ai_hist.parse_cursor_line(line) == "fix the bug"
+
+    def test_returns_text_without_wrapper(self):
+        line = json.dumps({
+            "role": "user",
+            "message": {"content": [{"type": "text", "text": "plain prompt"}]},
+        })
+        assert ai_hist.parse_cursor_line(line) == "plain prompt"
+
+    def test_string_content(self):
+        line = json.dumps({"role": "user", "message": {"content": "raw string"}})
+        assert ai_hist.parse_cursor_line(line) == "raw string"
+
+    def test_skips_assistant_role(self):
+        line = json.dumps({
+            "role": "assistant",
+            "message": {"content": [{"type": "text", "text": "hi"}]},
+        })
+        assert ai_hist.parse_cursor_line(line) is None
+
+    def test_skips_empty_text(self):
+        line = json.dumps({
+            "role": "user",
+            "message": {"content": [{"type": "text", "text": "   "}]},
+        })
+        assert ai_hist.parse_cursor_line(line) is None
+
+    def test_skips_when_only_wrapper(self):
+        line = json.dumps({
+            "role": "user",
+            "message": {"content": [{"type": "text",
+                                       "text": "<user_query></user_query>"}]},
+        })
+        assert ai_hist.parse_cursor_line(line) is None
+
+    def test_skips_non_text_content(self):
+        line = json.dumps({
+            "role": "user",
+            "message": {"content": [{"type": "image", "url": "x"}]},
+        })
+        assert ai_hist.parse_cursor_line(line) is None
+
+    def test_missing_message(self):
+        line = json.dumps({"role": "user"})
+        assert ai_hist.parse_cursor_line(line) is None
+
+
+class TestDecodeCursorProject:
+    def test_basic(self):
+        assert ai_hist._decode_cursor_project(
+            "Users-khaliq-Projects-AgentWorkforce"
+        ) == "/Users/khaliq/Projects/AgentWorkforce"
+
+
+class TestSyncCursor:
+    def test_no_cursor_dir(self, tmp_env):
+        # cursor_root does not exist by default — should silently no-op
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        ai_hist.sync_cursor(conn, {})
+        conn.close()
+
+    def test_imports_user_prompts(self, tmp_env, capsys):
+        make_cursor_session(
+            tmp_env.cursor_root,
+            "Users-me-Projects-foo",
+            "75042b11-e498-44a1-a37c-635924134bf2",
+            ["first prompt", "second prompt"],
+        )
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {}
+        ai_hist.sync_cursor(conn, state)
+        rows = conn.execute(
+            "SELECT session_id, project, prompt FROM history WHERE source='cursor' "
+            "ORDER BY prompt"
+        ).fetchall()
+        conn.close()
+        assert len(rows) == 2
+        assert rows[0][0] == "75042b11-e498-44a1-a37c-635924134bf2"
+        assert rows[0][1] == "/Users/me/Projects/foo"
+        assert rows[0][2] == "first prompt"
+        captured = capsys.readouterr()
+        assert "[cursor] +2 rows from 1 files" in captured.out
+
+    def test_skips_non_user_messages(self, tmp_env):
+        # `make_cursor_session` interleaves assistant lines — verify they're filtered.
+        make_cursor_session(tmp_env.cursor_root, "P", "s1", ["only one"])
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        ai_hist.sync_cursor(conn, {})
+        count = conn.execute(
+            "SELECT COUNT(*) FROM history WHERE source='cursor'"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 1
+
+    def test_incremental_offset(self, tmp_env):
+        jsonl = make_cursor_session(tmp_env.cursor_root, "P", "s1", ["one"])
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {}
+        ai_hist.sync_cursor(conn, state)
+        # Append a new user line.
+        with open(jsonl, "a") as f:
+            f.write(json.dumps({
+                "role": "user",
+                "message": {"content": [{"type": "text", "text": "two"}]},
+            }) + "\n")
+        ai_hist.sync_cursor(conn, state)
+        rows = conn.execute(
+            "SELECT prompt FROM history WHERE source='cursor' ORDER BY prompt"
+        ).fetchall()
+        conn.close()
+        assert [r[0] for r in rows] == ["one", "two"]
+
+    def test_skips_when_offset_at_eof(self, tmp_env):
+        jsonl = make_cursor_session(tmp_env.cursor_root, "P", "s1", ["x"])
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {"cursor": {str(jsonl): jsonl.stat().st_size}}
+        ai_hist.sync_cursor(conn, state)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM history WHERE source='cursor'"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 0
+
+    def test_handles_invalid_json(self, tmp_env, capsys):
+        session_dir = tmp_env.cursor_root / "P" / "agent-transcripts" / "s1"
+        session_dir.mkdir(parents=True)
+        jsonl = session_dir / "s1.jsonl"
+        jsonl.write_text(
+            "not valid json\n"
+            + json.dumps({"role": "user",
+                          "message": {"content": [{"type": "text", "text": "ok"}]}}) + "\n"
+        )
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        ai_hist.sync_cursor(conn, {})
+        rows = conn.execute(
+            "SELECT prompt FROM history WHERE source='cursor'"
+        ).fetchall()
+        conn.close()
+        assert rows == [("ok",)]
+        captured = capsys.readouterr()
+        assert "1 errors" in captured.out
+
+    def test_skips_files_without_matching_jsonl(self, tmp_env):
+        # session dir without the expected jsonl file — should be silently ignored.
+        (tmp_env.cursor_root / "P" / "agent-transcripts" / "empty").mkdir(parents=True)
+        # Also a non-dir entry at the project level.
+        tmp_env.cursor_root.mkdir(parents=True, exist_ok=True)
+        (tmp_env.cursor_root / "stray-file").write_text("nope")
+        # And a project dir with no agent-transcripts subdir.
+        (tmp_env.cursor_root / "Q").mkdir()
+        # And a non-dir under agent-transcripts.
+        (tmp_env.cursor_root / "P" / "agent-transcripts" / "loose.txt").write_text("x")
+
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        ai_hist.sync_cursor(conn, {})  # should not raise
+        conn.close()
+
+    def test_show_cursor_resume_hint(self, tmp_env, capsys):
+        make_cursor_session(
+            tmp_env.cursor_root,
+            "Users-me-Projects-foo",
+            "abc-123",
+            ["hello"],
+        )
+        ai_hist.cmd_sync()
+        capsys.readouterr()
+        # Find the entry id
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        eid = conn.execute(
+            "SELECT id FROM history WHERE source='cursor'"
+        ).fetchone()[0]
+        conn.close()
+        ai_hist.cmd_show(SimpleNamespace(id=eid))
+        captured = capsys.readouterr()
+        assert "cursor-agent --resume=abc-123" in captured.out
+        assert "cd /Users/me/Projects/foo" in captured.out
+
+    def test_show_cursor_resume_without_project(self, tmp_env, capsys, monkeypatch):
+        # Insert a cursor row directly with no project set.
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        conn.execute(
+            "INSERT INTO history (source, session_id, project, prompt, timestamp_ms) "
+            "VALUES ('cursor', 'sess-x', NULL, 'q', 1700000000000)"
+        )
+        conn.commit()
+        eid = conn.execute("SELECT id FROM history").fetchone()[0]
+        conn.close()
+        ai_hist.cmd_show(SimpleNamespace(id=eid))
+        captured = capsys.readouterr()
+        assert "cursor-agent --resume=sess-x" in captured.out
+        assert "cd " not in captured.out
