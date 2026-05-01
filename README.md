@@ -1,6 +1,6 @@
 # ai-hist
 
-Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), and [Agent Relay](https://github.com/AgentWorkforce/relay) conversation history into a local SQLite database with full-text search.
+Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor](https://cursor.com), and [Agent Relay](https://github.com/AgentWorkforce/relay) conversation history into a local SQLite database with full-text search.
 
 **Zero dependencies** — Python 3.8+ standard library only. Single file.
 
@@ -54,8 +54,10 @@ ai-hist context 4521 --window 15   # ±15 min window (default: 5)
 ai-hist session abc-1234-def
 ai-hist session abc-1234-def --full   # no truncation
 
-# Resume a conversation directly
-cd /path/to/project && claude --resume <session_id>   # shown by `show`
+# Resume a conversation directly (the exact command is shown by `ai-hist show <id>`)
+cd /path/to/project && claude --resume <session_id>          # claude
+codex --resume <session_id>                                   # codex
+cd /path/to/project && cursor-agent --resume=<session_id>    # cursor
 
 # Stats overview
 ai-hist stats
@@ -90,15 +92,16 @@ Top 10 projects:
 
 ## How it works
 
-ai-hist supports three sources:
+ai-hist supports four sources:
 
 | Source | How | Key fields |
 |--------|-----|------------|
 | Claude Code | Local JSONL (`~/.claude/history.jsonl`) | `display`, `timestamp`, `project`, `sessionId` |
 | Codex CLI | Local JSONL (`~/.codex/history.jsonl`) | `text`, `ts`, `session_id` |
+| Cursor | Per-session JSONL (`~/.cursor/projects/<encoded-path>/agent-transcripts/<uuid>/<uuid>.jsonl`) | `role`, `message.content[].text` (user prompts wrapped in `<user_query>...`) |
 | [Agent Relay](https://github.com/AgentWorkforce/relay) | API (`https://api.relaycast.dev/v1`) | `sender`, `content`, `channel`, `timestamp` |
 
-**Claude Code & Codex** are synced from local JSONL files incrementally (byte-offset tracking in `.sync-state.json`).
+**Claude Code, Codex & Cursor** are synced from local JSONL files incrementally (byte-offset tracking in `.sync-state.json`). Cursor lines have no per-line timestamp, so the file mtime at sync time is used.
 
 **Agent Relay** is synced via the [Relaycast API](https://github.com/AgentWorkforce/relaycast), pulling workspace messages with cursor-based pagination. Configure with:
 
@@ -173,7 +176,7 @@ ai-hist watch --interval 30  # syncs every 30s
 ```sql
 CREATE TABLE history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,          -- 'claude', 'codex', or 'relay'
+    source TEXT NOT NULL,          -- 'claude', 'codex', 'cursor', or 'relay'
     session_id TEXT,
     project TEXT,
     prompt TEXT NOT NULL,

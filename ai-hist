@@ -27,6 +27,8 @@ SOURCES = {
     "codex": Path.home() / ".codex" / "history.jsonl",
 }
 
+CURSOR_ROOT = Path.home() / ".cursor" / "projects"
+
 # --- Schema ------------------------------------------------------------------
 
 SCHEMA = """\
@@ -84,6 +86,110 @@ PARSERS = {
     "claude": parse_claude,
     "codex": parse_codex,
 }
+
+
+def parse_cursor_line(line: str):
+    """Extract a user prompt from a cursor agent-transcripts jsonl line.
+
+    Cursor lines have shape `{role, message: {content: [{type, text}, ...]}}`
+    and carry no per-line timestamp. User prompts are wrapped in
+    `<user_query>...</user_query>`.
+    """
+    obj = json.loads(line)
+    if obj.get("role") != "user":
+        return None
+    msg = obj.get("message") or {}
+    content = msg.get("content")
+    text = ""
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                text = c.get("text", "")
+                break
+    text = text.strip()
+    if not text:
+        return None
+    if text.startswith("<user_query>") and text.endswith("</user_query>"):
+        text = text[len("<user_query>"):-len("</user_query>")].strip()
+    return text or None
+
+
+def _decode_cursor_project(name: str) -> str:
+    """Decode an encoded cursor project dir name back into a filesystem path."""
+    return "/" + name.replace("-", "/")
+
+
+def sync_cursor(conn: sqlite3.Connection, state: dict):
+    """Sync user prompts from ~/.cursor/projects/*/agent-transcripts/."""
+    if not CURSOR_ROOT.exists():
+        return
+
+    cursor_state = state.get("cursor", {})
+    inserted = 0
+    errors = 0
+    files_seen = 0
+
+    for project_dir in sorted(CURSOR_ROOT.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        ts_root = project_dir / "agent-transcripts"
+        if not ts_root.is_dir():
+            continue
+        project_path = _decode_cursor_project(project_dir.name)
+        for session_dir in sorted(ts_root.iterdir()):
+            if not session_dir.is_dir():
+                continue
+            session_id = session_dir.name
+            jsonl = session_dir / f"{session_id}.jsonl"
+            if not jsonl.exists():
+                continue
+            files_seen += 1
+            try:
+                stat = jsonl.stat()
+            except OSError:
+                errors += 1
+                continue
+            offset = cursor_state.get(str(jsonl), 0)
+            if offset >= stat.st_size:
+                continue
+            ts_ms = int(stat.st_mtime * 1000)
+            try:
+                with open(jsonl, "r", encoding="utf-8") as f:
+                    f.seek(offset)
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            text = parse_cursor_line(line)
+                        except (json.JSONDecodeError, KeyError, TypeError):
+                            errors += 1
+                            continue
+                        if not text:
+                            continue
+                        try:
+                            cur = conn.execute(
+                                "INSERT OR IGNORE INTO history "
+                                "(source, session_id, project, prompt, timestamp_ms) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                ("cursor", session_id, project_path, text, ts_ms),
+                            )
+                            if cur.rowcount > 0:
+                                inserted += 1
+                        except sqlite3.Error:
+                            errors += 1
+            except OSError:
+                errors += 1
+                continue
+            cursor_state[str(jsonl)] = stat.st_size
+
+    conn.commit()
+    state["cursor"] = cursor_state
+    if files_seen:
+        suffix = f" ({errors} errors)" if errors else ""
+        print(f"  [cursor] +{inserted:,} rows from {files_seen} files{suffix}")
 
 # --- Relaycast API -----------------------------------------------------------
 
@@ -335,6 +441,9 @@ def cmd_sync(args=None):
         state[name] = file_size
         print(f"  [{name}] +{inserted:,} rows" + (f" ({errors} errors)" if errors else ""))
 
+    # Sync Cursor agent transcripts (auto-discovered, no config needed)
+    sync_cursor(conn, state)
+
     # Sync Relaycast (opt-in via env vars)
     sync_relaycast(conn, state)
 
@@ -431,6 +540,12 @@ def cmd_show(args):
             print(f"  Resume:  cd {project} && claude --resume {session_id}")
         elif source == "codex" and session_id:
             print(f"  Resume:  codex --resume {session_id}")
+        elif source == "cursor":
+            cmd = f"cursor-agent --resume={session_id}"
+            if project:
+                print(f"  Resume:  cd {project} && {cmd}")
+            else:
+                print(f"  Resume:  {cmd}")
     print(f"  Context: ai-hist context {id_}")
     conn.close()
 
@@ -550,13 +665,13 @@ def main():
 
     s = sub.add_parser("search", help="Full-text search prompts")
     s.add_argument("query", nargs="+", help="Search terms")
-    s.add_argument("--source", choices=["claude", "codex", "relay"], help="Filter by source")
+    s.add_argument("--source", choices=["claude", "codex", "cursor", "relay"], help="Filter by source")
     s.add_argument("--project", help="Filter by project path (substring match)")
     s.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
 
     r = sub.add_parser("recent", help="Show most recent entries")
     r.add_argument("n", nargs="?", type=int, default=20, help="Number of entries (default: 20)")
-    r.add_argument("--source", choices=["claude", "codex", "relay"], help="Filter by source")
+    r.add_argument("--source", choices=["claude", "codex", "cursor", "relay"], help="Filter by source")
     r.add_argument("--project", help="Filter by project path (substring match)")
 
     sh = sub.add_parser("show", help="Show full details for an entry by ID")
