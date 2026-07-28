@@ -471,6 +471,16 @@ fn quote_fts_term(term: &str) -> String {
     format!("\"{}\"", term.replace('"', "\"\""))
 }
 
+pub fn raw_fts_query_error(raw: bool, error: rusqlite::Error) -> anyhow::Error {
+    if raw {
+        anyhow::anyhow!(
+            "Invalid raw FTS5 MATCH expression. Quote literal terms (for example, \"parity-check\") or remove --fts to use the default search."
+        )
+    } else {
+        error.into()
+    }
+}
+
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
     Ok(HistoryEntry {
         id: row.get(0)?,
@@ -534,8 +544,12 @@ pub fn search(
     sql.push_str(" ORDER BY h.timestamp_ms DESC LIMIT ?");
     params_vec.push(filter.limit.max(1).to_string());
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_entry)?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params_vec), row_to_entry)
+        .map_err(|error| raw_fts_query_error(raw_fts, error))?;
+    Ok(rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| raw_fts_query_error(raw_fts, error))?)
 }
 
 pub fn recent(conn: &Connection, filter: &QueryFilter) -> Result<Vec<HistoryEntry>> {
@@ -870,6 +884,10 @@ mod tests {
         assert_eq!(
             build_fts_query(&["deploy".into(), "-relay".into()], false),
             "\"deploy\" NOT \"relay\""
+        );
+        assert_eq!(
+            build_fts_query(&["parity-check".into()], false),
+            "\"parity-check\""
         );
         assert_eq!(build_fts_query(&["foo*".into()], false), "foo*");
     }

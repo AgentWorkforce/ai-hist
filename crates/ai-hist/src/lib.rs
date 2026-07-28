@@ -1,8 +1,8 @@
 use ai_hist_core::convergence::MachineIdentity;
 use ai_hist_core::{
     default_db_path, import_json, insert_history, normalize_tag_name, open_db, parse_cursor_text,
-    prompt_hash, recent, resume_command, search, session, sync_opencode_db, untag_session,
-    HistoryEntry, QueryFilter, SOURCE_CHOICES,
+    prompt_hash, raw_fts_query_error, recent, resume_command, search, session, sync_opencode_db,
+    untag_session, HistoryEntry, QueryFilter, SOURCE_CHOICES,
 };
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
@@ -125,6 +125,8 @@ enum Command {
         human: bool,
         #[arg(long, default_value_t = 20)]
         limit: i64,
+        /// Pass the query through as a raw FTS5 MATCH expression. Operators such as
+        /// `-`, `*`, `AND`, `OR`, and `NOT` are interpreted; quote literal terms yourself.
         #[arg(long)]
         fts: bool,
         #[arg(long)]
@@ -207,6 +209,8 @@ enum Command {
     Resume {
         #[arg(required = true)]
         query: Vec<String>,
+        /// Pass the query through as a raw FTS5 MATCH expression. Operators such as
+        /// `-`, `*`, `AND`, `OR`, and `NOT` are interpreted; quote literal terms yourself.
         #[arg(long)]
         fts: bool,
         #[arg(long)]
@@ -2587,8 +2591,10 @@ fn search_history_rows(
                 kind: "history".to_string(),
                 match_source: "history".to_string(),
             })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        })
+        .map_err(|error| raw_fts_query_error(raw_fts, error))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| raw_fts_query_error(raw_fts, error))?;
     Ok(rows)
 }
 
@@ -2627,8 +2633,10 @@ fn search_event_rows(
                 kind: row.get(7)?,
                 match_source: "session_event".to_string(),
             })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        })
+        .map_err(|error| raw_fts_query_error(raw_fts, error))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| raw_fts_query_error(raw_fts, error))?;
     Ok(rows)
 }
 
@@ -4970,6 +4978,30 @@ mod tests {
                 && row.role == "assistant"
                 && row.text.contains("I will update auth.ts")
         }));
+    }
+
+    #[test]
+    fn malformed_raw_fts_query_has_a_friendly_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let error = search_all(
+            &conn,
+            &["parity-check".to_string()],
+            true,
+            &QueryFilter {
+                limit: 10,
+                ..Default::default()
+            },
+            SearchRole::All,
+        )
+        .expect_err("malformed raw FTS query should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("Invalid raw FTS5 MATCH expression"));
+        assert!(message.contains("Quote literal terms"));
+        assert!(!message.contains("no such column"));
+        assert!(!message.contains("SQL error or missing database"));
     }
 
     #[test]
