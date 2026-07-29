@@ -471,8 +471,28 @@ fn quote_fts_term(term: &str) -> String {
     format!("\"{}\"", term.replace('"', "\"\""))
 }
 
+/// True when a SQLite error is FTS5 rejecting the MATCH expression itself.
+///
+/// FTS5 surfaces a malformed expression as a `SqliteFailure` whose message names
+/// the fts5 parser, or -- when a bareword is parsed as a column reference -- as
+/// `no such column: <term>`. Anything else (I/O, decoding, a genuine schema
+/// mismatch) is a real failure and must not be relabelled.
+fn is_fts5_syntax_error(error: &rusqlite::Error) -> bool {
+    let rusqlite::Error::SqliteFailure(_, Some(message)) = error else {
+        return false;
+    };
+    let m = message.to_ascii_lowercase();
+    m.contains("fts5")
+        || m.contains("malformed match")
+        || m.contains("unterminated string")
+        || m.starts_with("no such column")
+}
+
+/// Map an FTS5 expression error to actionable guidance, leaving every other
+/// error untouched. Only applies in raw mode, where the caller supplied the
+/// MATCH expression verbatim.
 pub fn raw_fts_query_error(raw: bool, error: rusqlite::Error) -> anyhow::Error {
-    if raw {
+    if raw && is_fts5_syntax_error(&error) {
         anyhow::anyhow!(
             "Invalid raw FTS5 MATCH expression. Quote literal terms (for example, \"parity-check\") or remove --fts to use the default search."
         )

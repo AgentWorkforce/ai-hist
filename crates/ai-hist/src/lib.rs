@@ -4996,12 +4996,41 @@ mod tests {
             SearchRole::All,
         )
         .expect_err("malformed raw FTS query should fail");
-        let message = error.to_string();
+        assert_friendly_fts_error(&error.to_string());
 
-        assert!(message.contains("Invalid raw FTS5 MATCH expression"));
-        assert!(message.contains("Quote literal terms"));
-        assert!(!message.contains("no such column"));
-        assert!(!message.contains("SQL error or missing database"));
+        // event-row branch: history lookup succeeds, the event search still parses raw
+        let assistant_error = search_all(
+            &conn,
+            &["parity-check".to_string()],
+            true,
+            &QueryFilter {
+                limit: 10,
+                ..Default::default()
+            },
+            SearchRole::Assistant,
+        )
+        .expect_err("malformed raw FTS query should fail for assistant role");
+        assert_friendly_fts_error(&assistant_error.to_string());
+
+        // core search invoked directly with raw_fts enabled
+        let core_error = ai_hist_core::search(
+            &conn,
+            &["parity-check".to_string()],
+            true,
+            &QueryFilter {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .expect_err("malformed raw FTS query should fail in core search");
+        assert_friendly_fts_error(&core_error.to_string());
+    }
+
+    fn assert_friendly_fts_error(message: &str) {
+        assert!(message.contains("Invalid raw FTS5 MATCH expression"), "got: {message}");
+        assert!(message.contains("Quote literal terms"), "got: {message}");
+        assert!(!message.contains("no such column"), "got: {message}");
+        assert!(!message.contains("SQL error or missing database"), "got: {message}");
     }
 
     #[test]
