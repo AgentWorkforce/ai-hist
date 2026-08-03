@@ -21,7 +21,7 @@ use std::time::Duration;
 mod cloud;
 mod learn;
 
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 /// When set, sync progress lines (`[claude] +N rows`, …) are suppressed. The
 /// in-process library API ([`sync_and_push`]) sets this so an embedding host's
@@ -2888,20 +2888,65 @@ fn load_sqlite_entries(path: &Path) -> Result<Vec<HistoryEntry>> {
     Ok(entries)
 }
 
+/// Sync state is an optimization, not a source of truth: an unreadable file
+/// costs a full re-scan (every insert path upserts) but must never wedge sync.
+/// A disk-full write used to leave this file empty and abort every later run.
 fn load_sync_state(path: &Path) -> Result<Map<String, Value>> {
     if !path.exists() {
         return Ok(Map::new());
     }
-    let value: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
-    Ok(value.as_object().cloned().unwrap_or_default())
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!(
+                "ai-hist: could not read {} ({err}); starting from empty sync state",
+                path.display()
+            );
+            return Ok(Map::new());
+        }
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(value) => Ok(value.as_object().cloned().unwrap_or_default()),
+        Err(err) => {
+            eprintln!(
+                "ai-hist: {} is corrupt ({err}); starting from empty sync state",
+                path.display()
+            );
+            Ok(Map::new())
+        }
+    }
 }
 
+/// Writes via a temp file + rename so an interrupted or out-of-space write
+/// leaves the previous state intact rather than a truncated file.
+///
+/// The temp name is unique per writer, not just per destination: `sync_basic`
+/// runs from the CLI, from `watch_loop`, and from the in-process napi binding,
+/// so two saves can overlap. Sharing one temp path would let them interleave
+/// writes and rename a torn blend into place, or leave the slower writer's
+/// rename failing on a path the faster one already moved — reintroducing the
+/// class of failure this function exists to prevent.
 fn save_sync_state(path: &Path, state: &Map<String, Value>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_string_pretty(state)? + "\n")?;
-    Ok(())
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+    let tmp_path = path.with_extension(format!(
+        "json.tmp.{}.{}",
+        std::process::id(),
+        NEXT_TMP_ID.fetch_add(1, AtomicOrdering::Relaxed)
+    ));
+    let saved = fs::write(&tmp_path, serde_json::to_string_pretty(state)? + "\n")
+        .with_context(|| format!("writing sync state to {}", tmp_path.display()))
+        .and_then(|()| {
+            fs::rename(&tmp_path, path)
+                .with_context(|| format!("replacing sync state at {}", path.display()))
+        });
+    if saved.is_err() {
+        // Best effort: don't leave a stray temp file behind on a failed save.
+        let _ = fs::remove_file(&tmp_path);
+    }
+    saved
 }
 
 fn sync_jsonl_incremental(
@@ -4787,8 +4832,9 @@ fn home_dir() -> PathBuf {
 mod tests {
     use super::{
         cron_schedule, file_stamp, git_commit_time_ms, git_stdout, ingest_claude_transcript,
-        link_git_commit, parse_trajectory_file, paths_overlap, search_all, shell_single_quote,
-        strip_url_credentials, sync_claude_session_metadata, xml_escape, SearchRole,
+        link_git_commit, load_sync_state, parse_trajectory_file, paths_overlap, save_sync_state,
+        search_all, shell_single_quote, strip_url_credentials, sync_claude_session_metadata,
+        xml_escape, SearchRole,
     };
     use ai_hist_core::{init_db, QueryFilter};
     use rusqlite::Connection;
@@ -4816,6 +4862,82 @@ mod tests {
         assert_eq!(cron_schedule(300).2, 300);
         assert_eq!(cron_schedule(5400).2, 7200);
         assert_eq!(cron_schedule(420).2, 600);
+    }
+
+    #[test]
+    fn load_sync_state_recovers_from_empty_or_corrupt_file() {
+        let dir = std::env::temp_dir().join(format!("ai-hist-state-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".sync-state.json");
+
+        // Missing file: nothing synced yet.
+        assert!(load_sync_state(&path).unwrap().is_empty());
+
+        // Empty file — what an ENOSPC-truncated write leaves behind. Used to
+        // abort every sync with "EOF while parsing a value at line 1 column 0".
+        fs::write(&path, "").unwrap();
+        assert!(load_sync_state(&path).unwrap().is_empty());
+
+        // Partially written / otherwise corrupt JSON.
+        fs::write(&path, "{\"claude\": ").unwrap();
+        assert!(load_sync_state(&path).unwrap().is_empty());
+
+        // Valid state still round-trips.
+        let mut state = Map::new();
+        state.insert("claude".into(), json!({"offset": 42}));
+        save_sync_state(&path, &state).unwrap();
+        assert_eq!(load_sync_state(&path).unwrap(), state);
+
+        // The temp file is renamed away, never left beside the real one.
+        assert_eq!(leftover_tmp_files(&dir), Vec::<String>::new());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Temp files staged by `save_sync_state`, which should never outlive a save.
+    fn leftover_tmp_files(dir: &std::path::Path) -> Vec<String> {
+        let mut found: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".sync-state.json.tmp"))
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn concurrent_saves_never_publish_a_torn_state_file() {
+        let dir =
+            std::env::temp_dir().join(format!("ai-hist-state-concurrent-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".sync-state.json");
+
+        // Each writer stages a differently-sized payload, so a shared temp path
+        // would interleave into something that either fails to parse or blends
+        // two writers' bytes. Every save must publish exactly one writer's state.
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut state = Map::new();
+                    state.insert("writer".into(), json!(i));
+                    state.insert("padding".into(), json!("x".repeat(i * 4096)));
+                    save_sync_state(&path, &state).unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        // Whoever renamed last wins, but the winner must be intact and whole.
+        let published = load_sync_state(&path).unwrap();
+        let writer = published.get("writer").and_then(Value::as_u64).unwrap();
+        let padding = published.get("padding").and_then(Value::as_str).unwrap();
+        assert_eq!(padding.len(), writer as usize * 4096);
+        assert_eq!(leftover_tmp_files(&dir), Vec::<String>::new());
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
