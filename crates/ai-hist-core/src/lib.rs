@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, DatabaseName, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -254,6 +255,71 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     // Before init_db: creating the schema takes a write lock too.
     conn.busy_timeout(BUSY_TIMEOUT)?;
     init_db(&conn)?;
+    Ok(conn)
+}
+
+/// Objects and columns [`init_db`] adds, checked before trusting a read-only
+/// handle. Extend this whenever init_db gains a table or column, otherwise a
+/// database created by an older release is served queries against a schema it
+/// does not have.
+const REQUIRED_TABLES: &[&str] = &[
+    "history",
+    "history_fts",
+    "session_events",
+    "session_events_fts",
+    "tool_calls",
+    "file_edits",
+    "session_commit_links",
+    "trajectories",
+    "trajectory_fts",
+    "tags",
+    "session_tags",
+    "sessions",
+];
+const REQUIRED_HISTORY_COLUMNS: &[&str] = &["prompt_hash", "git_branch"];
+
+/// Whether this database already has everything [`init_db`] would add.
+///
+/// Read-only handles skip `init_db`, so an older database would otherwise be
+/// queried against tables and columns that do not exist -- a user upgrading
+/// from before `session_events` existed would get `no such table` on their
+/// first search instead of a silent migration. Callers fall back to a writable
+/// open (which migrates) when this returns false.
+pub fn schema_is_current(conn: &Connection) -> Result<bool> {
+    let mut table = conn.prepare("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1")?;
+    for name in REQUIRED_TABLES {
+        if !table.exists([name])? {
+            return Ok(false);
+        }
+    }
+    let columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('history')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(REQUIRED_HISTORY_COLUMNS
+        .iter()
+        .all(|needed| columns.contains(*needed)))
+}
+
+/// Open the database for reading only.
+///
+/// A read-only handle cannot acquire the write lock, so a query can neither
+/// block the writer nor be blocked behind it -- WAL readers proceed against
+/// their snapshot regardless of who is writing. Deliberately skips [`init_db`]:
+/// applying the schema is itself a write, so routing every `search`/`recent`
+/// through `open_db` made read commands contend for a lock they never needed.
+///
+/// Fails if the database does not exist yet; callers wanting create-on-demand
+/// should fall back to [`open_db`].
+pub fn open_db_readonly(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening {} read-only", path.display()))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     Ok(conn)
 }
 
@@ -893,6 +959,68 @@ pub fn import_json(conn: &Connection, entries: &[HistoryEntry]) -> Result<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_outdated_database_is_not_reported_as_schema_current() {
+        let dir = std::env::temp_dir().join(format!("ai-hist-schema-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // A database from before session_events existed: a read-only handle
+        // skips init_db, so serving queries here would surface `no such table`
+        // rather than migrating.
+        let old_path = dir.join("old.db");
+        let old = Connection::open(&old_path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE history (id INTEGER PRIMARY KEY, source TEXT, prompt TEXT, timestamp_ms INTEGER);",
+        )
+        .unwrap();
+        assert!(!schema_is_current(&old).unwrap());
+
+        // A database opened through init_db has everything.
+        let current = open_db(&dir.join("current.db")).unwrap();
+        assert!(schema_is_current(&current).unwrap());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_read_only_handle_can_read_but_never_write() {
+        let dir = std::env::temp_dir().join(format!("ai-hist-ro-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ro.db");
+        let writer = open_db(&path).unwrap();
+        insert_history(
+            &writer,
+            &HistoryEntry {
+                id: 0,
+                source: "claude".into(),
+                session_id: Some("s".into()),
+                project: None,
+                prompt: "hello".into(),
+                prompt_hash: None,
+                timestamp_ms: 1,
+            },
+        )
+        .unwrap();
+
+        let reader = open_db_readonly(&path).unwrap();
+        let count: i64 = reader
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // The point of the read-only handle: it cannot take the write lock, so
+        // a read command can never contend with or block the single writer.
+        let err = reader
+            .execute_batch("CREATE TABLE nope (x)")
+            .expect_err("a read-only handle must reject writes");
+        assert!(
+            err.to_string().contains("readonly"),
+            "expected a readonly error, got: {err}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn open_db_waits_longer_than_the_rusqlite_default_for_a_busy_writer() {
