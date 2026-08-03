@@ -21,7 +21,7 @@ use std::time::Duration;
 mod cloud;
 mod learn;
 
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 /// When set, sync progress lines (`[claude] +N rows`, …) are suppressed. The
 /// in-process library API ([`sync_and_push`]) sets this so an embedding host's
@@ -2911,16 +2911,34 @@ fn load_sync_state(path: &Path) -> Result<Map<String, Value>> {
 
 /// Writes via a temp file + rename so an interrupted or out-of-space write
 /// leaves the previous state intact rather than a truncated file.
+///
+/// The temp name is unique per writer, not just per destination: `sync_basic`
+/// runs from the CLI, from `watch_loop`, and from the in-process napi binding,
+/// so two saves can overlap. Sharing one temp path would let them interleave
+/// writes and rename a torn blend into place, or leave the slower writer's
+/// rename failing on a path the faster one already moved — reintroducing the
+/// class of failure this function exists to prevent.
 fn save_sync_state(path: &Path, state: &Map<String, Value>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, serde_json::to_string_pretty(state)? + "\n")
-        .with_context(|| format!("writing sync state to {}", tmp_path.display()))?;
-    fs::rename(&tmp_path, path)
-        .with_context(|| format!("replacing sync state at {}", path.display()))?;
-    Ok(())
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+    let tmp_path = path.with_extension(format!(
+        "json.tmp.{}.{}",
+        std::process::id(),
+        NEXT_TMP_ID.fetch_add(1, AtomicOrdering::Relaxed)
+    ));
+    let saved = fs::write(&tmp_path, serde_json::to_string_pretty(state)? + "\n")
+        .with_context(|| format!("writing sync state to {}", tmp_path.display()))
+        .and_then(|()| {
+            fs::rename(&tmp_path, path)
+                .with_context(|| format!("replacing sync state at {}", path.display()))
+        });
+    if saved.is_err() {
+        // Best effort: don't leave a stray temp file behind on a failed save.
+        let _ = fs::remove_file(&tmp_path);
+    }
+    saved
 }
 
 fn sync_jsonl_incremental(
@@ -4863,7 +4881,53 @@ mod tests {
         assert_eq!(load_sync_state(&path).unwrap(), state);
 
         // The temp file is renamed away, never left beside the real one.
-        assert!(!dir.join(".sync-state.json.tmp").exists());
+        assert_eq!(leftover_tmp_files(&dir), Vec::<String>::new());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Temp files staged by `save_sync_state`, which should never outlive a save.
+    fn leftover_tmp_files(dir: &std::path::Path) -> Vec<String> {
+        let mut found: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".sync-state.json.tmp"))
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn concurrent_saves_never_publish_a_torn_state_file() {
+        let dir =
+            std::env::temp_dir().join(format!("ai-hist-state-concurrent-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".sync-state.json");
+
+        // Each writer stages a differently-sized payload, so a shared temp path
+        // would interleave into something that either fails to parse or blends
+        // two writers' bytes. Every save must publish exactly one writer's state.
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut state = Map::new();
+                    state.insert("writer".into(), json!(i));
+                    state.insert("padding".into(), json!("x".repeat(i * 4096)));
+                    save_sync_state(&path, &state).unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        // Whoever renamed last wins, but the winner must be intact and whole.
+        let published = load_sync_state(&path).unwrap();
+        let writer = published.get("writer").and_then(Value::as_u64).unwrap();
+        let padding = published.get("padding").and_then(Value::as_str).unwrap();
+        assert_eq!(padding.len(), writer as usize * 4096);
+        assert_eq!(leftover_tmp_files(&dir), Vec::<String>::new());
 
         fs::remove_dir_all(&dir).ok();
     }
