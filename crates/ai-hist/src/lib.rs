@@ -1,8 +1,8 @@
 use ai_hist_core::convergence::MachineIdentity;
 use ai_hist_core::{
-    default_db_path, import_json, insert_history, normalize_tag_name, open_db, parse_cursor_text,
-    prompt_hash, raw_fts_query_error, recent, resume_command, search, session, sync_opencode_db,
-    untag_session, HistoryEntry, QueryFilter, SOURCE_CHOICES,
+    default_db_path, import_json, insert_history, normalize_tag_name, open_db, open_db_readonly,
+    parse_cursor_text, prompt_hash, raw_fts_query_error, recent, resume_command, schema_is_current,
+    search, session, sync_opencode_db, untag_session, HistoryEntry, QueryFilter, SOURCE_CHOICES,
 };
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
@@ -240,6 +240,11 @@ enum Command {
         #[arg(long, default_value_t = 60)]
         interval: u64,
     },
+    /// Diagnose database health: size, WAL, free space, and who holds the write lock.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
     /// Build a compact context pack from matching history.
     Pack {
         #[arg(required = true)]
@@ -469,12 +474,63 @@ enum LinkAction {
     },
 }
 
+/// Whether a command only reads the shared database.
+///
+/// Conservative by construction: anything not listed here gets a writable
+/// handle, so a miscategorised command fails safe (an unnecessary write lock)
+/// rather than unsafe (a write attempt on a read-only connection). `export`
+/// qualifies because it only writes to a separate destination file.
+fn is_read_only(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Search { .. }
+            | Command::Recent { .. }
+            | Command::Session { .. }
+            | Command::Show { .. }
+            | Command::Context { .. }
+            | Command::Stats { .. }
+            | Command::Tags { .. }
+            | Command::Resume { .. }
+            | Command::Export { .. }
+            | Command::Pack { .. }
+            | Command::Doctor { .. }
+    )
+}
+
+/// A non-contending handle for this command, or `None` to open writably.
+///
+/// `None` covers three cases: the command writes, the database does not exist
+/// yet, or its schema predates this build. That last one matters because a
+/// read-only handle skips `init_db`: serving queries over a database missing
+/// tables `init_db` would have added turns a silent migration into `no such
+/// table` on the user's first search.
+fn read_only_connection(command: &Command, db_path: &Path) -> Option<Connection> {
+    if !is_read_only(command) || !db_path.exists() {
+        return None;
+    }
+    let conn = open_db_readonly(db_path).ok()?;
+    match schema_is_current(&conn) {
+        Ok(true) => Some(conn),
+        // Pending migration, or the check itself failed: let the writable path
+        // sort it out rather than guessing.
+        _ => None,
+    }
+}
+
 /// CLI entry point. `src/main.rs` is a thin wrapper that calls this so the same
 /// code is available as a library (for the napi binding).
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let db_path = cli.db.unwrap_or_else(default_db_path);
-    let conn = open_db(&db_path)?;
+    // Read-only commands get a handle that cannot take the write lock, so a
+    // query never contends with the writer. Falls back to a writable open when
+    // the database does not exist yet (that first open creates it) or when it
+    // predates the current schema (a read-only handle skips init_db, so the
+    // migration has to happen through a writable connection first).
+    let conn = match read_only_connection(&cli.command, &db_path) {
+        Some(conn) => conn,
+        None => open_db(&db_path)?,
+    };
 
     match cli.command {
         Command::Search {
@@ -555,6 +611,7 @@ pub fn run() -> Result<()> {
         }
         Command::Show { id, json } => show_entry(&conn, id, json),
         Command::Context { id, window } => show_context(&conn, id, window),
+        Command::Doctor { json } => doctor(&db_path, json),
         Command::Pack {
             query,
             source,
@@ -1668,6 +1725,228 @@ fn import_history(conn: &Connection, path: &Path, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// Sidecar paths SQLite keeps beside the database in WAL mode.
+fn wal_path(db_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}-wal", db_path.display()))
+}
+
+/// Free bytes on the filesystem holding `path`.
+///
+/// Shells out to `df` rather than taking a libc dependency for one number;
+/// this crate already shells out to `git` for the same reason.
+fn free_bytes(path: &Path) -> Option<u64> {
+    // df needs an existing path: fall back to the parent for a database that
+    // has not been created yet.
+    let target = if path.exists() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    let out = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(&target)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Filesystem  1024-blocks  Used  Available  Capacity  Mounted-on
+    let available_kb: u64 = text
+        .lines()
+        .nth(1)?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()?;
+    Some(available_kb * 1024)
+}
+
+/// A process holding the database file open, and whether it can still release it.
+struct DbHolder {
+    pid: String,
+    state: String,
+    command: String,
+}
+
+impl DbHolder {
+    /// Stopped (`T`) and zombie (`Z`) processes never run again on their own, so
+    /// a write transaction they hold is held forever -- no busy timeout escapes
+    /// it. This is the condition that wedged sync for days.
+    fn is_wedged(&self) -> bool {
+        self.state.starts_with('T') || self.state.starts_with('Z')
+    }
+}
+
+/// Processes with the database open, via `lsof`, annotated with `ps` state.
+fn db_holders(db_path: &Path) -> Vec<DbHolder> {
+    let Ok(out) = std::process::Command::new("lsof")
+        .arg("-t")
+        .arg(db_path)
+        .output()
+    else {
+        return Vec::new();
+    };
+    let own_pid = std::process::id().to_string();
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        // Our own read-only handle is not a finding.
+        .filter(|pid| *pid != own_pid)
+        .filter_map(|pid| {
+            let info = std::process::Command::new("ps")
+                .args(["-o", "stat=,command=", "-p", pid])
+                .output()
+                .ok()?;
+            let line = String::from_utf8_lossy(&info.stdout).trim().to_string();
+            let (state, command) = line.split_once(char::is_whitespace)?;
+            Some(DbHolder {
+                pid: pid.to_string(),
+                state: state.to_string(),
+                command: command.trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Can a writer actually start right now?
+///
+/// Uses a short timeout on purpose: `doctor` should report a wedged database
+/// promptly rather than inherit the 30s production wait.
+fn probe_write_lock(db_path: &Path) -> std::result::Result<(), String> {
+    let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
+    let _ = conn.busy_timeout(Duration::from_millis(1500));
+    conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+        .map_err(|err| err.to_string())
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// WAL beyond this points at checkpoint starvation: a long-lived reader is
+/// pinning an old snapshot so SQLite cannot reclaim frames.
+const WAL_WARN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Below this, a write can fail partway and leave torn state behind, which is
+/// how the `.sync-state.json` corruption started.
+const FREE_SPACE_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
+
+fn doctor(db_path: &Path, json: bool) -> Result<()> {
+    let db_bytes = fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+    let wal_bytes = fs::metadata(wal_path(db_path))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let free = free_bytes(db_path);
+    let lock = probe_write_lock(db_path);
+    let holders = db_holders(db_path);
+
+    let mut problems: Vec<String> = Vec::new();
+    if let Err(err) = &lock {
+        problems.push(format!("write lock unavailable: {err}"));
+    }
+    // Having the file open is not the same as owning a write transaction, and
+    // SQLite will not say who holds the lock. So only assert causation when a
+    // writer is actually blocked; otherwise report the stopped process as a
+    // risk, which is true without overclaiming.
+    for holder in holders.iter().filter(|h| h.is_wedged()) {
+        if lock.is_err() {
+            problems.push(format!(
+                "pid {} is {} and holds the database open; if it is mid-transaction it can never release the write lock (resume it: kill -CONT {})",
+                holder.pid, holder.state, holder.pid
+            ));
+        } else {
+            problems.push(format!(
+                "pid {} is {} and holds the database open; writes work now, but it will wedge them if it stops mid-transaction (resume it: kill -CONT {})",
+                holder.pid, holder.state, holder.pid
+            ));
+        }
+    }
+    if wal_bytes > WAL_WARN_BYTES {
+        problems.push(format!(
+            "WAL is {} -- checkpointing is starved, usually by a long-lived reader",
+            human_bytes(wal_bytes)
+        ));
+    }
+    if free.is_some_and(|free| free < FREE_SPACE_FLOOR_BYTES) {
+        problems.push(format!(
+            "only {} free -- writes can fail partway and leave torn state",
+            human_bytes(free.unwrap_or(0))
+        ));
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "db_path": db_path.display().to_string(),
+                "db_bytes": db_bytes,
+                "wal_bytes": wal_bytes,
+                "free_bytes": free,
+                "write_lock": match &lock {
+                    Ok(()) => json!("available"),
+                    Err(err) => json!({"blocked": err}),
+                },
+                "holders": holders.iter().map(|h| json!({
+                    "pid": h.pid,
+                    "state": h.state,
+                    "command": h.command,
+                    "wedged": h.is_wedged(),
+                })).collect::<Vec<_>>(),
+                "problems": problems,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("database: {}", db_path.display());
+    println!("  size:  {}", human_bytes(db_bytes));
+    println!("  WAL:   {}", human_bytes(wal_bytes));
+    println!(
+        "  free:  {}",
+        free.map(human_bytes).unwrap_or_else(|| "unknown".into())
+    );
+    match &lock {
+        Ok(()) => println!("  write lock: available"),
+        Err(err) => println!("  write lock: BLOCKED ({err})"),
+    }
+    if holders.is_empty() {
+        println!("  holders: none detected");
+    } else {
+        println!("  holders:");
+        for holder in &holders {
+            let flag = if holder.is_wedged() {
+                "  <-- WEDGED"
+            } else {
+                ""
+            };
+            println!(
+                "    pid {:<8} {:<5} {}{flag}",
+                holder.pid, holder.state, holder.command
+            );
+        }
+    }
+    if problems.is_empty() {
+        println!("\nNo problems detected.");
+    } else {
+        println!("\nProblems:");
+        for problem in &problems {
+            println!("  - {problem}");
+        }
+    }
+    Ok(())
+}
+
 fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
     let home = home_dir();
     let mut total_inserted = 0;
@@ -1675,6 +1954,21 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(".sync-state.json");
+    // Refuse to start rather than fail partway. A write that runs out of space
+    // mid-flight is what truncated .sync-state.json and wedged sync for days;
+    // stopping up front with an actionable message is strictly better than
+    // discovering it through torn state.
+    if let Some(free) = free_bytes(db_path) {
+        if free < FREE_SPACE_FLOOR_BYTES {
+            anyhow::bail!(
+                "only {} free on the volume holding {} (need {}). \
+                 Free space before syncing: a write that fails partway can leave torn state.",
+                human_bytes(free),
+                db_path.display(),
+                human_bytes(FREE_SPACE_FLOOR_BYTES)
+            );
+        }
+    }
     let mut state = load_sync_state(&state_path)?;
     // Checkpoint after every source that advances `state`, rather than once at
     // the end. A run can die partway through -- killed process, locked database,
@@ -1689,6 +1983,7 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
         "claude",
         &home.join(".claude/history.jsonl"),
         parse_claude_line,
+        &mut |in_progress| checkpoint_sync_state(&state_path, in_progress),
     )?;
     checkpoint_sync_state(&state_path, &state);
     sync_claude_session_metadata(conn, &mut state, &home.join(".claude/projects"))?;
@@ -1714,6 +2009,23 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
     total_inserted += sync_relaycast(conn, &mut state)?;
     checkpoint_sync_state(&state_path, &state);
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
+    // Fold the WAL back into the database now that the writes are done. Best
+    // effort: a concurrent reader pinning an old snapshot blocks a full
+    // checkpoint, and that is not a reason to fail a sync that did its work.
+    // Left unchecked the WAL grows without bound (156MB observed in the wild).
+    if let Err(err) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+        sync_note!("  [wal] checkpoint skipped: {err}");
+    }
+    let wal_bytes = fs::metadata(wal_path(db_path))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if wal_bytes > WAL_WARN_BYTES {
+        eprintln!(
+            "ai-hist: WAL is {} after checkpointing -- a long-lived reader is \
+             pinning an old snapshot; run `ai-hist doctor`",
+            human_bytes(wal_bytes)
+        );
+    }
     sync_note!("  [rust-sync] +{total_inserted} rows");
     sync_note!("  Total: {total} entries");
     Ok(())
@@ -1911,10 +2223,7 @@ fn install_launchd_service(spec: &ServiceSpec, bin: &str, interval: u64) -> Resu
     );
     println!("  plist: {}", plist_path.display());
     println!("  check: launchctl list | grep ai-hist   (middle column 0 = healthy)");
-    println!(
-        "  remove: ai-hist {} --uninstall-service",
-        spec.subcommand
-    );
+    println!("  remove: ai-hist {} --uninstall-service", spec.subcommand);
     Ok(())
 }
 
@@ -3017,12 +3326,24 @@ fn save_sync_state(path: &Path, state: &Map<String, Value>) -> Result<()> {
     saved
 }
 
+/// Lines per transaction when ingesting a JSONL source.
+///
+/// Two jobs. It takes the write lock once per chunk instead of once per row,
+/// which matters because this database has several concurrent writers and every
+/// auto-commit insert is a separate lock acquisition. And it bounds how much
+/// work a failure can destroy: the byte offset is checkpointed on each commit,
+/// so an interrupted run resumes from the last committed chunk. Ingesting a
+/// large backlog in one transaction would instead hold the write lock for
+/// minutes and starve everyone else.
+const JSONL_CHUNK_LINES: usize = 2_000;
+
 fn sync_jsonl_incremental(
     conn: &Connection,
     state: &mut Map<String, Value>,
     name: &str,
     path: &Path,
     parser: fn(&str) -> Result<Option<HistoryEntry>>,
+    checkpoint: &mut dyn FnMut(&Map<String, Value>),
 ) -> Result<usize> {
     if !path.exists() {
         sync_note!("  [{name}] not found: {} (skipped)", path.display());
@@ -3040,18 +3361,51 @@ fn sync_jsonl_incremental(
     reader.seek_relative(offset as i64)?;
     let mut inserted = 0;
     let mut errors = 0;
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match parser(&line) {
-            Ok(Some(entry)) => inserted += insert_history(conn, &entry)?,
-            Ok(None) => {}
-            Err(_) => errors += 1,
-        }
+    // Byte position of the last line handed to the database, tracked as we read
+    // so a checkpoint records exactly what is committed. The file is append-only,
+    // so this offset stays valid across runs.
+    let mut consumed = offset;
+    let ingest = {
+        let mut run = || -> Result<()> {
+            conn.execute_batch("BEGIN")?;
+            let mut pending = 0usize;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let read = reader.read_line(&mut line)?;
+                if read == 0 {
+                    break;
+                }
+                consumed += read as u64;
+                if !line.trim().is_empty() {
+                    match parser(&line) {
+                        Ok(Some(entry)) => inserted += insert_history(conn, &entry)?,
+                        Ok(None) => {}
+                        Err(_) => errors += 1,
+                    }
+                }
+                pending += 1;
+                if pending >= JSONL_CHUNK_LINES {
+                    conn.execute_batch("COMMIT")?;
+                    state.insert(name.to_string(), json!(consumed));
+                    checkpoint(state);
+                    conn.execute_batch("BEGIN")?;
+                    pending = 0;
+                }
+            }
+            conn.execute_batch("COMMIT")?;
+            state.insert(name.to_string(), json!(consumed));
+            Ok(())
+        };
+        run()
+    };
+    if let Err(err) = ingest {
+        // Drop the open chunk, then persist the offset of the chunks that did
+        // commit so the next run resumes there instead of starting over.
+        let _ = conn.execute_batch("ROLLBACK");
+        checkpoint(state);
+        return Err(err);
     }
-    state.insert(name.to_string(), json!(size));
     let suffix = if errors > 0 {
         format!(" ({errors} errors)")
     } else {
@@ -4922,11 +5276,11 @@ mod tests {
         assert_eq!(cron_schedule(5400).0, "0 */2 * * *"); // 90 min -> every 2h, not hourly
         assert_eq!(cron_schedule(86_400).0, "0 0 * * *"); // 1 day -> daily, not hourly
         assert_eq!(cron_schedule(90_000).0, "0 0 * * *"); // 25h -> daily
-        // Non-divisor steps round up to a uniform divisor (no short boundary gap).
+                                                          // Non-divisor steps round up to a uniform divisor (no short boundary gap).
         assert_eq!(cron_schedule(420).0, "*/10 * * * *"); // 7 min -> */10 (not */7)
         assert_eq!(cron_schedule(2700).0, "0 * * * *"); // 45 min -> hourly (60 is next divisor)
         assert_eq!(cron_schedule(25_200).0, "0 */8 * * *"); // 7h -> */8 (uniform), not */7
-        // The effective period flags whether the interval was matched exactly.
+                                                            // The effective period flags whether the interval was matched exactly.
         assert_eq!(cron_schedule(300).2, 300);
         assert_eq!(cron_schedule(5400).2, 7200);
         assert_eq!(cron_schedule(420).2, 600);
@@ -5027,6 +5381,130 @@ mod tests {
         // same map after each one. Rewriting the full file seven times a minute
         // for no change is pure cost, so nothing should be written.
         assert!(super::merged_sync_state(&path, &state).unwrap().is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_non_mutating_commands_get_a_read_only_handle() {
+        // Reads must not take the write lock...
+        assert!(super::is_read_only(&super::Command::Stats {
+            tag: None,
+            json: false
+        }));
+        assert!(super::is_read_only(&super::Command::Show {
+            id: 1,
+            json: false
+        }));
+
+        // ...and anything that writes must not get a read-only handle, or it
+        // fails at runtime with "attempt to write a readonly database".
+        assert!(!super::is_read_only(&super::Command::Sync {
+            install_service: false,
+            uninstall_service: false,
+            interval: 60,
+        }));
+        assert!(!super::is_read_only(&super::Command::Tag {
+            session_id: "s".into(),
+            tag_name: "t".into(),
+            source: None,
+            color: None,
+            json: false,
+        }));
+    }
+
+    #[test]
+    fn a_stopped_or_zombie_holder_is_reported_as_wedged() {
+        let wedged = |state: &str| {
+            super::DbHolder {
+                pid: "1".into(),
+                state: state.into(),
+                command: "agent-relay".into(),
+            }
+            .is_wedged()
+        };
+
+        // Stopped and zombie processes never run again on their own, so a lock
+        // they hold is held forever -- this is the case worth surfacing.
+        assert!(wedged("T"));
+        assert!(wedged("Ts"));
+        assert!(wedged("Z"));
+        // Running or sleeping holders are normal and will release in time.
+        assert!(!wedged("S"));
+        assert!(!wedged("R"));
+        assert!(!wedged("Ss"));
+    }
+
+    #[test]
+    fn human_bytes_scales_units() {
+        assert_eq!(super::human_bytes(512), "512 B");
+        assert_eq!(super::human_bytes(1024), "1.0 KB");
+        assert_eq!(super::human_bytes(156_205_712), "149.0 MB");
+        assert_eq!(super::human_bytes(3_038_662_656), "2.8 GB");
+    }
+
+    #[test]
+    fn jsonl_ingest_checkpoints_mid_source_and_resumes_from_there() {
+        let dir = std::env::temp_dir().join(format!("ai-hist-jsonl-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+
+        // Span several chunks so checkpoints land inside the source, not just
+        // at its end -- that is what lets an interrupted run make progress.
+        let lines = super::JSONL_CHUNK_LINES * 2 + 500;
+        let body: String = (0..lines)
+            .map(|i| {
+                format!(
+                    r#"{{"display":"prompt {i}","timestamp":{},"project":"/p","sessionId":"s"}}"#,
+                    i + 1
+                ) + "\n"
+            })
+            .collect();
+        fs::write(&path, &body).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        let mut checkpoints: Vec<u64> = Vec::new();
+        let inserted = super::sync_jsonl_incremental(
+            &conn,
+            &mut state,
+            "claude",
+            &path,
+            super::parse_claude_line,
+            &mut |in_progress| {
+                checkpoints.push(in_progress.get("claude").and_then(Value::as_u64).unwrap());
+            },
+        )
+        .unwrap();
+        assert_eq!(inserted, lines);
+
+        // Progress was published while the source was still running, and each
+        // checkpoint is a real byte position inside the file.
+        assert_eq!(checkpoints.len(), lines / super::JSONL_CHUNK_LINES);
+        assert!(checkpoints.windows(2).all(|w| w[0] < w[1]));
+        assert!(checkpoints.iter().all(|&at| at < body.len() as u64));
+        assert_eq!(
+            state.get("claude").and_then(Value::as_u64),
+            Some(body.len() as u64)
+        );
+
+        // Resuming from a mid-file checkpoint ingests only the remainder, and
+        // the offsets line up exactly -- nothing skipped, nothing double-counted.
+        let resumed_conn = Connection::open_in_memory().unwrap();
+        init_db(&resumed_conn).unwrap();
+        let mut resumed = Map::new();
+        resumed.insert("claude".into(), json!(checkpoints[0]));
+        let after = super::sync_jsonl_incremental(
+            &resumed_conn,
+            &mut resumed,
+            "claude",
+            &path,
+            super::parse_claude_line,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(after, lines - super::JSONL_CHUNK_LINES);
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -5306,10 +5784,16 @@ mod tests {
     }
 
     fn assert_friendly_fts_error(message: &str) {
-        assert!(message.contains("Invalid raw FTS5 MATCH expression"), "got: {message}");
+        assert!(
+            message.contains("Invalid raw FTS5 MATCH expression"),
+            "got: {message}"
+        );
         assert!(message.contains("Quote literal terms"), "got: {message}");
         assert!(!message.contains("no such column"), "got: {message}");
-        assert!(!message.contains("SQL error or missing database"), "got: {message}");
+        assert!(
+            !message.contains("SQL error or missing database"),
+            "got: {message}"
+        );
     }
 
     #[test]
