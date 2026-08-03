@@ -2938,9 +2938,51 @@ fn load_sync_state(path: &Path) -> Result<Map<String, Value>> {
 /// leaves the previous state intact when a write fails, so the worst case is a
 /// re-scan rather than corruption.
 fn checkpoint_sync_state(path: &Path, state: &Map<String, Value>) {
-    if let Err(err) = save_sync_state(path, state) {
-        eprintln!("ai-hist: could not checkpoint sync state: {err:#}");
+    match merged_sync_state(path, state) {
+        // Disk is already current; skip the rewrite.
+        Ok(None) => {}
+        Ok(Some(merged)) => {
+            if let Err(err) = save_sync_state(path, &merged) {
+                eprintln!("ai-hist: could not checkpoint sync state: {err:#}");
+            }
+        }
+        Err(err) => eprintln!("ai-hist: could not checkpoint sync state: {err:#}"),
     }
+}
+
+/// Fold this run's cursors into whatever is already on disk.
+///
+/// Sync runs are not serialized -- the CLI, the background service, and the
+/// in-process napi entry point can all overlap -- and each holds its own copy
+/// of the whole state map. Writing that copy wholesale lets a slow run replace
+/// a fast run's newer cursors with its own stale ones, so the next run rescans
+/// work that was already finished: exactly the loop checkpointing exists to
+/// prevent. Merging per key keeps sources this run did not touch, and cursors
+/// are monotonic byte offsets so a smaller one is always staler and is dropped.
+///
+/// Returns `None` when disk already reflects everything here, so a steady-state
+/// run that finds every source up to date does not rewrite the file per source.
+fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Map<String, Value>>> {
+    let mut merged = load_sync_state(path)?;
+    let mut changed = false;
+    for (key, value) in ours {
+        match (merged.get(key), value.as_u64()) {
+            // A cursor that has not advanced past what is on disk is stale.
+            (Some(existing), Some(ours_offset))
+                if existing
+                    .as_u64()
+                    .is_some_and(|on_disk| on_disk >= ours_offset) =>
+            {
+                continue
+            }
+            // Unchanged non-cursor entries (per-file maps) need no rewrite.
+            (Some(existing), None) if existing == value => continue,
+            _ => {}
+        }
+        merged.insert(key.clone(), value.clone());
+        changed = true;
+    }
+    Ok(if changed { Some(merged) } else { None })
 }
 
 /// Writes via a temp file + rename so an interrupted or out-of-space write
@@ -4929,6 +4971,64 @@ mod tests {
             .collect();
         found.sort();
         found
+    }
+
+    #[test]
+    fn a_slow_run_cannot_rewind_or_clobber_a_faster_runs_cursors() {
+        let dir = std::env::temp_dir().join(format!("ai-hist-merge-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".sync-state.json");
+
+        // A fast run finished claude and codex and moved on.
+        let mut fast = Map::new();
+        fast.insert("claude".into(), json!(900));
+        fast.insert("codex".into(), json!(500));
+        checkpoint_sync_state(&path, &fast);
+
+        // A slow overlapping run only just finished claude, at an older offset.
+        // Writing its whole map wholesale would rewind claude and delete codex,
+        // sending the next run back over work that was already done.
+        let mut slow = Map::new();
+        slow.insert("claude".into(), json!(400));
+        checkpoint_sync_state(&path, &slow);
+
+        let on_disk = load_sync_state(&path).unwrap();
+        assert_eq!(on_disk.get("claude").and_then(Value::as_u64), Some(900));
+        assert_eq!(on_disk.get("codex").and_then(Value::as_u64), Some(500));
+
+        // A genuinely newer cursor still advances.
+        let mut newer = Map::new();
+        newer.insert("claude".into(), json!(1200));
+        checkpoint_sync_state(&path, &newer);
+        assert_eq!(
+            load_sync_state(&path)
+                .unwrap()
+                .get("claude")
+                .and_then(Value::as_u64),
+            Some(1200)
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unchanged_source_does_not_rewrite_the_state_file() {
+        let dir = std::env::temp_dir().join(format!("ai-hist-norewrite-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".sync-state.json");
+
+        let mut state = Map::new();
+        state.insert("claude".into(), json!(42));
+        state.insert("codex".into(), json!({"files": {"a.jsonl": 7}}));
+        assert!(super::merged_sync_state(&path, &state).unwrap().is_some());
+        checkpoint_sync_state(&path, &state);
+
+        // Steady state: every source reports "up to date" and checkpoints the
+        // same map after each one. Rewriting the full file seven times a minute
+        // for no change is pure cost, so nothing should be written.
+        assert!(super::merged_sync_state(&path, &state).unwrap().is_none());
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
