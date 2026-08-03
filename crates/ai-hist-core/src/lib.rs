@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// WS-9 cloud-sync: local recall store → WS-1 convergence envelope (Agent Relay Loop).
 pub mod convergence;
@@ -235,11 +236,23 @@ pub fn default_db_path() -> PathBuf {
         })
 }
 
+/// How long a writer waits for a competing writer before giving up.
+///
+/// Raised from rusqlite's 5s default. The database is shared by several
+/// long-lived writers (the sync agent, the MCP server, relay brokers) and WAL
+/// admits one at a time, so a lock can be held longer than 5s -- a large WAL
+/// being recovered or checkpointed is enough. Sync then dies mid-run with
+/// "database is locked" and, being long-running, is the process most likely to
+/// be waiting when that happens.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub fn open_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
+    // Before init_db: creating the schema takes a write lock too.
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     init_db(&conn)?;
     Ok(conn)
 }
@@ -880,6 +893,40 @@ pub fn import_json(conn: &Connection, entries: &[HistoryEntry]) -> Result<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_db_waits_longer_than_the_rusqlite_default_for_a_busy_writer() {
+        let dir = std::env::temp_dir().join(format!("ai-hist-busy-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("busy.db");
+        let conn = open_db(&path).unwrap();
+
+        // rusqlite already waits 5s by default; this database is contended by
+        // several long-lived writers and a lock can outlast that, so sync needs
+        // a longer grace period than the default gives it.
+        let configured: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(configured, BUSY_TIMEOUT.as_millis() as i64);
+        assert!(
+            configured > 5_000,
+            "expected a longer wait than rusqlite's 5s default, got {configured}ms"
+        );
+
+        // The waiting is real: a competing writer blocks rather than erroring.
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        open_db(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE contended_probe (x)")
+            .expect("writer should wait for the lock, not fail with SQLITE_BUSY");
+        releaser.join().unwrap();
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn parses_claude_and_codex() {
