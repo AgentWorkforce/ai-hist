@@ -1676,6 +1676,13 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
         .unwrap_or_else(|| Path::new("."))
         .join(".sync-state.json");
     let mut state = load_sync_state(&state_path)?;
+    // Checkpoint after every source that advances `state`, rather than once at
+    // the end. A run can die partway through -- killed process, locked database,
+    // full disk -- and state written only at the end discards every source that
+    // already finished, sending the next run back over the same files. That
+    // turns one interrupted run into a loop that re-scans from scratch forever
+    // and never persists anything. Checkpointing makes each source's cursor
+    // durable the moment that source completes.
     total_inserted += sync_jsonl_incremental(
         conn,
         &mut state,
@@ -1683,11 +1690,17 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
         &home.join(".claude/history.jsonl"),
         parse_claude_line,
     )?;
+    checkpoint_sync_state(&state_path, &state);
     sync_claude_session_metadata(conn, &mut state, &home.join(".claude/projects"))?;
+    checkpoint_sync_state(&state_path, &state);
     total_inserted += sync_codex(conn, &mut state, &home)?;
+    checkpoint_sync_state(&state_path, &state);
     total_inserted += sync_cursor(conn, &mut state, &home.join(".cursor/projects"))?;
+    checkpoint_sync_state(&state_path, &state);
     total_inserted += sync_grok(conn, &mut state, &home.join(".grok/sessions"))?;
+    checkpoint_sync_state(&state_path, &state);
     total_inserted += sync_trajectories(conn, &mut state)?;
+    checkpoint_sync_state(&state_path, &state);
     let opencode = std::env::var_os("OPENCODE_DB")
         .map(PathBuf::from)
         .unwrap_or_else(default_opencode_db_path);
@@ -1699,8 +1712,8 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
     }
     total_inserted += open_inserted;
     total_inserted += sync_relaycast(conn, &mut state)?;
+    checkpoint_sync_state(&state_path, &state);
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
-    save_sync_state(&state_path, &state)?;
     sync_note!("  [rust-sync] +{total_inserted} rows");
     sync_note!("  Total: {total} entries");
     Ok(())
@@ -2914,6 +2927,19 @@ fn load_sync_state(path: &Path) -> Result<Map<String, Value>> {
             );
             Ok(Map::new())
         }
+    }
+}
+
+/// Persist progress mid-run, between sources.
+///
+/// Deliberately non-fatal: the rows are already committed, so a run that
+/// finished real work should not be reported as failed because its bookkeeping
+/// write did not land. The next checkpoint retries, and [`save_sync_state`]
+/// leaves the previous state intact when a write fails, so the worst case is a
+/// re-scan rather than corruption.
+fn checkpoint_sync_state(path: &Path, state: &Map<String, Value>) {
+    if let Err(err) = save_sync_state(path, state) {
+        eprintln!("ai-hist: could not checkpoint sync state: {err:#}");
     }
 }
 
@@ -4831,10 +4857,10 @@ fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        cron_schedule, file_stamp, git_commit_time_ms, git_stdout, ingest_claude_transcript,
-        link_git_commit, load_sync_state, parse_trajectory_file, paths_overlap, save_sync_state,
-        search_all, shell_single_quote, strip_url_credentials, sync_claude_session_metadata,
-        xml_escape, SearchRole,
+        checkpoint_sync_state, cron_schedule, file_stamp, git_commit_time_ms, git_stdout,
+        ingest_claude_transcript, link_git_commit, load_sync_state, parse_trajectory_file,
+        paths_overlap, save_sync_state, search_all, shell_single_quote, strip_url_credentials,
+        sync_claude_session_metadata, xml_escape, SearchRole,
     };
     use ai_hist_core::{init_db, QueryFilter};
     use rusqlite::Connection;
@@ -4903,6 +4929,37 @@ mod tests {
             .collect();
         found.sort();
         found
+    }
+
+    #[test]
+    fn checkpoints_persist_between_sources_and_never_abort_a_run() {
+        let dir = std::env::temp_dir().join(format!("ai-hist-checkpoint-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".sync-state.json");
+
+        // A cursor saved mid-run is visible to the next run. This is what stops
+        // an interrupted sync from re-scanning what it already finished.
+        let mut state = Map::new();
+        state.insert("claude".into(), json!({"offset": 147_624_483u64}));
+        checkpoint_sync_state(&path, &state);
+        assert_eq!(load_sync_state(&path).unwrap(), state);
+
+        // A later source advances state; its checkpoint supersedes the earlier one.
+        state.insert("codex".into(), json!({"files": 3}));
+        checkpoint_sync_state(&path, &state);
+        assert_eq!(load_sync_state(&path).unwrap(), state);
+
+        // An unwritable destination warns instead of unwinding -- the rows are
+        // already committed, so a failed bookkeeping write must not fail the run.
+        let blocker = dir.join("blocker");
+        fs::write(&blocker, "not a directory").unwrap();
+        checkpoint_sync_state(&blocker.join("nested").join(".sync-state.json"), &state);
+
+        // ...and the last good checkpoint is left untouched by that failure.
+        assert_eq!(load_sync_state(&path).unwrap(), state);
+        assert_eq!(leftover_tmp_files(&dir), Vec::<String>::new());
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
