@@ -331,12 +331,17 @@ fn agent_relay_bin() -> String {
 }
 
 fn read_agent_relay_session(bin: &str) -> Result<AgentRelayCloudSession> {
+    // `--reveal-token` is REQUIRED. Without it `agent-relay cloud session --json` returns the
+    // access token *masked* (e.g. `cld_at_…Knv4`), which is not a usable bearer: relayhistory
+    // forwards it to Cloud `api/v1/auth/whoami`, which rejects it, and `ai-hist login` fails with
+    // `HTTP 401: {"error":"invalid Agent Relay Cloud token"}`. The masked form is still a
+    // syntactically plausible `cld_at_…` string, so nothing upstream catches it.
     let output = std::process::Command::new(bin)
-        .args(["cloud", "session", "--json"])
+        .args(["cloud", "session", "--json", "--reveal-token"])
         .output()
         .with_context(|| {
             format!(
-                "failed to run `{bin} cloud session --json` — install Agent Relay and run `agent-relay login`"
+                "failed to run `{bin} cloud session --json --reveal-token` — install Agent Relay and run `agent-relay login`"
             )
         })?;
     if !output.status.success() {
@@ -878,9 +883,19 @@ mod tests {
     fn login_via_cloud_exchanges_agent_relay_session() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (base_url, server) = one_shot_login_server("relay_at_abc", Some("sync"));
+        // Models the real `agent-relay cloud session --json` contract: the access token comes
+        // back MASKED unless `--reveal-token` is passed. If ai-hist ever drops that flag it gets
+        // `relay_at_MASKED`, the login server below rejects the payload, and this test fails —
+        // which is exactly the production failure it stands in for.
         let (_dir, bin) = fake_agent_relay(
-            r#"if [ "$1 $2 $3" = "cloud session --json" ]; then
-  echo '{"apiUrl":"https://agentrelay.com/cloud","accessToken":"relay_at_abc","accessTokenExpiresAt":"2999-01-01T00:00:00.000Z"}'
+            r#"case " $* " in
+  *" --reveal-token "*)
+    echo '{"apiUrl":"https://agentrelay.com/cloud","accessToken":"relay_at_abc","accessTokenExpiresAt":"2999-01-01T00:00:00.000Z"}'
+    exit 0
+    ;;
+esac
+if [ "$1 $2 $3" = "cloud session --json" ]; then
+  echo '{"apiUrl":"https://agentrelay.com/cloud","accessToken":"relay_at_MASKED","accessTokenExpiresAt":"2999-01-01T00:00:00.000Z"}'
   exit 0
 fi
 echo "unexpected args: $*" 1>&2
@@ -898,6 +913,34 @@ exit 42"#,
         assert_eq!(auth.refresh_token.as_deref(), Some("rth_rt_def"));
         assert_eq!(auth.org_id.as_deref(), Some("org_dev"));
         assert_eq!(auth.workspace_id.as_deref(), Some("ws_dev"));
+    }
+
+    /// Guards the exact defect that made `ai-hist login` fail fleet-wide: the session lookup must
+    /// ask for the UNMASKED token. `agent-relay cloud session --json` masks it by default, and the
+    /// masked stub is a plausible-looking `cld_at_…` string that only fails later, at Cloud
+    /// `whoami`, as an opaque 401.
+    #[cfg(unix)]
+    #[test]
+    fn cloud_session_invocation_requests_unmasked_token() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let log_dir = tempfile::tempdir().unwrap();
+        let argv_log = log_dir.path().join("argv.log");
+        let (_dir, bin) = fake_agent_relay(&format!(
+            r#"echo "$*" > {}
+echo '{{"apiUrl":"https://agentrelay.com/cloud","accessToken":"relay_at_abc","accessTokenExpiresAt":"2999-01-01T00:00:00.000Z"}}'
+exit 0"#,
+            argv_log.display()
+        ));
+        let _cloud_token = EnvVarGuard::remove("CLOUD_API_ACCESS_TOKEN");
+
+        read_agent_relay_session(bin.to_str().unwrap()).unwrap();
+
+        let argv = fs::read_to_string(&argv_log).unwrap();
+        assert!(
+            argv.contains("--reveal-token"),
+            "ai-hist must request the unmasked token; without `--reveal-token` the CLI forwards a \
+             masked stub and login fails with `invalid Agent Relay Cloud token`. argv was: {argv}"
+        );
     }
 
     #[cfg(unix)]
