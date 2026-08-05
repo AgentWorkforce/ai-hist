@@ -354,8 +354,9 @@ fn read_agent_relay_session(bin: &str) -> Result<AgentRelayCloudSession> {
             stderr.trim()
         );
     }
-    serde_json::from_slice(&output.stdout)
-        .context("parsing Agent Relay Cloud session JSON from `agent-relay cloud session --json`")
+    serde_json::from_slice(&output.stdout).context(
+        "parsing Agent Relay Cloud session JSON from `agent-relay cloud session --json --reveal-token`",
+    )
 }
 
 fn ensure_agent_relay_session(
@@ -925,12 +926,14 @@ exit 42"#,
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let log_dir = tempfile::tempdir().unwrap();
         let argv_log = log_dir.path().join("argv.log");
-        let (_dir, bin) = fake_agent_relay(&format!(
-            r#"echo "$*" > {}
-echo '{{"apiUrl":"https://agentrelay.com/cloud","accessToken":"relay_at_abc","accessTokenExpiresAt":"2999-01-01T00:00:00.000Z"}}'
+        // Pass the capture path via env and expand it quoted — a temp dir containing spaces or
+        // shell metacharacters would otherwise break the fixture rather than the assertion.
+        let _argv_log_env = EnvVarGuard::set("AI_HIST_TEST_ARGV_LOG", argv_log.as_os_str());
+        let (_dir, bin) = fake_agent_relay(
+            r#"printf '%s\n' "$@" > "$AI_HIST_TEST_ARGV_LOG"
+echo '{"apiUrl":"https://agentrelay.com/cloud","accessToken":"relay_at_abc","accessTokenExpiresAt":"2999-01-01T00:00:00.000Z"}'
 exit 0"#,
-            argv_log.display()
-        ));
+        );
         let _cloud_token = EnvVarGuard::remove("CLOUD_API_ACCESS_TOKEN");
 
         read_agent_relay_session(bin.to_str().unwrap()).unwrap();
