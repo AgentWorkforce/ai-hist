@@ -838,25 +838,58 @@ fn safe_cell(raw: &str) -> String {
     cleaned
 }
 
-/// Render the cursor map as `key=value` pairs.
+/// Cursor keys `push` actually sends (`cloud.rs`, `IngestRequest.cursors`). Rendered first
+/// so the real watermark survives any budget applied to an over-stuffed cursor object.
+const KNOWN_CURSOR_KEYS: [&str; 2] = ["history_id", "trajectory_rowid"];
+
+/// Most cursor entries to render before summarising the rest.
+const MAX_CURSOR_ENTRIES: usize = 6;
+
+/// Render the cursor map as `key=value` pairs, bounded without losing the diagnostic.
 ///
-/// Each key and value is bounded *individually* rather than capping the joined string.
-/// Capping the whole cell would let one long entry silently push a later one out entirely,
-/// and the cursor is the diagnostic this column exists to show — losing `history_id` to a
-/// display cap would defeat the point. Every key stays visible; only an absurd value is
-/// shortened.
+/// Three constraints pull against each other here, and the earlier attempts each dropped
+/// one:
+///
+/// - Bound the output. `cursors` is stored as free-form jsonb from whatever the client
+///   sent, so a machine can put arbitrarily many keys in its own row.
+/// - Never *silently* drop a key. Capping the joined string did exactly that — an entry
+///   sorting before `history_id` could push it out with nothing to show it had happened.
+/// - Keep the watermark visible. `history_id` is the number this column exists for.
+///
+/// So: known cursor keys first, then the rest alphabetically, bounded by entry count with
+/// any remainder stated explicitly rather than vanishing. Each key and value is also
+/// bounded individually, so one absurd value cannot crowd out its neighbours.
 fn format_cursors(cursors: &serde_json::Value) -> String {
-    match cursors.as_object() {
-        Some(map) if !map.is_empty() => {
-            let mut parts: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("{}={}", safe_cell(k), safe_cell(&compact_json(v))))
-                .collect();
-            parts.sort();
-            parts.join(" ")
+    let Some(map) = cursors.as_object().filter(|m| !m.is_empty()) else {
+        return "-".to_string();
+    };
+
+    let mut rest: Vec<&String> = map
+        .keys()
+        .filter(|k| !KNOWN_CURSOR_KEYS.contains(&k.as_str()))
+        .collect();
+    rest.sort();
+
+    let ordered = KNOWN_CURSOR_KEYS
+        .iter()
+        .filter_map(|k| map.get_key_value(*k).map(|(k, _)| k))
+        .chain(rest);
+
+    let mut parts = Vec::new();
+    let mut omitted = 0usize;
+    for key in ordered {
+        if parts.len() >= MAX_CURSOR_ENTRIES {
+            omitted += 1;
+            continue;
         }
-        _ => "-".to_string(),
+        let value = map.get(key).map(compact_json).unwrap_or_default();
+        parts.push(format!("{}={}", safe_cell(key), safe_cell(&value)));
     }
+    if omitted > 0 {
+        parts.push(format!("(+{omitted} more)"));
+    }
+
+    parts.join(" ")
 }
 
 fn compact_json(v: &serde_json::Value) -> String {
@@ -1301,6 +1334,40 @@ mod tests {
         assert!(out.contains("trajectory_rowid=1641"), "{out}");
         // The absurd value is still shortened rather than printed in full.
         assert!(!out.contains(&"z".repeat(100)), "{out}");
+    }
+
+    /// `cursors` is free-form jsonb from the client, so a machine can stuff its own row
+    /// with arbitrarily many keys. Bound it — but state the remainder rather than letting
+    /// keys vanish, and never at the cost of the watermark itself.
+    #[test]
+    fn coverage_table_bounds_an_overstuffed_cursor_without_hiding_the_watermark() {
+        let mut m = coverage_machine("finn-mini", "active", 30, 1);
+        let mut cursors = serde_json::Map::new();
+        for i in 0..50 {
+            // "aaa_*" sorts ahead of history_id, so a naive order loses the watermark.
+            cursors.insert(format!("aaa_filler_{i:02}"), serde_json::json!(i));
+        }
+        cursors.insert("history_id".into(), serde_json::json!(13_409_762));
+        cursors.insert("trajectory_rowid".into(), serde_json::json!(1641));
+        m.cursors = serde_json::Value::Object(cursors);
+
+        let out = format_fleet_coverage(&CoverageResponse {
+            machines: vec![m],
+            summary: CoverageSummary {
+                total: 1,
+                active: 1,
+                ..Default::default()
+            },
+            thresholds: CoverageThresholds::default(),
+        });
+
+        // The watermark survives 50 keys that all sort ahead of it.
+        assert!(out.contains("history_id=13409762"), "{out}");
+        assert!(out.contains("trajectory_rowid=1641"), "{out}");
+        // Bounded...
+        assert!(!out.contains("aaa_filler_49"), "{out}");
+        // ...but the omission is stated, not silent. 52 keys - 6 rendered = 46.
+        assert!(out.contains("(+46 more)"), "{out}");
     }
 
     #[test]
