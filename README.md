@@ -277,7 +277,7 @@ ai-hist coverage --json             # same data, machine-readable
 ai-hist coverage --fail-on-stale    # exit 1 if any machine has fallen behind
 ```
 
-```
+```text
 Fleet coverage — 3 machine(s): 2 active, 0 stale, 1 missing
 
 MACHINE     STATUS   LAST PUSH  24H PUSHES  RECORDS  CURSOR
@@ -294,8 +294,9 @@ with `--stale-after` and `--missing-after` if your push interval differs.
 
 The push and record columns are there because recency alone is not coverage: a
 machine working through a large backlog pushes on schedule for days while its
-history is still far behind. When its batches keep filling the push limit,
-`coverage` says so explicitly.
+history is still far behind. When a machine's most recent push filled its batch
+limit, `coverage` says so — that is evidence it had more queued at that push,
+not proof a backlog still exists, and the wording keeps that distinction.
 
 `--fail-on-stale` is what makes this more than a spot check — run it from cron
 and a machine going quiet raises an alert instead of going unnoticed.

@@ -516,6 +516,10 @@ fn is_read_only(command: &Command) -> bool {
             | Command::Export { .. }
             | Command::Pack { .. }
             | Command::Doctor { .. }
+            // `coverage` queries the server and never reads the local database at all.
+            // Listing it here keeps it off the write lock, so running it does not contend
+            // with the 60s `sync` service.
+            | Command::Coverage { .. }
     )
 }
 

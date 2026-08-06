@@ -702,12 +702,12 @@ pub fn format_fleet_coverage(resp: &CoverageResponse) -> String {
         .iter()
         .map(|m| {
             [
-                m.display_name().to_string(),
+                safe_cell(m.display_name()),
                 status_cell(&m.status),
                 format!("{} ago", humanize_secs(m.seconds_since_last_seen)),
                 m.recent.batches.to_string(),
                 m.recent.records.to_string(),
-                format_cursors(&m.cursors),
+                safe_cell(&format_cursors(&m.cursors)),
             ]
         })
         .collect();
@@ -746,17 +746,22 @@ pub fn format_fleet_coverage(resp: &CoverageResponse) -> String {
         if !m.is_reporting() {
             notes.push(format!(
                 "⚠️  {} has not pushed in {} (last seen {}).",
-                m.display_name(),
+                safe_cell(m.display_name()),
                 humanize_secs(m.seconds_since_last_seen),
-                m.last_seen_at.as_deref().unwrap_or("unknown"),
+                safe_cell(m.last_seen_at.as_deref().unwrap_or("unknown")),
             ));
-        } else if m.recent.last_batch_record_count.unwrap_or(0) >= DEFAULT_PUSH_LIMIT {
-            // Reporting on schedule, but every push is filling its batch limit: the machine
-            // is draining a backlog and its history is not current yet.
+        } else if let Some(size) = m
+            .recent
+            .last_batch_record_count
+            .filter(|size| *size >= DEFAULT_PUSH_LIMIT)
+        {
+            // A full batch means the client hit its `--limit` on that push, so more was
+            // queued *at that moment*. It does not prove a backlog still exists now — the
+            // server reports no has-more signal — so say only what the number shows.
             notes.push(format!(
-                "ℹ️  {} is pushing but still draining a backlog (last batch {} records).",
-                m.display_name(),
-                m.recent.last_batch_record_count.unwrap_or(0),
+                "ℹ️  {}'s most recent push filled its {size}-record batch limit, so it had \
+                 more history queued at that point.",
+                safe_cell(m.display_name()),
             ));
         }
     }
@@ -792,13 +797,42 @@ fn render_row(cells: &[String], widths: &[usize], right_aligned: &[bool]) -> Str
 }
 
 /// `missing` shouts, because it is the state nobody noticed for two days.
+///
+/// Unrecognised values are sanitized rather than trusted — `status` is server data like any
+/// other field here.
 fn status_cell(status: &str) -> String {
     match status {
         "active" => "active".to_string(),
         "stale" => "STALE".to_string(),
         "missing" => "MISSING".to_string(),
-        other => other.to_string(),
+        other => safe_cell(other),
     }
+}
+
+/// Longest a single cell may be. A machine cannot blow up the table by reporting a
+/// pathological hostname.
+const MAX_CELL_CHARS: usize = 64;
+
+/// Make server-supplied text safe to print to a terminal.
+///
+/// Every string in this table originates on a machine that pushed to the org — hostnames,
+/// labels and cursor keys are all attacker-influenceable by any enrolled box. A table whose
+/// entire value is "you can trust this readout" must not let one machine repaint another's
+/// row, so strip C0/C1 control characters (which kills `ESC`, and with it every CSI escape
+/// sequence) and bound the width. Anything left renders as inert literal text.
+///
+/// `--json` output is deliberately left untouched: it is not going to a terminal, and
+/// sanitizing it would corrupt the data a caller is parsing.
+fn safe_cell(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '\u{80}'..='\u{9f}'))
+        .collect();
+    if cleaned.chars().count() > MAX_CELL_CHARS {
+        let truncated: String = cleaned.chars().take(MAX_CELL_CHARS - 1).collect();
+        return format!("{truncated}…");
+    }
+    cleaned
 }
 
 fn format_cursors(cursors: &serde_json::Value) -> String {
@@ -1186,16 +1220,69 @@ mod tests {
         };
 
         let out = format_fleet_coverage(&resp);
+        // Claims only what a full batch actually shows: more was queued at that push.
+        // Asserting the absence of the stronger claim keeps the wording from drifting back.
         assert!(
-            out.contains("finn-mini is pushing but still draining a backlog"),
+            out.contains("finn-mini's most recent push filled its 500-record batch limit"),
             "{out}"
         );
+        assert!(!out.contains("still draining a backlog"), "{out}");
         assert!(
-            !out.contains("kjg-laptop is pushing but still draining"),
+            !out.contains("kjg-laptop's most recent push filled"),
             "{out}"
         );
         // Still reporting, so this is not a coverage gap — `--fail-on-stale` must not fire.
         assert!(!resp.has_gaps());
+    }
+
+    /// Hostnames come from the machines themselves. One box must not be able to repaint
+    /// another box's row — or hide its own — by reporting an escape sequence as its name.
+    #[test]
+    fn coverage_table_neutralizes_terminal_escapes_in_server_supplied_names() {
+        let mut hostile = coverage_machine("evil", "missing", 3 * 86_400, 0);
+        hostile.hostname = Some("\u{1b}[2Kok-box\u{1b}[1;32m".to_string());
+        hostile.cursors = serde_json::json!({ "history_id": "\u{1b}[31m1" });
+
+        let out = format_fleet_coverage(&CoverageResponse {
+            machines: vec![hostile],
+            summary: CoverageSummary {
+                total: 1,
+                missing: 1,
+                ..Default::default()
+            },
+            thresholds: CoverageThresholds::default(),
+        });
+
+        assert!(
+            !out.contains('\u{1b}'),
+            "raw ESC reached the terminal: {out:?}"
+        );
+        // Neutralized, not dropped — the row and its gap note must still be there.
+        assert!(out.contains("ok-box"), "{out}");
+        assert!(out.contains("MISSING"), "{out}");
+        assert!(out.contains("has not pushed in 3d"), "{out}");
+    }
+
+    #[test]
+    fn coverage_table_bounds_a_pathological_hostname() {
+        let mut huge = coverage_machine("x", "active", 10, 1);
+        huge.hostname = Some("h".repeat(500));
+
+        let out = format_fleet_coverage(&CoverageResponse {
+            machines: vec![huge],
+            summary: CoverageSummary {
+                total: 1,
+                active: 1,
+                ..Default::default()
+            },
+            thresholds: CoverageThresholds::default(),
+        });
+
+        assert!(
+            !out.contains(&"h".repeat(100)),
+            "unbounded cell widened the table"
+        );
+        assert!(out.contains('…'), "{out}");
     }
 
     #[test]
