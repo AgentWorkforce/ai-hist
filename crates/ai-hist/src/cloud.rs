@@ -67,6 +67,59 @@ fn normalize_base_url(value: &str) -> Option<String> {
     }
 }
 
+/// Refuse to put a credential on the wire in cleartext.
+///
+/// `base_url` is whatever `login`/`admin-mint` stored, and it is replayed with the `rth_at_`
+/// bearer attached by every authenticated request below — `push` on a 300s timer, `pair
+/// check` per invocation, `coverage` per run. A single `http://` in `auth.json` therefore
+/// leaks the token to anything on the path, repeatedly.
+///
+/// Loopback is exempt, and deliberately without an opt-in flag: an `http://127.0.0.1`
+/// request never reaches a network, so there is nothing to intercept, and `wrangler dev` on
+/// `http://localhost:8787` is the documented local flow. Requiring an env var there would
+/// buy no security and break the one case where plaintext is actually safe.
+///
+/// This is applied at every call site rather than only the newest one. Guarding `coverage`
+/// alone would have left the high-frequency `push` path sending the same token to the same
+/// URL — an inconsistent CLI that closes none of the exposure.
+fn require_secure_transport(base_url: &str) -> Result<()> {
+    let url = base_url.trim();
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+    if url
+        .strip_prefix("http://")
+        .is_some_and(authority_is_loopback)
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to send the relayhistory bearer token in cleartext to `{url}` — use an \
+         https:// endpoint. Plain http:// is accepted only for loopback (for example \
+         http://127.0.0.1:8787, the `wrangler dev` address)."
+    )
+}
+
+/// Does the authority of a URL — everything after `http://` — name this machine?
+///
+/// Parsed by hand rather than pulled in as a dependency, but the parts that matter for a
+/// security decision are all handled: userinfo (`http://127.0.0.1@evil.com/`), the port, and
+/// bracketed IPv6. A name that merely looks loopback-ish, like `127.0.0.1.evil.com`, fails
+/// both the literal check and the IP parse, so it is rejected.
+fn authority_is_loopback(rest: &str) -> bool {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Userinfo is everything before the *last* `@`; the host is what follows it.
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 fn auth_path() -> PathBuf {
     config_dir().join("auth.json")
 }
@@ -141,11 +194,32 @@ pub fn machine_id() -> Result<String> {
     Ok(id)
 }
 
-fn hostname() -> String {
+/// This machine's name, or `None` if the OS will not tell us.
+///
+/// `$HOSTNAME` wins when set, so a test or a deliberately-labelled box can override it.
+/// Otherwise ask the OS directly, which is the part that was missing: `HOSTNAME` is a shell
+/// convenience, not part of the environment `launchd` (or `systemd`) hands a service. The
+/// scheduled push therefore reported no hostname at all, and every pushing machine arrived
+/// as an anonymous row — exactly the identity `coverage` exists to show. A manual
+/// `ai-hist push` from a terminal looked fine, which is why it went unnoticed.
+pub fn machine_hostname() -> Option<String> {
+    fn clean(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
     std::env::var("HOSTNAME")
         .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown-host".to_string())
+        .and_then(|value| clean(&value))
+        .or_else(|| {
+            hostname::get()
+                .ok()
+                .and_then(|name| clean(&name.to_string_lossy()))
+        })
+}
+
+/// The same name with a placeholder for the one caller that needs an infallible string.
+fn hostname() -> String {
+    machine_hostname().unwrap_or_else(|| "unknown-host".to_string())
 }
 
 /// Deterministic, retry-safe batch id: a hash of the batch's contents. Re-pushing the same
@@ -224,6 +298,7 @@ pub struct UreqIngestor;
 
 impl Ingestor for UreqIngestor {
     fn ingest(&self, auth: &StoredAuth, req: &IngestRequest) -> Result<IngestResponse> {
+        require_secure_transport(&auth.base_url)?;
         let url = format!("{}/v1/ingest", auth.base_url.trim_end_matches('/'));
         let resp = ureq::post(&url)
             .set("Authorization", &format!("Bearer {}", auth.access_token))
@@ -249,6 +324,7 @@ pub fn admin_mint(
     user_id: &str,
     label: &str,
 ) -> Result<StoredAuth> {
+    require_secure_transport(base_url)?;
     let url = format!("{}/v1/admin/mint", base_url.trim_end_matches('/'));
     let mut body = serde_json::json!({ "orgId": org_id, "userId": user_id, "label": label });
     if let Some(ws) = workspace_id {
@@ -279,6 +355,7 @@ pub fn login(
     label: &str,
     mode: Option<&str>,
 ) -> Result<StoredAuth> {
+    require_secure_transport(base_url)?;
     let url = format!("{}/v1/cli/login", base_url.trim_end_matches('/'));
     let mut body = serde_json::json!({ "agentRelayToken": agent_relay_token, "label": label });
     if let Some(mode) = mode {
@@ -523,6 +600,7 @@ pub struct PairResponse {
 
 /// `POST /v1/pair/check` with the stored `rth_at_` bearer. Returns ranked advisory warnings.
 pub fn pair_check(auth: &StoredAuth, context: &PairContext, limit: usize) -> Result<PairResponse> {
+    require_secure_transport(&auth.base_url)?;
     let url = format!("{}/v1/pair/check", auth.base_url.trim_end_matches('/'));
     let req = PairRequest { context, limit };
     let resp = ureq::post(&url)
@@ -570,7 +648,8 @@ pub struct CoverageRecent {
     pub accepted: u64,
     #[serde(rename = "lastBatchAt", default)]
     pub last_batch_at: Option<String>,
-    /// Records in the newest batch. At the client's `--limit`, more was still queued.
+    /// Records in the newest batch. Carried for `--json` consumers; deliberately not used to
+    /// infer a backlog — see the note in `format_fleet_coverage`.
     #[serde(rename = "lastBatchRecordCount", default)]
     pub last_batch_record_count: Option<u64>,
 }
@@ -664,6 +743,7 @@ pub struct CoverageQuery {
 
 /// `GET /v1/machines` with the stored `rth_at_` bearer.
 pub fn fleet_coverage(auth: &StoredAuth, query: &CoverageQuery) -> Result<CoverageResponse> {
+    require_secure_transport(&auth.base_url)?;
     let url = format!("{}/v1/machines", auth.base_url.trim_end_matches('/'));
     let mut req = ureq::get(&url).set("Authorization", &format!("Bearer {}", auth.access_token));
     if let Some(v) = query.stale_after_seconds {
@@ -684,9 +764,6 @@ pub fn fleet_coverage(auth: &StoredAuth, query: &CoverageQuery) -> Result<Covera
         Err(e) => Err(e.into()),
     }
 }
-
-/// Batch size that means the client hit its default `--limit` and had more queued.
-const DEFAULT_PUSH_LIMIT: u64 = 500;
 
 /// Human-readable fleet table (the non-`--json` output).
 ///
@@ -743,6 +820,21 @@ pub fn format_fleet_coverage(resp: &CoverageResponse) -> String {
 
     // Repeat every gap in prose. A status column is easy to skim past; this is the line
     // that would have caught finn-mini.
+    //
+    // Only gaps get a note. Earlier revisions also called out a machine whose newest batch
+    // reached 500 records, reading that as a backlog still draining. That inference does not
+    // hold from anything in this payload:
+    //
+    // - 500 is `push --limit`'s *default*, not a fact about the fleet. A machine pushing
+    //   with a smaller limit fills every batch and would be flagged forever; a machine with
+    //   exactly 500 new records fills one batch and is already caught up.
+    // - The server sends no has-more signal, so "the batch was full" is the whole of what is
+    //   known — and it separates neither backlog from caught-up nor healthy from failing.
+    //   sf-mini cannot complete a 500-record batch at all (it 503s above ~200,
+    //   AgentWorkforce/relayhistory#58), so the one machine with a real ingest problem is
+    //   precisely the one this note could never fire for.
+    //
+    // The batch and record columns carry the same evidence without asserting a cause.
     let mut notes = Vec::new();
     for m in &resp.machines {
         if !m.is_reporting() {
@@ -751,19 +843,6 @@ pub fn format_fleet_coverage(resp: &CoverageResponse) -> String {
                 safe_cell(m.display_name()),
                 humanize_secs(m.seconds_since_last_seen),
                 safe_cell(m.last_seen_at.as_deref().unwrap_or("unknown")),
-            ));
-        } else if let Some(size) = m
-            .recent
-            .last_batch_record_count
-            .filter(|size| *size >= DEFAULT_PUSH_LIMIT)
-        {
-            // A full batch means the client hit its `--limit` on that push, so more was
-            // queued *at that moment*. It does not prove a backlog still exists now — the
-            // server reports no has-more signal — so say only what the number shows.
-            notes.push(format!(
-                "ℹ️  {}'s most recent push filled its {size}-record batch limit, so it had \
-                 more history queued at that point.",
-                safe_cell(m.display_name()),
             ));
         }
     }
@@ -859,35 +938,50 @@ const MAX_CURSOR_ENTRIES: usize = 6;
 /// So: known cursor keys first, then the rest alphabetically, bounded by entry count with
 /// any remainder stated explicitly rather than vanishing. Each key and value is also
 /// bounded individually, so one absurd value cannot crowd out its neighbours.
+///
+/// The bound applies to the *work* as well as the output. Sorting the whole key set and then
+/// truncating would let one enrolled machine decide how much CPU every operator's `coverage`
+/// spends, so the entries actually rendered are selected in a single bounded pass and the
+/// remainder is only counted.
 fn format_cursors(cursors: &serde_json::Value) -> String {
     let Some(map) = cursors.as_object().filter(|m| !m.is_empty()) else {
         return "-".to_string();
     };
 
-    let mut rest: Vec<&String> = map
-        .keys()
-        .filter(|k| !KNOWN_CURSOR_KEYS.contains(&k.as_str()))
-        .collect();
-    rest.sort();
-
-    let ordered = KNOWN_CURSOR_KEYS
+    let known: Vec<&String> = KNOWN_CURSOR_KEYS
         .iter()
         .filter_map(|k| map.get_key_value(*k).map(|(k, _)| k))
-        .chain(rest);
+        .collect();
 
-    let mut parts = Vec::new();
+    // Keep the `budget` lexicographically smallest unknown keys; never hold more than that.
+    let budget = MAX_CURSOR_ENTRIES.saturating_sub(known.len());
+    let mut rest: Vec<&String> = Vec::with_capacity(budget);
     let mut omitted = 0usize;
-    for key in ordered {
-        if parts.len() >= MAX_CURSOR_ENTRIES {
+    for key in map.keys() {
+        if KNOWN_CURSOR_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        let at = rest.partition_point(|held| *held < key);
+        if at >= budget {
             omitted += 1;
             continue;
         }
-        let value = map.get(key).map(compact_json).unwrap_or_default();
-        parts.push(format!("{}={}", safe_cell(key), safe_cell(&value)));
+        rest.insert(at, key);
+        if rest.len() > budget {
+            rest.pop();
+            omitted += 1;
+        }
     }
-    if omitted > 0 {
-        parts.push(format!("(+{omitted} more)"));
-    }
+
+    let parts: Vec<String> = known
+        .into_iter()
+        .chain(rest)
+        .map(|key| {
+            let value = map.get(key).map(compact_json).unwrap_or_default();
+            format!("{}={}", safe_cell(key), safe_cell(&value))
+        })
+        .chain((omitted > 0).then(|| format!("(+{omitted} more)")))
+        .collect();
 
     parts.join(" ")
 }
@@ -1103,6 +1197,35 @@ mod tests {
         });
     }
 
+    /// The bug this closes: `launchd` does not export `HOSTNAME`, so the scheduled push —
+    /// the only one that runs unattended — reported no name and landed as an anonymous row.
+    /// Every machine in `coverage` was therefore identified by an opaque `m_…` id.
+    #[test]
+    fn hostname_is_resolved_when_the_environment_does_not_supply_one() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _hostname = EnvVarGuard::remove("HOSTNAME");
+
+        let resolved = machine_hostname().expect("the OS must name this machine");
+        assert!(!resolved.trim().is_empty());
+        assert_ne!(resolved, "unknown-host");
+        assert_eq!(hostname(), resolved);
+    }
+
+    /// Kept as an override so the resolution stays testable and a box can be labelled.
+    #[test]
+    fn hostname_env_override_wins_and_an_empty_one_falls_through() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let _hostname = EnvVarGuard::set("HOSTNAME", "kjg-laptop");
+            assert_eq!(machine_hostname().as_deref(), Some("kjg-laptop"));
+        }
+        // A blank or whitespace-only `HOSTNAME` is not a name; fall through to the OS
+        // rather than pushing an empty string as this machine's identity.
+        let _blank = EnvVarGuard::set("HOSTNAME", "   ");
+        let resolved = machine_hostname().expect("the OS must name this machine");
+        assert!(!resolved.trim().is_empty());
+    }
+
     #[test]
     fn pair_request_serializes_camelcase_and_omits_empties() {
         let ctx = PairContext {
@@ -1244,13 +1367,21 @@ mod tests {
         assert!(!resp.has_gaps());
     }
 
-    /// A machine can be pushing on schedule and still be days behind on content.
+    /// A full batch is not evidence of anything, and coverage must not narrate it as if it
+    /// were. Both machines below hit their limit; neither is behind.
     #[test]
-    fn coverage_table_flags_a_machine_that_is_pushing_but_still_draining() {
-        let mut draining = coverage_machine("finn-mini", "active", 60, 12);
-        draining.recent.last_batch_record_count = Some(500);
+    fn coverage_table_does_not_infer_a_backlog_from_a_full_batch() {
+        // Filled the 500 default exactly, and is caught up: the server accepted 0 new
+        // records because it already had them all — finn-mini's real shape on 2026-08-06.
+        let mut caught_up = coverage_machine("finn-mini", "active", 60, 12);
+        caught_up.recent.last_batch_record_count = Some(500);
+        caught_up.recent.accepted = 0;
+        // Pushes with `--limit 200`, so every batch it ever completes is "full".
+        let mut small_limit = coverage_machine("sf-mini", "active", 60, 12);
+        small_limit.recent.last_batch_record_count = Some(200);
+
         let resp = CoverageResponse {
-            machines: vec![coverage_machine("kjg-laptop", "active", 60, 12), draining],
+            machines: vec![caught_up, small_limit],
             summary: CoverageSummary {
                 total: 2,
                 active: 2,
@@ -1263,17 +1394,22 @@ mod tests {
         };
 
         let out = format_fleet_coverage(&resp);
-        // Claims only what a full batch actually shows: more was queued at that push.
-        // Asserting the absence of the stronger claim keeps the wording from drifting back.
-        assert!(
-            out.contains("finn-mini's most recent push filled its 500-record batch limit"),
-            "{out}"
-        );
-        assert!(!out.contains("still draining a backlog"), "{out}");
-        assert!(
-            !out.contains("kjg-laptop's most recent push filled"),
-            "{out}"
-        );
+        // No claim about backlogs, drainage, or queued history in any wording.
+        for phrase in [
+            "backlog",
+            "draining",
+            "queued",
+            "batch limit",
+            "filled",
+            "ℹ️",
+        ] {
+            assert!(
+                !out.contains(phrase),
+                "a full batch proves nothing, so `{phrase}` must not appear: {out}"
+            );
+        }
+        // The counts stay — they are the evidence, stated without a cause attached.
+        assert!(out.contains("RECORDS"), "{out}");
         // Still reporting, so this is not a coverage gap — `--fail-on-stale` must not fire.
         assert!(!resp.has_gaps());
     }
@@ -1644,6 +1780,85 @@ exit 0"#,
             .unwrap_err()
             .to_string();
         assert!(err.contains("refusing to send"), "{err}");
+    }
+
+    fn http_auth(base_url: &str) -> StoredAuth {
+        StoredAuth {
+            base_url: base_url.to_string(),
+            access_token: "rth_at_secret".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The token must never leave the machine in cleartext, from *any* of the calls that
+    /// carry it — not just the newest one. `push` runs on a 300s timer, so it is the path
+    /// that would leak most often.
+    #[test]
+    fn authenticated_calls_refuse_a_cleartext_base_url() {
+        // `.invalid` is reserved and can never resolve (RFC 2606), so if this guard is ever
+        // removed the test fails on the assertion rather than by putting the token on a wire.
+        let auth = http_auth("http://history.relayhistory.invalid");
+
+        let coverage = fleet_coverage(&auth, &CoverageQuery::default()).unwrap_err();
+        let ingest = UreqIngestor
+            .ingest(
+                &auth,
+                &IngestRequest {
+                    machine: MachineIdentity::default(),
+                    batch_id: "b_test".into(),
+                    cursors: None,
+                    records: Vec::new(),
+                },
+            )
+            .unwrap_err();
+        let pair = pair_check(&auth, &PairContext::default(), 5).unwrap_err();
+
+        for err in [coverage, ingest, pair] {
+            let msg = err.to_string();
+            assert!(msg.contains("refusing to send"), "{msg}");
+            // The failure must not itself disclose what it was protecting.
+            assert!(!msg.contains("rth_at_secret"), "{msg}");
+        }
+    }
+
+    /// `wrangler dev` is the documented local endpoint and never puts bytes on a network,
+    /// so it stays usable — no opt-in flag, which would be friction bought with no security.
+    #[test]
+    fn loopback_stays_usable_for_local_development() {
+        for url in [
+            "http://localhost:8787",
+            "http://127.0.0.1:8787",
+            "http://[::1]:8787",
+            "http://LocalHost:8787/",
+        ] {
+            assert!(
+                require_secure_transport(url).is_ok(),
+                "loopback dev endpoint rejected: {url}"
+            );
+        }
+        assert!(require_secure_transport("https://history.agentrelay.com").is_ok());
+    }
+
+    /// A hostname that merely reads as loopback is a remote host. Userinfo is the classic
+    /// way to dress one up.
+    #[test]
+    fn loopback_exemption_cannot_be_spoofed_by_a_lookalike_host() {
+        for url in [
+            "http://127.0.0.1.evil.com/",
+            "http://localhost.evil.com:8787",
+            "http://127.0.0.1@evil.com/",
+            "http://user@localhost@evil.com/",
+            "http://evil.com/?h=localhost",
+            "http://evil.com/#127.0.0.1",
+            "http://[::1]@evil.com/",
+            "ftp://localhost:8787",
+            "history.agentrelay.com",
+        ] {
+            assert!(
+                require_secure_transport(url).is_err(),
+                "non-loopback endpoint accepted: {url}"
+            );
+        }
     }
 
     #[test]

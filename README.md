@@ -264,6 +264,21 @@ sub-minute intervals run every minute (cron's finest granularity).
 
 Running both services keeps local capture and cloud upload going end-to-end.
 The push job authenticates with the `rth_at_` token written by `ai-hist login`.
+Because that token goes on the wire, an `https://` endpoint is required; plain
+`http://` is accepted only for loopback (`http://127.0.0.1:8787`, the `wrangler
+dev` address), where nothing leaves the machine.
+
+Each push identifies the machine by name so `coverage` below can name it back.
+The name comes from the OS, with `$HOSTNAME` as an override if you want a box to
+report as something else:
+
+```bash
+HOSTNAME=kjg-laptop ai-hist push
+```
+
+`$HOSTNAME` alone is not enough to rely on — it is a shell convenience that
+launchd and systemd do not pass to a service, so a scheduled push reading only
+that variable reports no name at all.
 
 ### Checking fleet coverage
 
@@ -294,9 +309,12 @@ with `--stale-after` and `--missing-after` if your push interval differs.
 
 The push and record columns are there because recency alone is not coverage: a
 machine working through a large backlog pushes on schedule for days while its
-history is still far behind. When a machine's most recent push filled its batch
-limit, `coverage` says so — that is evidence it had more queued at that push,
-not proof a backlog still exists, and the wording keeps that distinction.
+history is still far behind. The columns show you that; `coverage` does not try
+to diagnose it for you. A batch that reached the push limit means only that the
+batch was full — it separates neither a draining machine from one that happened
+to have exactly that many records, nor a healthy machine from a failing one, and
+500 is the *default* `--limit` rather than a fact about the fleet. Calling a
+backlog needs a has-more signal the server does not yet send.
 
 `--fail-on-stale` is what makes this more than a spot check — run it from cron
 and a machine going quiet raises an alert instead of going unnoticed.

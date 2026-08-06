@@ -70,7 +70,7 @@ pub fn sync_and_push() -> Result<SyncPushOutcome> {
     };
     let machine = MachineIdentity {
         id: cloud::machine_id()?,
-        hostname: std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()),
+        hostname: cloud::machine_hostname(),
         os: Some(std::env::consts::OS.to_string()),
         cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         ..Default::default()
@@ -918,7 +918,7 @@ pub fn run() -> Result<()> {
                 .context("not authenticated — run `ai-hist login` or `ai-hist admin-mint` first")?;
             let machine = MachineIdentity {
                 id: cloud::machine_id()?,
-                hostname: std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()),
+                hostname: cloud::machine_hostname(),
                 os: Some(std::env::consts::OS.to_string()),
                 cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 ..Default::default()
@@ -5450,6 +5450,16 @@ mod tests {
         assert!(super::is_read_only(&super::Command::Show {
             id: 1,
             json: false
+        }));
+        // `coverage` never touches the local database at all — it only queries the server.
+        // Opening writably would park a scheduled `coverage --fail-on-stale` behind the 60s
+        // sync service's write lock, for a query that reads nothing local.
+        assert!(super::is_read_only(&super::Command::Coverage {
+            stale_after: None,
+            missing_after: None,
+            window_hours: None,
+            fail_on_stale: true,
+            json: false,
         }));
 
         // ...and anything that writes must not get a read-only handle, or it
