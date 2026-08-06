@@ -707,7 +707,9 @@ pub fn format_fleet_coverage(resp: &CoverageResponse) -> String {
                 format!("{} ago", humanize_secs(m.seconds_since_last_seen)),
                 m.recent.batches.to_string(),
                 m.recent.records.to_string(),
-                safe_cell(&format_cursors(&m.cursors)),
+                // Already sanitized per entry. CURSOR is the last column and `render_row`
+                // never pads the last cell, so its length cannot misalign another row.
+                format_cursors(&m.cursors),
             ]
         })
         .collect();
@@ -818,16 +820,17 @@ const MAX_CELL_CHARS: usize = 64;
 /// Every string in this table originates on a machine that pushed to the org — hostnames,
 /// labels and cursor keys are all attacker-influenceable by any enrolled box. A table whose
 /// entire value is "you can trust this readout" must not let one machine repaint another's
-/// row, so strip C0/C1 control characters (which kills `ESC`, and with it every CSI escape
-/// sequence) and bound the width. Anything left renders as inert literal text.
+/// row, so strip control characters and bound the width. Anything left renders as inert
+/// literal text.
+///
+/// `char::is_control()` is the Unicode `Cc` category, which is C0 *and* C1
+/// (U+0000–U+001F, U+007F–U+009F). That covers `ESC`, and with it every CSI escape
+/// sequence — no separate C1 range check is needed.
 ///
 /// `--json` output is deliberately left untouched: it is not going to a terminal, and
 /// sanitizing it would corrupt the data a caller is parsing.
 fn safe_cell(raw: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| !c.is_control() && !matches!(c, '\u{80}'..='\u{9f}'))
-        .collect();
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
     if cleaned.chars().count() > MAX_CELL_CHARS {
         let truncated: String = cleaned.chars().take(MAX_CELL_CHARS - 1).collect();
         return format!("{truncated}…");
@@ -835,12 +838,19 @@ fn safe_cell(raw: &str) -> String {
     cleaned
 }
 
+/// Render the cursor map as `key=value` pairs.
+///
+/// Each key and value is bounded *individually* rather than capping the joined string.
+/// Capping the whole cell would let one long entry silently push a later one out entirely,
+/// and the cursor is the diagnostic this column exists to show — losing `history_id` to a
+/// display cap would defeat the point. Every key stays visible; only an absurd value is
+/// shortened.
 fn format_cursors(cursors: &serde_json::Value) -> String {
     match cursors.as_object() {
         Some(map) if !map.is_empty() => {
             let mut parts: Vec<String> = map
                 .iter()
-                .map(|(k, v)| format!("{k}={}", compact_json(v)))
+                .map(|(k, v)| format!("{}={}", safe_cell(k), safe_cell(&compact_json(v))))
                 .collect();
             parts.sort();
             parts.join(" ")
@@ -1261,6 +1271,36 @@ mod tests {
         assert!(out.contains("ok-box"), "{out}");
         assert!(out.contains("MISSING"), "{out}");
         assert!(out.contains("has not pushed in 3d"), "{out}");
+    }
+
+    /// The cursor column is the diagnostic this report exists to expose. A display-safety
+    /// cap on the joined string would let one long entry silently push `history_id` out —
+    /// bounding each entry instead keeps every key visible.
+    #[test]
+    fn coverage_table_never_drops_a_cursor_key_to_a_width_cap() {
+        let mut m = coverage_machine("finn-mini", "active", 30, 1);
+        m.cursors = serde_json::json!({
+            "aaa_padding_key": "z".repeat(200),
+            "history_id": 13_409_762,
+            "trajectory_rowid": 1641,
+        });
+
+        let out = format_fleet_coverage(&CoverageResponse {
+            machines: vec![m],
+            summary: CoverageSummary {
+                total: 1,
+                active: 1,
+                ..Default::default()
+            },
+            thresholds: CoverageThresholds::default(),
+        });
+
+        // Sorted alphabetically, the padding key precedes history_id — a whole-cell cap
+        // would have consumed the budget before reaching it.
+        assert!(out.contains("history_id=13409762"), "{out}");
+        assert!(out.contains("trajectory_rowid=1641"), "{out}");
+        // The absurd value is still shortened rather than printed in full.
+        assert!(!out.contains(&"z".repeat(100)), "{out}");
     }
 
     #[test]
