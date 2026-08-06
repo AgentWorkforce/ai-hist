@@ -557,6 +557,281 @@ pub fn format_pair_warnings(resp: &PairResponse) -> String {
     out
 }
 
+// ----- Fleet coverage: client of GET /v1/machines -----
+
+/// Push activity for one machine inside the server's reporting window.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CoverageRecent {
+    #[serde(default)]
+    pub batches: u64,
+    #[serde(default)]
+    pub records: u64,
+    #[serde(default)]
+    pub accepted: u64,
+    #[serde(rename = "lastBatchAt", default)]
+    pub last_batch_at: Option<String>,
+    /// Records in the newest batch. At the client's `--limit`, more was still queued.
+    #[serde(rename = "lastBatchRecordCount", default)]
+    pub last_batch_record_count: Option<u64>,
+}
+
+/// One machine's coverage row. `status` is server-derived: `active`, `stale`, or `missing`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MachineCoverage {
+    #[serde(rename = "machineId", default)]
+    pub machine_id: String,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub os: Option<String>,
+    #[serde(rename = "relayhistoryVersion", default)]
+    pub relayhistory_version: Option<String>,
+    #[serde(rename = "lastSeenAt", default)]
+    pub last_seen_at: Option<String>,
+    #[serde(rename = "secondsSinceLastSeen", default)]
+    pub seconds_since_last_seen: u64,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub cursors: serde_json::Value,
+    #[serde(default)]
+    pub recent: CoverageRecent,
+}
+
+impl MachineCoverage {
+    /// What to call this machine in output: hostname, else label, else the opaque id.
+    pub fn display_name(&self) -> &str {
+        self.hostname
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or(self.label.as_deref().filter(|s| !s.is_empty()))
+            .unwrap_or(&self.machine_id)
+    }
+
+    pub fn is_reporting(&self) -> bool {
+        self.status == "active"
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CoverageSummary {
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub active: u64,
+    #[serde(default)]
+    pub stale: u64,
+    #[serde(default)]
+    pub missing: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CoverageThresholds {
+    #[serde(rename = "staleAfterSeconds", default)]
+    pub stale_after_seconds: u64,
+    #[serde(rename = "missingAfterSeconds", default)]
+    pub missing_after_seconds: u64,
+    #[serde(rename = "windowHours", default)]
+    pub window_hours: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CoverageResponse {
+    #[serde(default)]
+    pub machines: Vec<MachineCoverage>,
+    #[serde(default)]
+    pub summary: CoverageSummary,
+    #[serde(default)]
+    pub thresholds: CoverageThresholds,
+}
+
+impl CoverageResponse {
+    /// True when any machine has fallen behind — the condition `--fail-on-stale` reports.
+    pub fn has_gaps(&self) -> bool {
+        self.machines.iter().any(|m| !m.is_reporting())
+    }
+}
+
+/// Knobs forwarded to the server so the caller can match its own push interval.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoverageQuery {
+    pub stale_after_seconds: Option<u64>,
+    pub missing_after_seconds: Option<u64>,
+    pub window_hours: Option<u64>,
+}
+
+/// `GET /v1/machines` with the stored `rth_at_` bearer.
+pub fn fleet_coverage(auth: &StoredAuth, query: &CoverageQuery) -> Result<CoverageResponse> {
+    let url = format!("{}/v1/machines", auth.base_url.trim_end_matches('/'));
+    let mut req = ureq::get(&url).set("Authorization", &format!("Bearer {}", auth.access_token));
+    if let Some(v) = query.stale_after_seconds {
+        req = req.query("staleAfterSeconds", &v.to_string());
+    }
+    if let Some(v) = query.missing_after_seconds {
+        req = req.query("missingAfterSeconds", &v.to_string());
+    }
+    if let Some(v) = query.window_hours {
+        req = req.query("windowHours", &v.to_string());
+    }
+    match req.call() {
+        Ok(r) => Ok(r.into_json::<CoverageResponse>()?),
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            anyhow::bail!("coverage query failed: HTTP {code}: {body}")
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Batch size that means the client hit its default `--limit` and had more queued.
+const DEFAULT_PUSH_LIMIT: u64 = 500;
+
+/// Human-readable fleet table (the non-`--json` output).
+///
+/// The point of this rendering is that a mute machine cannot be skimmed past: it keeps its
+/// row, gets a loud status, and is called out again underneath the table.
+pub fn format_fleet_coverage(resp: &CoverageResponse) -> String {
+    if resp.machines.is_empty() {
+        return "No machines have pushed history to this org yet.\n".to_string();
+    }
+
+    let rows: Vec<[String; 6]> = resp
+        .machines
+        .iter()
+        .map(|m| {
+            [
+                m.display_name().to_string(),
+                status_cell(&m.status),
+                format!("{} ago", humanize_secs(m.seconds_since_last_seen)),
+                m.recent.batches.to_string(),
+                m.recent.records.to_string(),
+                format_cursors(&m.cursors),
+            ]
+        })
+        .collect();
+
+    let headers = [
+        "MACHINE".to_string(),
+        "STATUS".to_string(),
+        "LAST PUSH".to_string(),
+        format!("{}H PUSHES", resp.thresholds.window_hours),
+        "RECORDS".to_string(),
+        "CURSOR".to_string(),
+    ];
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+
+    let s = &resp.summary;
+    let mut out = format!(
+        "Fleet coverage — {} machine(s): {} active, {} stale, {} missing\n\n",
+        s.total, s.active, s.stale, s.missing
+    );
+    // Counts read as counts only when their digits line up.
+    const RIGHT_ALIGNED: [bool; 6] = [false, false, false, true, true, false];
+    out.push_str(&render_row(&headers, &widths, &RIGHT_ALIGNED));
+    for row in &rows {
+        out.push_str(&render_row(row, &widths, &RIGHT_ALIGNED));
+    }
+
+    // Repeat every gap in prose. A status column is easy to skim past; this is the line
+    // that would have caught finn-mini.
+    let mut notes = Vec::new();
+    for m in &resp.machines {
+        if !m.is_reporting() {
+            notes.push(format!(
+                "⚠️  {} has not pushed in {} (last seen {}).",
+                m.display_name(),
+                humanize_secs(m.seconds_since_last_seen),
+                m.last_seen_at.as_deref().unwrap_or("unknown"),
+            ));
+        } else if m.recent.last_batch_record_count.unwrap_or(0) >= DEFAULT_PUSH_LIMIT {
+            // Reporting on schedule, but every push is filling its batch limit: the machine
+            // is draining a backlog and its history is not current yet.
+            notes.push(format!(
+                "ℹ️  {} is pushing but still draining a backlog (last batch {} records).",
+                m.display_name(),
+                m.recent.last_batch_record_count.unwrap_or(0),
+            ));
+        }
+    }
+    if !notes.is_empty() {
+        out.push('\n');
+        for note in notes {
+            out.push_str(&note);
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+fn render_row(cells: &[String], widths: &[usize], right_aligned: &[bool]) -> String {
+    let mut line = String::new();
+    for (i, cell) in cells.iter().enumerate() {
+        let pad = widths[i].saturating_sub(cell.chars().count());
+        if i + 1 == cells.len() {
+            // No trailing padding on the last column, so rows have no invisible tail.
+            line.push_str(cell);
+        } else if right_aligned[i] {
+            line.push_str(&" ".repeat(pad));
+            line.push_str(cell);
+            line.push_str("  ");
+        } else {
+            line.push_str(cell);
+            line.push_str(&" ".repeat(pad + 2));
+        }
+    }
+    line.push('\n');
+    line
+}
+
+/// `missing` shouts, because it is the state nobody noticed for two days.
+fn status_cell(status: &str) -> String {
+    match status {
+        "active" => "active".to_string(),
+        "stale" => "STALE".to_string(),
+        "missing" => "MISSING".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn format_cursors(cursors: &serde_json::Value) -> String {
+    match cursors.as_object() {
+        Some(map) if !map.is_empty() => {
+            let mut parts: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{k}={}", compact_json(v)))
+                .collect();
+            parts.sort();
+            parts.join(" ")
+        }
+        _ => "-".to_string(),
+    }
+}
+
+fn compact_json(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Coarse, human-scale durations. Precision past the unit is noise for this question.
+fn humanize_secs(secs: u64) -> String {
+    match secs {
+        0..=89 => format!("{secs}s"),
+        90..=5399 => format!("{}m", secs / 60),
+        5400..=172_799 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,6 +1079,182 @@ mod tests {
         let rendered = format_pair_warnings(&resp);
         assert!(rendered.contains("Pair warning(s)"));
         assert!(rendered.contains("reflection:tA:suggestion:0"));
+    }
+
+    fn coverage_machine(host: &str, status: &str, secs: u64, batches: u64) -> MachineCoverage {
+        MachineCoverage {
+            machine_id: format!("m_{host}"),
+            hostname: Some(host.to_string()),
+            last_seen_at: Some("2026-08-03T04:11:00Z".to_string()),
+            seconds_since_last_seen: secs,
+            status: status.to_string(),
+            cursors: serde_json::json!({ "history_id": 82_896 }),
+            recent: CoverageRecent {
+                batches,
+                records: batches * 4,
+                accepted: batches * 4,
+                last_batch_at: Some("2026-08-06T07:00:00Z".to_string()),
+                last_batch_record_count: Some(4),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The CLI half of the finn-mini failure: a machine that stopped pushing has to be
+    /// impossible to skim past. It keeps its row, gets a loud status, and is named again
+    /// in prose beneath the table.
+    #[test]
+    fn coverage_table_calls_out_a_machine_that_stopped_pushing() {
+        let resp = CoverageResponse {
+            machines: vec![
+                coverage_machine("kjg-laptop", "active", 120, 280),
+                coverage_machine("sf-mini", "active", 240, 275),
+                coverage_machine("finn-mini", "missing", 3 * 86_400, 0),
+            ],
+            summary: CoverageSummary {
+                total: 3,
+                active: 2,
+                stale: 0,
+                missing: 1,
+            },
+            thresholds: CoverageThresholds {
+                stale_after_seconds: 900,
+                missing_after_seconds: 86_400,
+                window_hours: 24,
+            },
+        };
+
+        let out = format_fleet_coverage(&resp);
+
+        assert!(
+            out.contains("3 machine(s): 2 active, 0 stale, 1 missing"),
+            "{out}"
+        );
+        assert!(out.contains("MISSING"), "{out}");
+        assert!(
+            out.contains("⚠️  finn-mini has not pushed in 3d"),
+            "a mute machine must be named in prose, not only in a column: {out}"
+        );
+        // The machines that are fine must not be dressed up as problems.
+        assert!(!out.contains("kjg-laptop has not pushed"), "{out}");
+        assert!(!out.contains("sf-mini has not pushed"), "{out}");
+        assert!(out.contains("history_id=82896"), "{out}");
+        assert!(resp.has_gaps());
+    }
+
+    #[test]
+    fn coverage_table_stays_quiet_when_the_whole_fleet_is_reporting() {
+        let resp = CoverageResponse {
+            machines: vec![
+                coverage_machine("kjg-laptop", "active", 120, 280),
+                coverage_machine("finn-mini", "active", 90, 279),
+            ],
+            summary: CoverageSummary {
+                total: 2,
+                active: 2,
+                ..Default::default()
+            },
+            thresholds: CoverageThresholds {
+                stale_after_seconds: 900,
+                missing_after_seconds: 86_400,
+                window_hours: 24,
+            },
+        };
+
+        let out = format_fleet_coverage(&resp);
+        assert!(!out.contains("⚠️"), "{out}");
+        assert!(!out.contains("MISSING"), "{out}");
+        assert!(!resp.has_gaps());
+    }
+
+    /// A machine can be pushing on schedule and still be days behind on content.
+    #[test]
+    fn coverage_table_flags_a_machine_that_is_pushing_but_still_draining() {
+        let mut draining = coverage_machine("finn-mini", "active", 60, 12);
+        draining.recent.last_batch_record_count = Some(500);
+        let resp = CoverageResponse {
+            machines: vec![coverage_machine("kjg-laptop", "active", 60, 12), draining],
+            summary: CoverageSummary {
+                total: 2,
+                active: 2,
+                ..Default::default()
+            },
+            thresholds: CoverageThresholds {
+                window_hours: 24,
+                ..Default::default()
+            },
+        };
+
+        let out = format_fleet_coverage(&resp);
+        assert!(
+            out.contains("finn-mini is pushing but still draining a backlog"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("kjg-laptop is pushing but still draining"),
+            "{out}"
+        );
+        // Still reporting, so this is not a coverage gap — `--fail-on-stale` must not fire.
+        assert!(!resp.has_gaps());
+    }
+
+    #[test]
+    fn coverage_response_parses_the_server_payload() {
+        let resp: CoverageResponse = serde_json::from_str(
+            r#"{"machines":[{"machineId":"m_abc","hostname":"finn-mini","label":null,
+                 "os":"macos","relayhistoryVersion":"0.9.0","firstSeenAt":"2026-07-01T00:00:00Z",
+                 "lastSeenAt":"2026-08-03T04:11:00Z","secondsSinceLastSeen":259200,
+                 "status":"missing","cursors":{"history_id":13409762},
+                 "recent":{"batches":0,"records":0,"accepted":0,"lastBatchAt":null,
+                   "lastBatchRecordCount":null}}],
+               "summary":{"total":1,"active":0,"stale":0,"missing":1},
+               "thresholds":{"staleAfterSeconds":900,"missingAfterSeconds":86400,"windowHours":24},
+               "generatedAt":"2026-08-06T07:00:00Z","correlationId":"corr-1"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(resp.machines.len(), 1);
+        let m = &resp.machines[0];
+        assert_eq!(m.display_name(), "finn-mini");
+        assert_eq!(m.status, "missing");
+        assert_eq!(m.seconds_since_last_seen, 259_200);
+        assert_eq!(m.cursors["history_id"], 13_409_762);
+        assert_eq!(resp.summary.missing, 1);
+        assert_eq!(resp.thresholds.window_hours, 24);
+        assert!(resp.has_gaps());
+    }
+
+    #[test]
+    fn coverage_falls_back_to_the_machine_id_when_a_host_never_reported_one() {
+        let m = MachineCoverage {
+            machine_id: "m_opaque".to_string(),
+            hostname: None,
+            label: None,
+            ..Default::default()
+        };
+        assert_eq!(m.display_name(), "m_opaque");
+
+        let labelled = MachineCoverage {
+            machine_id: "m_opaque".to_string(),
+            hostname: Some(String::new()),
+            label: Some("barry".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(labelled.display_name(), "barry");
+    }
+
+    #[test]
+    fn coverage_renders_an_empty_fleet_without_a_table() {
+        let out = format_fleet_coverage(&CoverageResponse::default());
+        assert_eq!(out, "No machines have pushed history to this org yet.\n");
+    }
+
+    #[test]
+    fn humanize_secs_uses_a_readable_unit_per_scale() {
+        assert_eq!(humanize_secs(45), "45s");
+        assert_eq!(humanize_secs(300), "5m");
+        assert_eq!(humanize_secs(7_200), "2h");
+        assert_eq!(humanize_secs(3 * 86_400), "3d");
     }
 
     #[test]

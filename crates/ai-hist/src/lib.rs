@@ -364,6 +364,28 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         interval: u64,
     },
+    /// Which machines are pushing history to relayhistory-cloud, and how recently.
+    ///
+    /// Answers "is any machine mute?" without an ssh tour of the fleet. A machine that
+    /// stops pushing keeps its row and shows up as STALE or MISSING rather than
+    /// disappearing quietly.
+    Coverage {
+        /// Seconds without a push before a machine counts as stale (server default: 900,
+        /// three times the 300s push service interval).
+        #[arg(long)]
+        stale_after: Option<u64>,
+        /// Seconds without a push before a machine counts as missing (server default: 86400).
+        #[arg(long)]
+        missing_after: Option<u64>,
+        /// Hours of push activity to roll up per machine (server default: 24).
+        #[arg(long)]
+        window_hours: Option<u64>,
+        /// Exit non-zero when any machine is stale or missing, for use from cron/CI.
+        #[arg(long)]
+        fail_on_stale: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Pair (Agent Relay Loop, WS-6) — in-session warnings from your team's history.
     Pair {
         #[command(subcommand)]
@@ -928,6 +950,35 @@ pub fn run() -> Result<()> {
                     report.cursor.history_id,
                     report.cursor.trajectory_rowid
                 );
+            }
+            Ok(())
+        }
+        Command::Coverage {
+            stale_after,
+            missing_after,
+            window_hours,
+            fail_on_stale,
+            json,
+        } => {
+            let auth = cloud::load_auth()?
+                .context("not authenticated — run `ai-hist login` or `ai-hist admin-mint` first")?;
+            let resp = cloud::fleet_coverage(
+                &auth,
+                &cloud::CoverageQuery {
+                    stale_after_seconds: stale_after,
+                    missing_after_seconds: missing_after,
+                    window_hours,
+                },
+            )?;
+            if json {
+                println!("{}", serde_json::to_string(&resp)?);
+            } else {
+                print!("{}", cloud::format_fleet_coverage(&resp));
+            }
+            // Opt-in so an interactive `coverage` stays a plain query, while a scheduled one
+            // can alert. Silent absence is only fixed if something can act on it.
+            if fail_on_stale && resp.has_gaps() {
+                std::process::exit(1);
             }
             Ok(())
         }

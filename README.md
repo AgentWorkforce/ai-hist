@@ -265,6 +265,41 @@ sub-minute intervals run every minute (cron's finest granularity).
 Running both services keeps local capture and cloud upload going end-to-end.
 The push job authenticates with the `rth_at_` token written by `ai-hist login`.
 
+### Checking fleet coverage
+
+A machine whose push service dies does not announce it — it just stops
+appearing in new data. `ai-hist coverage` asks the server which machines have
+reported and how recently, so a mute machine is visible without ssh'ing to it:
+
+```bash
+ai-hist coverage                    # the whole fleet, newest first
+ai-hist coverage --json             # same data, machine-readable
+ai-hist coverage --fail-on-stale    # exit 1 if any machine has fallen behind
+```
+
+```
+Fleet coverage — 3 machine(s): 2 active, 0 stale, 1 missing
+
+MACHINE     STATUS   LAST PUSH  24H PUSHES  RECORDS  CURSOR
+kjg-laptop  active   2m ago            287     1148  history_id=82896
+sf-mini     active   4m ago            283      903  history_id=5512
+finn-mini   MISSING  3d ago              0        0  history_id=13409762
+
+⚠️  finn-mini has not pushed in 3d (last seen 2026-08-03T04:11:00Z).
+```
+
+`STATUS` is `active`, `STALE`, or `MISSING`, measured against the server's
+thresholds — 900s (three missed 300s pushes) and 24h by default, overridable
+with `--stale-after` and `--missing-after` if your push interval differs.
+
+The push and record columns are there because recency alone is not coverage: a
+machine working through a large backlog pushes on schedule for days while its
+history is still far behind. When its batches keep filling the push limit,
+`coverage` says so explicitly.
+
+`--fail-on-stale` is what makes this more than a spot check — run it from cron
+and a machine going quiet raises an alert instead of going unnoticed.
+
 ### Manual setup (macOS)
 
 If you prefer to write the launchd plist by hand, sync every 60 seconds with:

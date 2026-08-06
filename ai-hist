@@ -31,6 +31,7 @@ RUST_COMMANDS = {
     "login",
     "admin-mint",
     "push",
+    "coverage",
     "pair",
     "learn",
 }
@@ -117,6 +118,7 @@ Rust-default commands:
   login          Authenticate through Agent Relay Cloud
   admin-mint     Dev-only local relayhistory token mint
   push           Push new local history to relayhistory-cloud
+  coverage       Show which machines are pushing, and how recently
   pair           Ask relayhistory-cloud for in-session warnings
   learn          Distill history into Pair signal
 
