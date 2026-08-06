@@ -209,6 +209,7 @@ def test_top_level_help_lists_rust_commands(tmp_path):
     assert "sync" in result.stdout
     assert "show" in result.stdout
     assert "login" in result.stdout
+    assert "coverage" in result.stdout
     assert "pair" in result.stdout
     assert "learn" in result.stdout
     assert "DISPATCH_MATRIX.md" not in result.stdout
@@ -260,6 +261,7 @@ def test_all_rust_command_help_forms_work(tmp_path):
         ["login"],
         ["admin-mint"],
         ["push"],
+        ["coverage"],
         ["pair"],
         ["pair", "check"],
         ["learn"],
