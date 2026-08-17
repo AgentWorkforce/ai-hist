@@ -697,15 +697,18 @@ fn is_unauthorized(error: &ureq::Error) -> bool {
     matches!(error, ureq::Error::Status(401, _))
 }
 
-/// Send one authenticated request and rotate an expired session at most once. Refresh-token
-/// rotation is serialized per stage: a waiter reloads credentials after acquiring the lock and
-/// reuses a pair already rotated by another process instead of submitting the revoked old token.
+/// Send one authenticated request and rotate an expired session at most once. The persisted
+/// session is loaded before each request so a long-lived caller holding an older `StoredAuth`
+/// transparently adopts a pair rotated by an earlier call. Refresh-token rotation is serialized
+/// per stage: a waiter reloads credentials after acquiring the lock and reuses a pair already
+/// rotated by another process instead of submitting the revoked old token.
 fn send_with_auth_refresh(
     auth: &StoredAuth,
     send: impl Fn(&StoredAuth) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
     map_error: impl Fn(ureq::Error) -> anyhow::Error,
 ) -> Result<ureq::Response> {
-    let mut unauthorized = match send(auth) {
+    let attempted = load_auth(Some(&auth.base_url))?.unwrap_or_else(|| auth.clone());
+    let mut unauthorized = match send(&attempted) {
         Ok(response) => return Ok(response),
         Err(error) if is_unauthorized(&error) => *error,
         Err(error) => return Err(map_error(*error)),
@@ -716,7 +719,7 @@ fn send_with_auth_refresh(
 
     // A concurrent process may have completed rotation while this caller waited. Try its
     // persisted access token before touching the one-time refresh token again.
-    if current.access_token != auth.access_token {
+    if current.access_token != attempted.access_token {
         match send(&current) {
             Ok(response) => return Ok(response),
             Err(error) if is_unauthorized(&error) => unauthorized = *error,
@@ -2195,6 +2198,92 @@ mod tests {
             let stored = load_auth(Some(&auth.base_url)).unwrap().unwrap();
             assert_eq!(stored.access_token, "rth_at_fresh");
             assert_eq!(stored.refresh_token.as_deref(), Some("rth_rt_fresh"));
+        });
+    }
+
+    #[test]
+    fn a_reused_auth_value_adopts_the_persisted_rotation() {
+        with_temp_home(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stale_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let refreshes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let server_stale_requests = std::sync::Arc::clone(&stale_requests);
+            let server_refreshes = std::sync::Arc::clone(&refreshes);
+            let server = std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let mut handled = 0;
+                while handled < 4 && started.elapsed() < std::time::Duration::from_secs(10) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("accept failed: {error}"),
+                    };
+                    handled += 1;
+                    let (line, headers, _) = read_http_request(&mut stream);
+                    if line.starts_with("POST /v1/auth/token/refresh ") {
+                        server_refreshes.fetch_add(1, Ordering::SeqCst);
+                        write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            r#"{"accessToken":"rth_at_fresh","refreshToken":"rth_rt_fresh"}"#,
+                        );
+                        continue;
+                    }
+
+                    assert!(line.starts_with("POST /v1/ingest "), "{line}");
+                    match headers.get("authorization").map(String::as_str) {
+                        Some("Bearer rth_at_expired") => {
+                            server_stale_requests.fetch_add(1, Ordering::SeqCst);
+                            write_http_response(
+                                &mut stream,
+                                "401 Unauthorized",
+                                r#"{"error":"invalid_token"}"#,
+                            );
+                        }
+                        Some("Bearer rth_at_fresh") => write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            r#"{"batchId":"b_test","received":0,"accepted":0}"#,
+                        ),
+                        other => panic!("unexpected authorization header: {other:?}"),
+                    }
+                }
+                assert_eq!(
+                    handled, 4,
+                    "expected one stale call, one refresh, and two successful calls"
+                );
+            });
+
+            let auth = StoredAuth {
+                base_url: format!("http://{addr}"),
+                access_token: "rth_at_expired".into(),
+                refresh_token: Some("rth_rt_old".into()),
+                ..Default::default()
+            };
+            save_auth(&auth).unwrap();
+            let request = IngestRequest {
+                machine: MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                batch_id: "b_test".into(),
+                cursors: None,
+                records: Vec::new(),
+            };
+
+            UreqIngestor.ingest(&auth, &request).unwrap();
+            // Deliberately reuse the stale value. The persisted rotated pair must be selected
+            // before sending, without another guaranteed-to-fail request or refresh.
+            UreqIngestor.ingest(&auth, &request).unwrap();
+            server.join().unwrap();
+
+            assert_eq!(stale_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(refreshes.load(Ordering::SeqCst), 1);
         });
     }
 
