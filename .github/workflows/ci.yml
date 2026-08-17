@@ -29,7 +29,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Rust lint
-        run: cargo clippy --workspace --all-targets -- -A clippy::needless-question_mark -A clippy::unnecessary_map_or -A clippy::too_many_arguments -D warnings
+        run: cargo clippy --workspace --all-targets -- -A clippy::too_many_arguments -D warnings
 
       - name: Rust tests
         run: cargo test --workspace

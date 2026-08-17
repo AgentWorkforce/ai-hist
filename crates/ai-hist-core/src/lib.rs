@@ -646,9 +646,8 @@ pub fn search(
     let rows = stmt
         .query_map(rusqlite::params_from_iter(params_vec), row_to_entry)
         .map_err(|error| raw_fts_query_error(raw_fts, error))?;
-    Ok(rows
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|error| raw_fts_query_error(raw_fts, error))?)
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| raw_fts_query_error(raw_fts, error))
 }
 
 pub fn recent(conn: &Connection, filter: &QueryFilter) -> Result<Vec<HistoryEntry>> {
