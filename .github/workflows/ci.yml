@@ -25,6 +25,12 @@ jobs:
           cache: npm
           cache-dependency-path: sdk-ts/package-lock.json
 
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Rust lint
+        run: cargo clippy --workspace --all-targets -- -A clippy::needless-question_mark -A clippy::unnecessary_map_or -A clippy::too_many_arguments -D warnings
+
       - name: Rust tests
         run: cargo test --workspace
 
@@ -40,6 +46,7 @@ jobs:
         working-directory: sdk-ts
         run: |
           npm ci
+          npm run lint
           npm test
 
       - name: End-to-end wrapper verification

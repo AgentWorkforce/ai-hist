@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use url::Url;
 
 const DEFAULT_BASE_URL: &str = "https://history.agentrelay.com";
 
@@ -59,12 +60,25 @@ pub fn default_base_url() -> String {
 }
 
 fn normalize_base_url(value: &str) -> Option<String> {
-    let normalized = value.trim().trim_end_matches('/').to_string();
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
+    let parsed = Url::parse(value.trim()).ok()?;
+    if parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
     }
+    Some(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+fn normalized_stage(value: &str) -> Result<String> {
+    normalize_base_url(value).with_context(|| {
+        format!(
+            "invalid relayhistory base URL `{}`; expected an absolute URL without credentials, query, or fragment",
+            value.trim()
+        )
+    })
 }
 
 /// Refuse to put a credential on the wire in cleartext.
@@ -83,7 +97,8 @@ fn normalize_base_url(value: &str) -> Option<String> {
 /// alone would have left the high-frequency `push` path sending the same token to the same
 /// URL — an inconsistent CLI that closes none of the exposure.
 fn require_secure_transport(base_url: &str) -> Result<()> {
-    let url = base_url.trim();
+    let normalized = normalized_stage(base_url)?;
+    let url = normalized.as_str();
     if url.starts_with("https://") {
         return Ok(());
     }
@@ -128,20 +143,20 @@ fn legacy_cursor_path() -> PathBuf {
     config_dir().join("cursor.json")
 }
 
-fn stage_key(base_url: &str) -> String {
-    ai_hist_core::prompt_hash(base_url.trim().trim_end_matches('/'))
+fn stage_key(base_url: &str) -> Result<String> {
+    Ok(ai_hist_core::prompt_hash(&normalized_stage(base_url)?))
 }
 
 fn stage_dir() -> PathBuf {
     config_dir().join("stages")
 }
 
-fn auth_path(base_url: &str) -> PathBuf {
-    stage_dir().join(format!("{}.auth.json", stage_key(base_url)))
+fn auth_path(base_url: &str) -> Result<PathBuf> {
+    Ok(stage_dir().join(format!("{}.auth.json", stage_key(base_url)?)))
 }
 
-fn cursor_path(base_url: &str) -> PathBuf {
-    stage_dir().join(format!("{}.cursor.json", stage_key(base_url)))
+fn cursor_path(base_url: &str) -> Result<PathBuf> {
+    Ok(stage_dir().join(format!("{}.cursor.json", stage_key(base_url)?)))
 }
 fn machine_path() -> PathBuf {
     config_dir().join("machine-id")
@@ -186,7 +201,10 @@ fn staged_auths() -> Result<Vec<StoredAuth>> {
 }
 
 fn same_stage(left: &str, right: &str) -> bool {
-    left.trim().trim_end_matches('/') == right.trim().trim_end_matches('/')
+    matches!(
+        (normalize_base_url(left), normalize_base_url(right)),
+        (Some(left), Some(right)) if left == right
+    )
 }
 
 /// Load one stored session. A caller that knows its destination must pass it explicitly.
@@ -194,7 +212,7 @@ fn same_stage(left: &str, right: &str) -> bool {
 /// successful login was the old behavior and could silently divert a scheduled push.
 pub fn load_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
     if let Some(base_url) = base_url {
-        let path = auth_path(base_url);
+        let path = auth_path(base_url)?;
         if path.exists() {
             let auth = read_auth(&path)?;
             anyhow::ensure!(
@@ -211,16 +229,19 @@ pub fn load_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
         return Ok(same_stage(&auth.base_url, base_url).then_some(auth));
     }
 
-    let auths = staged_auths()?;
-    match auths.len() {
-        0 => {
-            let path = legacy_auth_path();
-            if path.exists() {
-                Ok(Some(read_auth(&path)?))
-            } else {
-                Ok(None)
-            }
+    let mut auths = staged_auths()?;
+    let legacy = legacy_auth_path();
+    if legacy.exists() {
+        let legacy_auth = read_auth(&legacy)?;
+        if !auths
+            .iter()
+            .any(|auth| same_stage(&auth.base_url, &legacy_auth.base_url))
+        {
+            auths.push(legacy_auth);
         }
+    }
+    match auths.len() {
+        0 => Ok(None),
         1 => Ok(auths.into_iter().next()),
         count => anyhow::bail!(
             "{count} relayhistory stages are configured; pass --base-url to select one. \
@@ -234,9 +255,11 @@ pub fn load_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
 /// cross-stage cursor corruption.
 pub fn save_auth(auth: &StoredAuth) -> Result<()> {
     migrate_legacy_stage()?;
+    let mut stored = auth.clone();
+    stored.base_url = normalized_stage(&auth.base_url)?;
     write_private(
-        &auth_path(&auth.base_url),
-        &serde_json::to_string_pretty(auth)?,
+        &auth_path(&stored.base_url)?,
+        &serde_json::to_string_pretty(&stored)?,
     )
 }
 
@@ -245,15 +268,16 @@ fn migrate_legacy_stage() -> Result<()> {
     if !legacy_auth.exists() {
         return Ok(());
     }
-    let auth = read_auth(&legacy_auth)?;
-    let staged_auth_path = auth_path(&auth.base_url);
+    let mut auth = read_auth(&legacy_auth)?;
+    auth.base_url = normalized_stage(&auth.base_url)?;
+    let staged_auth_path = auth_path(&auth.base_url)?;
     if !staged_auth_path.exists() {
         write_private(&staged_auth_path, &serde_json::to_string_pretty(&auth)?)?;
     }
 
     let legacy_cursor = legacy_cursor_path();
     if legacy_cursor.exists() {
-        let staged_cursor = cursor_path(&auth.base_url);
+        let staged_cursor = cursor_path(&auth.base_url)?;
         if !staged_cursor.exists() {
             let body = fs::read_to_string(&legacy_cursor)?;
             write_private(&staged_cursor, &body)?;
@@ -268,7 +292,7 @@ fn migrate_legacy_stage() -> Result<()> {
 }
 
 pub fn load_cursor(base_url: &str) -> Result<SyncCursor> {
-    let path = cursor_path(base_url);
+    let path = cursor_path(base_url)?;
     if path.exists() {
         let body = fs::read_to_string(&path)?;
         return serde_json::from_str(&body).context("parsing stage-scoped cursor.json");
@@ -276,8 +300,13 @@ pub fn load_cursor(base_url: &str) -> Result<SyncCursor> {
 
     // Compatibility for an existing single-stage install. The next successful push writes the
     // scoped path; a subsequent login migrates it eagerly with the corresponding auth session.
+    let legacy_auth = legacy_auth_path();
     let legacy = legacy_cursor_path();
-    if !legacy.exists() {
+    if !legacy_auth.exists() || !legacy.exists() {
+        return Ok(SyncCursor::default());
+    }
+    let auth = read_auth(&legacy_auth)?;
+    if !same_stage(&auth.base_url, base_url) {
         return Ok(SyncCursor::default());
     }
     let body = fs::read_to_string(&legacy)?;
@@ -286,7 +315,7 @@ pub fn load_cursor(base_url: &str) -> Result<SyncCursor> {
 
 pub fn save_cursor(base_url: &str, cursor: &SyncCursor) -> Result<()> {
     write_private(
-        &cursor_path(base_url),
+        &cursor_path(base_url)?,
         &serde_json::to_string_pretty(cursor)?,
     )
 }
@@ -1303,6 +1332,77 @@ mod tests {
             };
             save_cursor(&auth.base_url, &c).unwrap();
             assert_eq!(load_cursor(&auth.base_url).unwrap(), c);
+        });
+    }
+
+    #[test]
+    fn equivalent_url_forms_share_one_stage_store() {
+        with_temp_home(|| {
+            let auth = StoredAuth {
+                base_url: "http://LocalHost:8787/".into(),
+                access_token: "rth_at_equivalent".into(),
+                ..Default::default()
+            };
+            save_auth(&auth).unwrap();
+            let cursor = SyncCursor {
+                history_id: 17,
+                trajectory_rowid: 3,
+            };
+            save_cursor(&auth.base_url, &cursor).unwrap();
+
+            let stored = load_auth(Some("http://localhost:8787")).unwrap().unwrap();
+            assert_eq!(stored.base_url, "http://localhost:8787");
+            assert_eq!(stored.access_token, auth.access_token);
+            assert_eq!(load_cursor(" HTTP://LOCALHOST:8787/ ").unwrap(), cursor);
+            assert_eq!(
+                auth_path("http://LocalHost:8787/").unwrap(),
+                auth_path("http://localhost:8787").unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_state_cannot_make_an_unqualified_command_guess_or_leak_a_cursor() {
+        with_temp_home(|| {
+            let prod = StoredAuth {
+                base_url: "https://history.agentrelay.com".into(),
+                access_token: "rth_at_prod".into(),
+                ..Default::default()
+            };
+            save_auth(&prod).unwrap();
+
+            let legacy_dev = StoredAuth {
+                base_url: "http://localhost:8787".into(),
+                access_token: "rth_at_dev".into(),
+                ..Default::default()
+            };
+            write_private(
+                &legacy_auth_path(),
+                &serde_json::to_string_pretty(&legacy_dev).unwrap(),
+            )
+            .unwrap();
+            let legacy_cursor = SyncCursor {
+                history_id: 900,
+                trajectory_rowid: 42,
+            };
+            write_private(
+                &legacy_cursor_path(),
+                &serde_json::to_string_pretty(&legacy_cursor).unwrap(),
+            )
+            .unwrap();
+
+            let err = load_auth(None).unwrap_err().to_string();
+            assert!(err.contains("2 relayhistory stages"), "{err}");
+            assert_eq!(
+                load_cursor(&prod.base_url).unwrap(),
+                SyncCursor::default(),
+                "a prod push must not inherit the dev cursor"
+            );
+            assert_eq!(
+                load_cursor("http://LOCALHOST:8787/").unwrap(),
+                legacy_cursor,
+                "the legacy cursor remains available to its own normalized stage"
+            );
         });
     }
 

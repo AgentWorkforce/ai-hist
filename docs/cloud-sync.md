@@ -122,7 +122,8 @@ login. To test Cloud exchange against a trusted non-prod endpoint, set
 ### Automation (cron / launchd)
 
 ```cron
-*/5 * * * * ai-hist sync && ai-hist push --base-url https://history.agentrelay.com --json >> /tmp/ai-hist-push.log 2>&1
+*/5 * * * * RELAYHISTORY_HOME=$HOME/.agentworkforce/relayhistory-prod ai-hist sync && \
+            RELAYHISTORY_HOME=$HOME/.agentworkforce/relayhistory-prod ai-hist push --base-url https://history.agentrelay.com --json >> /tmp/ai-hist-push.log 2>&1
 ```
 
 `push` exits non-zero on transport/auth failure (cursor not advanced → safe retry next run).

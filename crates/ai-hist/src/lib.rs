@@ -411,7 +411,7 @@ enum Command {
 enum PairAction {
     /// Ask relayhistory-cloud for advisory warnings before an action (POST /v1/pair/check).
     Check {
-        /// Select the cloud stage. Required when this machine has sessions for multiple stages.
+        /// Select the cloud stage. Defaults to RELAYHISTORY_BASE_URL/AI_HIST_BASE_URL, then prod.
         #[arg(long)]
         base_url: Option<String>,
         /// Files in scope / about to be touched (paths only — never contents).
@@ -1017,7 +1017,11 @@ pub fn run() -> Result<()> {
                 limit,
                 json,
             } => {
-                let auth = cloud::load_auth(base_url.as_deref())?.context(
+                // Hooks and MCP wrappers do not have an interactive stage-selection channel.
+                // Pin them to the configured/default origin instead of making Pair disappear
+                // when an unrelated second-stage login exists.
+                let base_url = base_url.unwrap_or_else(cloud::default_base_url);
+                let auth = cloud::load_auth(Some(&base_url))?.context(
                     "not authenticated — run `ai-hist login` or `ai-hist admin-mint` first",
                 )?;
                 let cwd = std::env::current_dir()
