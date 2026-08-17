@@ -19,6 +19,10 @@ export interface PushReport {
   accepted: number;
   batchId: string | null;
   cursor?: unknown;
+  /** Accepted per-source record limit after any capacity retry. */
+  batchLimit?: number;
+  /** Number of HTTP ingest attempts made by this push. */
+  attempts?: number;
 }
 
 export interface PushOptions {
@@ -125,6 +129,8 @@ export function pushToCloud(opts: PushOptions = {}): Promise<PushReport | null> 
           accepted: typeof parsed.accepted === 'number' ? parsed.accepted : 0,
           batchId: typeof parsed.batchId === 'string' ? parsed.batchId : null,
           cursor: parsed.cursor,
+          ...(typeof parsed.batchLimit === 'number' ? { batchLimit: parsed.batchLimit } : {}),
+          ...(typeof parsed.attempts === 'number' ? { attempts: parsed.attempts } : {}),
         });
       } catch (err) {
         reject(

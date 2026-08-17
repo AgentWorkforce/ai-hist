@@ -401,6 +401,29 @@ pub struct PushReport {
     pub attempts: usize,
 }
 
+/// A typed Cloudflare Worker capacity rejection. Keeping the status, body, and attempted
+/// record count together lets the retry loop distinguish a real resource-limit response from
+/// an unrelated 503 and shrink from the payload that was actually emitted.
+#[derive(Debug)]
+struct WorkerCapacityError {
+    status: u16,
+    body: String,
+    attempted_records: usize,
+}
+
+impl std::fmt::Display for WorkerCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ingest failed: HTTP {}: {}",
+            self.status,
+            self.body.trim()
+        )
+    }
+}
+
+impl std::error::Error for WorkerCapacityError {}
+
 /// Build the next outbox batch and push it. On success, persists the advanced cursor.
 /// No-op (no HTTP call) when there's nothing new to send.
 pub fn push(
@@ -412,7 +435,6 @@ pub fn push(
     limit: usize,
     incognito: &HashSet<String>,
 ) -> Result<PushReport> {
-    const MIN_RECOVERABLE_BATCH_LIMIT: usize = 10;
     let mut batch_limit = limit.max(1);
     let mut attempts = 1;
 
@@ -428,20 +450,19 @@ pub fn push(
             attempts,
         ) {
             Ok(report) => return Ok(report),
-            Err(err)
-                if is_worker_capacity_error(&err) && batch_limit > MIN_RECOVERABLE_BATCH_LIMIT =>
-            {
-                let next_limit = (batch_limit / 2).max(MIN_RECOVERABLE_BATCH_LIMIT);
-                batch_limit = next_limit;
+            Err(err) => {
+                let Some(attempted_records) = worker_capacity_attempted_records(&err) else {
+                    return Err(err);
+                };
+                if attempted_records <= 1 {
+                    return Err(err.context(format!(
+                        "cloud ingest still exceeded its resource limit with one record after \
+                         {attempts} attempt(s); cursor was not advanced"
+                    )));
+                }
+                batch_limit = (attempted_records / 2).max(1);
                 attempts += 1;
             }
-            Err(err) if is_worker_capacity_error(&err) => {
-                return Err(err.context(format!(
-                    "cloud ingest still exceeded its resource limit at batch limit {batch_limit} \
-                     after {attempts} attempt(s); cursor was not advanced"
-                )));
-            }
-            Err(err) => return Err(err),
         }
     }
 }
@@ -490,17 +511,30 @@ fn push_once(
     })
 }
 
-/// Cloudflare's worker overload currently arrives as an HTML 503, while a future structured
-/// response may retain the text without that status. Treat either signal as safe to retry with
-/// the exact same starting cursor and a smaller batch; no cursor is persisted before success.
-fn is_worker_capacity_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        let message = cause.to_string();
-        message.contains("HTTP 503")
-            || message
-                .to_ascii_lowercase()
-                .contains("worker exceeded resource limits")
+fn worker_capacity_attempted_records(err: &anyhow::Error) -> Option<usize> {
+    err.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<WorkerCapacityError>()
+            .map(|failure| failure.attempted_records)
     })
+}
+
+fn ingest_status_error(code: u16, body: String, attempted_records: usize) -> anyhow::Error {
+    let normalized = body.to_ascii_lowercase();
+    let is_capacity = code == 503
+        && (normalized.contains("worker exceeded resource limits")
+            || normalized.contains("error code: 1102")
+            || normalized.contains("worker_capacity"));
+    if is_capacity {
+        WorkerCapacityError {
+            status: code,
+            body,
+            attempted_records,
+        }
+        .into()
+    } else {
+        anyhow::anyhow!("ingest failed: HTTP {code}: {body}")
+    }
 }
 
 // ----- ureq-backed live transport -----
@@ -521,7 +555,7 @@ impl Ingestor for UreqIngestor {
             Ok(r) => Ok(r.into_json::<IngestResponse>()?),
             Err(ureq::Error::Status(code, r)) => {
                 let body = r.into_string().unwrap_or_default();
-                anyhow::bail!("ingest failed: HTTP {code}: {body}")
+                Err(ingest_status_error(code, body, req.records.len()))
             }
             Err(e) => Err(e.into()),
         }
@@ -1273,7 +1307,11 @@ mod tests {
                 .borrow_mut()
                 .push(req.records.len());
             if req.records.len() > self.max_records {
-                anyhow::bail!("ingest failed: HTTP 503: Worker exceeded resource limits");
+                return Err(ingest_status_error(
+                    503,
+                    "Worker exceeded resource limits".to_string(),
+                    req.records.len(),
+                ));
             }
             Ok(IngestResponse {
                 batch_id: req.batch_id.clone(),
@@ -1281,6 +1319,21 @@ mod tests {
                 accepted: req.records.len() as u64,
                 cursors: None,
             })
+        }
+    }
+
+    struct GenericUnavailableIngestor {
+        attempts: RefCell<usize>,
+    }
+
+    impl Ingestor for GenericUnavailableIngestor {
+        fn ingest(&self, _auth: &StoredAuth, _req: &IngestRequest) -> Result<IngestResponse> {
+            *self.attempts.borrow_mut() += 1;
+            Err(ingest_status_error(
+                503,
+                "service temporarily unavailable".to_string(),
+                32,
+            ))
         }
     }
 
@@ -1366,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn push_halves_a_worker_rejected_batch_and_makes_progress() {
+    fn push_shrinks_from_the_emitted_batch_size_and_makes_progress() {
         with_temp_home(|| {
             let conn = mem();
             for id in 1..=32 {
@@ -1390,16 +1443,54 @@ mod tests {
                     ..Default::default()
                 },
                 &SyncCursor::default(),
-                32,
+                500,
                 &HashSet::new(),
             )
             .unwrap();
 
-            assert_eq!(*client.attempted_record_counts.borrow(), vec![32, 16, 10]);
-            assert_eq!(report.batch_limit, 10);
+            // The configured limit is 500 but only 32 rows are pending. Retrying from 250
+            // would resend the same 32-record payload; shrink from the emitted size instead.
+            assert_eq!(*client.attempted_record_counts.borrow(), vec![32, 16, 8]);
+            assert_eq!(report.batch_limit, 8);
             assert_eq!(report.attempts, 3);
-            assert_eq!(report.cursor.history_id, 10);
-            assert_eq!(load_cursor(&auth.base_url).unwrap().history_id, 10);
+            assert_eq!(report.cursor.history_id, 8);
+            assert_eq!(load_cursor(&auth.base_url).unwrap().history_id, 8);
+        });
+    }
+
+    #[test]
+    fn an_unrelated_503_is_not_retried_as_a_capacity_failure() {
+        with_temp_home(|| {
+            let conn = mem();
+            for id in 1..=32 {
+                add(&conn, &format!("entry {id}"), id);
+            }
+            let client = GenericUnavailableIngestor {
+                attempts: RefCell::new(0),
+            };
+            let auth = StoredAuth {
+                base_url: "http://localhost:8787".into(),
+                access_token: "test-access-token".into(),
+                ..Default::default()
+            };
+            let err = push(
+                &conn,
+                &client,
+                &auth,
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &SyncCursor::default(),
+                500,
+                &HashSet::new(),
+            )
+            .unwrap_err();
+            let message = format!("{err:#}");
+
+            assert!(message.contains("temporarily unavailable"), "{message}");
+            assert_eq!(*client.attempts.borrow(), 1);
+            assert_eq!(load_cursor(&auth.base_url).unwrap(), SyncCursor::default());
         });
     }
 

@@ -34,12 +34,26 @@ function fakeSpawn(script: { stdout?: string; stderr?: string; code?: number; er
 
 test('pushToCloud parses ai-hist push --json output into a report', async () => {
   const { spawnFn, calls } = fakeSpawn({
-    stdout: JSON.stringify({ sent: 3, accepted: 3, batchId: 'b_abc', cursor: { history_id: 9 } }),
+    stdout: JSON.stringify({
+      sent: 3,
+      accepted: 3,
+      batchId: 'b_abc',
+      cursor: { history_id: 9 },
+      batchLimit: 100,
+      attempts: 2,
+    }),
   });
 
   const report = await pushToCloud({ binPath: '/bin/echo', spawnFn, limit: 200, incognito: ['s1', 's2'] });
 
-  assert.deepEqual(report, { sent: 3, accepted: 3, batchId: 'b_abc', cursor: { history_id: 9 } });
+  assert.deepEqual(report, {
+    sent: 3,
+    accepted: 3,
+    batchId: 'b_abc',
+    cursor: { history_id: 9 },
+    batchLimit: 100,
+    attempts: 2,
+  });
   // Forwards the flags to the binary.
   assert.deepEqual(calls[0].args, ['push', '--json', '--limit', '200', '--incognito', 's1', '--incognito', 's2']);
 });
