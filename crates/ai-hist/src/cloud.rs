@@ -1358,6 +1358,16 @@ mod tests {
                 auth_path("http://LocalHost:8787/").unwrap(),
                 auth_path("http://localhost:8787").unwrap()
             );
+            assert_eq!(
+                auth_path("https://History.AgentRelay.com:443/").unwrap(),
+                auth_path("https://history.agentrelay.com").unwrap(),
+                "an explicit default HTTPS port must not create another stage"
+            );
+            assert_eq!(
+                auth_path("http://Example.test:80/").unwrap(),
+                auth_path("http://example.test").unwrap(),
+                "an explicit default HTTP port must not create another stage"
+            );
         });
     }
 
