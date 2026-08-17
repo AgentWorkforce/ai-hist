@@ -49,6 +49,13 @@ jobs:
           npm run lint
           npm test
 
+      - name: Native binding contract
+        working-directory: crates/ai-hist-napi
+        run: |
+          npm ci
+          npm run build:debug
+          git diff --exit-code -- index.d.ts
+
       - name: End-to-end wrapper verification
         run: AI_HIST_RUST_BIN="$PWD/target/debug/ai-hist" ./scripts/verify-e2e.sh
 
