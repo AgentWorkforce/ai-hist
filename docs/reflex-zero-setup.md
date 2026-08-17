@@ -24,7 +24,12 @@ agent-relay up  ──(every few minutes, if reflex.json.enabled)──▶  requ
   push. The CLI binary and the addon call the same code.
 - **Auth:** the `rth_at_` token written by `reflex on` (in the stage-scoped
   `~/.agentworkforce/relayhistory/stages/` store). `syncAndPush()` returns
-  `authenticated: false` (a no-op) until the user is logged in.
+  `authenticated: false` (a no-op) until the user is logged in. If the access token expires,
+  the addon serializes refresh-token rotation, atomically persists the new pair, and retries.
+- **One sync owner:** Reflex supplies the periodic sync + push loop. Do not run standalone
+  `ai-hist sync` / `ai-hist push` launchd services at the same time. A cross-process lock
+  prevents overlapping scans as a safeguard. If another scanner owns it, `syncAndPush()` sets
+  `syncSkipped: true` and still pushes rows already present in SQLite.
 
 ## The packages
 

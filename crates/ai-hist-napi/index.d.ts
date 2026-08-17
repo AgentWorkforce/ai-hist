@@ -9,6 +9,8 @@ export interface SyncPushResult {
   accepted: number
   /** `false` when there's no stored relayhistory auth yet (a no-op, not an error). */
   authenticated: boolean
+  /** `true` when another process owned the history scan; existing rows were still pushed. */
+  syncSkipped: boolean
 }
 /**
  * Sync local agent history into the ai-hist DB, then push new records to

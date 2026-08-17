@@ -107,7 +107,8 @@ login. To test Cloud exchange against a trusted non-prod endpoint, set
 
 - **Auth + cursor are stage-scoped.** `login`/`admin-mint` store each target's session and
   watermark independently under `$RELAYHISTORY_HOME/stages/` (mode `0600`). A second login
-  cannot overwrite the first target's cursor.
+  cannot overwrite the first target's cursor. On an access-token 401, authenticated commands
+  serialize refresh-token rotation for that stage, atomically persist the new pair, and retry.
 - **Select deliberately when needed.** With one configured target, `ai-hist push` uses it.
   With more than one, use `ai-hist push --base-url <origin>`; the CLI refuses to guess. A
   service installed with `ai-hist push --install-service` pins that selected origin so later
@@ -117,9 +118,13 @@ login. To test Cloud exchange against a trusted non-prod endpoint, set
   advances only after the server accepts the batch.
 - **Exclude sessions:** `ai-hist push --incognito <sessionId> --incognito <trajectoryId>`.
 - To switch targets, pass the corresponding `--base-url`; for prod, re-run Agent Relay Cloud
-  login if that stored session expires.
+  login only if the refresh session expires or is revoked.
 
 ### Automation (cron / launchd)
+
+Choose one scheduler. If Agent Relay Reflex is enabled, its in-process loop already runs sync +
+push; do not also install standalone launchd/cron services. A cross-process lock prevents
+overlapping scans as a safeguard, and a contended Reflex tick still pushes already-indexed rows.
 
 ```cron
 */5 * * * * RELAYHISTORY_HOME=$HOME/.agentworkforce/relayhistory-prod ai-hist sync && RELAYHISTORY_HOME=$HOME/.agentworkforce/relayhistory-prod ai-hist push --base-url https://history.agentrelay.com --json >> /tmp/ai-hist-push.log 2>&1
