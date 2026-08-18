@@ -41,6 +41,7 @@ dependencies = [
  "flate2",
  "fs2",
  "hostname",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

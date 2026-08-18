@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// WS-9 cloud-sync: local recall store → WS-1 convergence envelope (Agent Relay Loop).
 pub mod convergence;
@@ -237,15 +237,51 @@ pub fn default_db_path() -> PathBuf {
         })
 }
 
-/// How long a writer waits for a competing writer before giving up.
+/// Maximum number of times SQLite asks us to retry a contended lock.
 ///
-/// Raised from rusqlite's 5s default. The database is shared by several
-/// long-lived writers (the sync agent, the MCP server, relay brokers) and WAL
-/// admits one at a time, so a lock can be held longer than 5s -- a large WAL
-/// being recovered or checkpointed is enough. Sync then dies mid-run with
-/// "database is locked" and, being long-running, is the process most likely to
-/// be waiting when that happens.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+/// A busy handler is preferable to one flat timeout for normal writer overlap:
+/// exponential delays stop hammering the lock and per-process/time jitter keeps
+/// two scheduled syncs from waking and colliding in lockstep. The callback is
+/// never useful for a permanently suspended holder, so the sequence stays
+/// bounded while preserving the previous 30-second grace window for a healthy writer that is
+/// merely slow. Even with zero jitter the sequence waits at least 30 seconds; jitter can extend
+/// that to roughly 33 seconds so simultaneous syncs do not keep waking in lockstep.
+const BUSY_RETRY_ATTEMPTS: i32 = 65;
+const BUSY_RETRY_BASE_MS: u64 = 10;
+const BUSY_RETRY_CAP_MS: u64 = 500;
+const BUSY_RETRY_JITTER_DIVISOR: u64 = 10;
+
+fn busy_retry_backoff_ms(prior_attempts: i32) -> Option<u64> {
+    if !(0..BUSY_RETRY_ATTEMPTS).contains(&prior_attempts) {
+        return None;
+    }
+
+    let shift = (prior_attempts as u32).min(6);
+    Some(
+        BUSY_RETRY_BASE_MS
+            .saturating_mul(1_u64 << shift)
+            .min(BUSY_RETRY_CAP_MS),
+    )
+}
+
+fn busy_retry_handler(prior_attempts: i32) -> bool {
+    let Some(backoff_ms) = busy_retry_backoff_ms(prior_attempts) else {
+        return false;
+    };
+    let clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    let seed = clock ^ u64::from(std::process::id()) ^ prior_attempts as u64;
+    let jitter_ms = seed % (backoff_ms / BUSY_RETRY_JITTER_DIVISOR + 1);
+    std::thread::sleep(Duration::from_millis(backoff_ms + jitter_ms));
+    true
+}
+
+fn configure_busy_retry(conn: &Connection) -> Result<()> {
+    conn.busy_handler(Some(busy_retry_handler))?;
+    Ok(())
+}
 
 pub fn open_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
@@ -253,9 +289,48 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     }
     let conn = Connection::open(path)?;
     // Before init_db: creating the schema takes a write lock too.
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+    configure_busy_retry(&conn)?;
     init_db(&conn)?;
     Ok(conn)
+}
+
+/// An operation against an attached/source SQLite database failed. Keeping the source path in
+/// the error chain lets callers diagnose that database rather than incorrectly probing the
+/// destination history store.
+#[derive(Debug)]
+pub struct SourceDatabaseError {
+    path: PathBuf,
+    source: rusqlite::Error,
+}
+
+impl SourceDatabaseError {
+    pub fn new(path: impl Into<PathBuf>, source: rusqlite::Error) -> Self {
+        Self {
+            path: path.into(),
+            source,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::fmt::Display for SourceDatabaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "reading source database {}: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for SourceDatabaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// Objects and columns [`init_db`] adds, checked before trusting a read-only
@@ -319,7 +394,7 @@ pub fn open_db_readonly(path: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_URI,
     )
     .with_context(|| format!("opening {} read-only", path.display()))?;
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+    configure_busy_retry(&conn)?;
     Ok(conn)
 }
 
@@ -897,7 +972,9 @@ pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> 
     )
     .with_context(|| format!("opening {}", opencode_db.display()))?;
     src_live.busy_timeout(std::time::Duration::from_secs(5))?;
-    src_live.backup(DatabaseName::Main, &tmp, None)?;
+    src_live
+        .backup(DatabaseName::Main, &tmp, None)
+        .map_err(|source| SourceDatabaseError::new(opencode_db, source))?;
     let src = Connection::open(&tmp)?;
     let mut stmt = src.prepare(
         "SELECT s.id, s.directory, p.data, COALESCE(p.time_created, m.time_created, s.time_created) FROM part p JOIN message m ON m.id = p.message_id JOIN session s ON s.id = p.session_id WHERE json_extract(m.data, '$.role') = 'user' AND json_extract(p.data, '$.type') = 'text' ORDER BY p.time_created ASC",
@@ -1022,25 +1099,15 @@ mod tests {
     }
 
     #[test]
-    fn open_db_waits_longer_than_the_rusqlite_default_for_a_busy_writer() {
+    fn open_db_retries_a_transient_busy_writer() {
         let dir = std::env::temp_dir().join(format!("ai-hist-busy-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("busy.db");
         let conn = open_db(&path).unwrap();
 
-        // rusqlite already waits 5s by default; this database is contended by
-        // several long-lived writers and a lock can outlast that, so sync needs
-        // a longer grace period than the default gives it.
-        let configured: i64 = conn
-            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(configured, BUSY_TIMEOUT.as_millis() as i64);
-        assert!(
-            configured > 5_000,
-            "expected a longer wait than rusqlite's 5s default, got {configured}ms"
-        );
-
-        // The waiting is real: a competing writer blocks rather than erroring.
+        // A competing writer is retried rather than failing immediately. The
+        // releaser runs after several backoff steps, exercising the handler
+        // rather than succeeding on the first lock attempt.
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
@@ -1053,6 +1120,30 @@ mod tests {
         releaser.join().unwrap();
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn busy_retry_sequence_is_bounded() {
+        let minimum_ms: u64 = (0..BUSY_RETRY_ATTEMPTS)
+            .map(|attempt| busy_retry_backoff_ms(attempt).unwrap())
+            .sum();
+        assert!(
+            (30_000..31_000).contains(&minimum_ms),
+            "minimum retry grace changed unexpectedly: {minimum_ms}ms"
+        );
+        let maximum_ms: u64 = (0..BUSY_RETRY_ATTEMPTS)
+            .map(|attempt| {
+                let backoff = busy_retry_backoff_ms(attempt).unwrap();
+                backoff + backoff / BUSY_RETRY_JITTER_DIVISOR
+            })
+            .sum();
+        assert!(
+            (33_000..34_000).contains(&maximum_ms),
+            "maximum retry grace changed unexpectedly: {maximum_ms}ms"
+        );
+        assert!(busy_retry_backoff_ms(BUSY_RETRY_ATTEMPTS).is_none());
+        assert!(!busy_retry_handler(BUSY_RETRY_ATTEMPTS));
+        assert!(!busy_retry_handler(BUSY_RETRY_ATTEMPTS + 1));
     }
 
     #[test]

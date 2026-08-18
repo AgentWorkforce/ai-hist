@@ -2,7 +2,8 @@ use ai_hist_core::convergence::MachineIdentity;
 use ai_hist_core::{
     default_db_path, import_json, insert_history, normalize_tag_name, open_db, open_db_readonly,
     parse_cursor_text, prompt_hash, raw_fts_query_error, recent, resume_command, schema_is_current,
-    search, session, sync_opencode_db, untag_session, HistoryEntry, QueryFilter, SOURCE_CHOICES,
+    search, session, sync_opencode_db, untag_session, HistoryEntry, QueryFilter,
+    SourceDatabaseError, SOURCE_CHOICES,
 };
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
@@ -10,7 +11,7 @@ use clap::{Parser, Subcommand};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, ErrorCode};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -563,7 +564,6 @@ fn read_only_connection(command: &Command, db_path: &Path) -> Option<Connection>
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let db_path = cli.db.unwrap_or_else(default_db_path);
-
     // Sync commands must acquire their advisory lock before opening a writable connection.
     // Pre-dispatch them so the common connection setup below cannot initialize the schema or
     // wait on SQLite before contention is detected.
@@ -588,7 +588,6 @@ pub fn run() -> Result<()> {
         }
         _ => {}
     }
-
     // Read-only commands get a handle that cannot take the write lock, so a
     // query never contends with the writer. Falls back to a writable open when
     // the database does not exist yet (that first open creates it) or when it
@@ -1881,11 +1880,20 @@ impl DbHolder {
 
 /// Processes with the database open, via `lsof`, annotated with `ps` state.
 fn db_holders(db_path: &Path) -> Vec<DbHolder> {
-    let Ok(out) = std::process::Command::new("lsof")
-        .arg("-t")
-        .arg(db_path)
-        .output()
-    else {
+    // macOS keeps lsof in /usr/sbin, which is commonly absent from the PATH of
+    // launchd jobs and embedded hosts. Try PATH first, then stable system
+    // locations so automatic diagnostics do not silently lose their evidence.
+    let out = ["lsof", "/usr/sbin/lsof", "/usr/bin/lsof"]
+        .iter()
+        .find_map(|program| {
+            std::process::Command::new(program)
+                .arg("-t")
+                .arg(db_path)
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+        });
+    let Some(out) = out else {
         return Vec::new();
     };
     let own_pid = std::process::id().to_string();
@@ -1894,30 +1902,135 @@ fn db_holders(db_path: &Path) -> Vec<DbHolder> {
         // Our own read-only handle is not a finding.
         .filter(|pid| *pid != own_pid)
         .filter_map(|pid| {
-            let info = std::process::Command::new("ps")
-                .args(["-o", "stat=,command=", "-p", pid])
-                .output()
-                .ok()?;
-            let line = String::from_utf8_lossy(&info.stdout).trim().to_string();
-            let (state, command) = line.split_once(char::is_whitespace)?;
+            let (state, command) = process_status(pid)?;
             Some(DbHolder {
                 pid: pid.to_string(),
-                state: state.to_string(),
-                command: command.trim().to_string(),
+                state,
+                command,
             })
         })
         .collect()
 }
 
+/// Process state with stable-path fallbacks for reduced-PATH launchd and embedded hosts.
+fn process_status(pid: &str) -> Option<(String, String)> {
+    process_status_with_programs(pid, &["ps", "/bin/ps", "/usr/bin/ps"])
+}
+
+fn process_status_with_programs(pid: &str, programs: &[&str]) -> Option<(String, String)> {
+    programs.iter().find_map(|program| {
+        let output = std::process::Command::new(program)
+            .args(["-o", "stat=,command=", "-p", pid])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())?;
+        let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let (state, command) = line.split_once(char::is_whitespace)?;
+        Some((state.to_string(), command.trim().to_string()))
+    })
+}
+
 /// Can a writer actually start right now?
 ///
 /// Uses a short timeout on purpose: `doctor` should report a wedged database
-/// promptly rather than inherit the 30s production wait.
+/// promptly rather than inherit the production retry sequence.
 fn probe_write_lock(db_path: &Path) -> std::result::Result<(), String> {
     let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
     let _ = conn.busy_timeout(Duration::from_millis(1500));
     conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
         .map_err(|err| err.to_string())
+}
+
+fn is_sqlite_contention(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(code.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        )
+    })
+}
+
+/// Explain a write-contention failure using a fresh capability probe.
+///
+/// `lsof` proves only that a process has the file open. The `BEGIN IMMEDIATE`
+/// probe below establishes whether a writer can actually start *now*; holder
+/// output is deliberately phrased as causal only while that probe is blocked.
+fn write_contention_diagnostic(db_path: &Path) -> String {
+    let lock = probe_write_lock(db_path);
+    let holders = db_holders(db_path);
+    let wal_bytes = fs::metadata(wal_path(db_path))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let mut lines = vec![match &lock {
+        Ok(()) => "write capability probe now succeeds; the contention was transient".to_string(),
+        Err(err) => format!("write capability probe is still blocked: {err}"),
+    }];
+
+    if lock.is_err() {
+        let wedged: Vec<_> = holders.iter().filter(|holder| holder.is_wedged()).collect();
+        if wedged.is_empty() {
+            if holders.is_empty() {
+                lines.push(
+                    "no file-open holder was detected; SQLite does not expose lock ownership"
+                        .to_string(),
+                );
+            } else {
+                lines.push(format!(
+                    "{} process(es) have the database open, but none is stopped or zombie; file-open status does not prove lock ownership",
+                    holders.len()
+                ));
+            }
+        } else {
+            for holder in wedged {
+                lines.push(format!(
+                    "pid {} is {} with the database open; if it owns the transaction it cannot release it until resumed (kill -CONT {})",
+                    holder.pid, holder.state, holder.pid
+                ));
+            }
+        }
+    }
+    if let Some(wal_line) = wal_contention_line(wal_bytes, lock.is_err()) {
+        lines.push(wal_line);
+    }
+
+    format!("ai-hist contention diagnostic: {}", lines.join("; "))
+}
+
+fn wal_contention_line(wal_bytes: u64, write_blocked: bool) -> Option<String> {
+    if wal_bytes <= WAL_WARN_BYTES {
+        return None;
+    }
+    Some(if write_blocked {
+        format!(
+            "WAL is {} while the write path is failing; checkpoint progress is starved",
+            human_bytes(wal_bytes)
+        )
+    } else {
+        format!(
+            "WAL is {} after write capability recovered; a long-lived reader may still be delaying checkpoints",
+            human_bytes(wal_bytes)
+        )
+    })
+}
+
+fn enrich_sync_error(db_path: &Path, error: anyhow::Error) -> anyhow::Error {
+    if is_sqlite_contention(&error) {
+        let diagnostic_path = source_database_path(&error)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| db_path.to_path_buf());
+        error.context(write_contention_diagnostic(&diagnostic_path))
+    } else {
+        error
+    }
+}
+
+fn source_database_path(error: &anyhow::Error) -> Option<&Path> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<SourceDatabaseError>()
+            .map(SourceDatabaseError::path)
+    })
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -1998,6 +2111,7 @@ fn doctor(db_path: &Path, json: bool) -> Result<()> {
                     Ok(()) => json!("available"),
                     Err(err) => json!({"blocked": err}),
                 },
+                "write_capable": lock.is_ok(),
                 "holders": holders.iter().map(|h| json!({
                     "pid": h.pid,
                     "state": h.state,
@@ -2038,7 +2152,7 @@ fn doctor(db_path: &Path, json: bool) -> Result<()> {
         }
     }
     if problems.is_empty() {
-        println!("\nNo problems detected.");
+        println!("\nDatabase write capability is healthy.");
     } else {
         println!("\nProblems:");
         for problem in &problems {
@@ -2048,13 +2162,82 @@ fn doctor(db_path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct SyncSourceReport {
+    succeeded: usize,
+    failures: Vec<SyncSourceFailure>,
+}
+
+struct SyncSourceFailure {
+    source: String,
+    error: String,
+    is_contention: bool,
+    contention_path: Option<PathBuf>,
+}
+
+impl SyncSourceReport {
+    fn capture<T>(&mut self, source: &str, result: Result<T>) -> Option<T> {
+        match result {
+            Ok(value) => {
+                self.succeeded += 1;
+                Some(value)
+            }
+            Err(error) => {
+                self.failures.push(SyncSourceFailure {
+                    source: source.to_string(),
+                    error: format!("{error:#}"),
+                    is_contention: is_sqlite_contention(&error),
+                    contention_path: source_database_path(&error).map(Path::to_path_buf),
+                });
+                None
+            }
+        }
+    }
+
+    fn finish(&self, db_path: &Path) -> Result<()> {
+        if self.failures.is_empty() {
+            return Ok(());
+        }
+
+        eprintln!(
+            "ai-hist: {} history source(s) failed; {} source(s) completed:",
+            self.failures.len(),
+            self.succeeded
+        );
+        for failure in &self.failures {
+            eprintln!("  [{}] {}", failure.source, failure.error);
+        }
+        let mut diagnosed = HashSet::new();
+        for failure in self.failures.iter().filter(|failure| failure.is_contention) {
+            let path = failure.contention_path.as_deref().unwrap_or(db_path);
+            if diagnosed.insert(path.to_path_buf()) {
+                eprintln!("{}", write_contention_diagnostic(path));
+            }
+        }
+        if self.succeeded == 0 {
+            anyhow::bail!(
+                "all {} history sources failed; no source made progress",
+                self.failures.len()
+            );
+        }
+        Ok(())
+    }
+}
+
 fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
     let home = home_dir();
     let mut total_inserted = 0;
+    let mut report = SyncSourceReport::default();
     let state_path = db_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(".sync-state.json");
+    if let Err(error) = cleanup_stale_sync_state_temps(&state_path) {
+        eprintln!(
+            "ai-hist: could not clean stale sync-state temp files beside {}: {error:#}",
+            state_path.display()
+        );
+    }
     // Refuse to start rather than fail partway. A write that runs out of space
     // mid-flight is what truncated .sync-state.json and wedged sync for days;
     // stopping up front with an actionable message is strictly better than
@@ -2078,37 +2261,67 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
     // turns one interrupted run into a loop that re-scans from scratch forever
     // and never persists anything. Checkpointing makes each source's cursor
     // durable the moment that source completes.
-    total_inserted += sync_jsonl_incremental(
-        conn,
-        &mut state,
+    if let Some(inserted) = report.capture(
         "claude",
-        &home.join(".claude/history.jsonl"),
-        parse_claude_line,
-        &mut |in_progress| checkpoint_sync_state(&state_path, in_progress),
-    )?;
-    checkpoint_sync_state(&state_path, &state);
-    sync_claude_session_metadata(conn, &mut state, &home.join(".claude/projects"))?;
-    checkpoint_sync_state(&state_path, &state);
-    total_inserted += sync_codex(conn, &mut state, &home)?;
-    checkpoint_sync_state(&state_path, &state);
-    total_inserted += sync_cursor(conn, &mut state, &home.join(".cursor/projects"))?;
-    checkpoint_sync_state(&state_path, &state);
-    total_inserted += sync_grok(conn, &mut state, &home.join(".grok/sessions"))?;
-    checkpoint_sync_state(&state_path, &state);
-    total_inserted += sync_trajectories(conn, &mut state)?;
-    checkpoint_sync_state(&state_path, &state);
+        sync_jsonl_incremental(
+            conn,
+            &mut state,
+            "claude",
+            &home.join(".claude/history.jsonl"),
+            parse_claude_line,
+            &mut |in_progress| checkpoint_sync_state(&state_path, in_progress),
+        ),
+    ) {
+        total_inserted += inserted;
+        checkpoint_sync_state(&state_path, &state);
+    }
+    if report
+        .capture(
+            "claude-metadata",
+            sync_claude_session_metadata(conn, &mut state, &home.join(".claude/projects")),
+        )
+        .is_some()
+    {
+        checkpoint_sync_state(&state_path, &state);
+    }
+    if let Some(inserted) = report.capture("codex", sync_codex(conn, &mut state, &home)) {
+        total_inserted += inserted;
+        checkpoint_sync_state(&state_path, &state);
+    }
+    if let Some(inserted) = report.capture(
+        "cursor",
+        sync_cursor(conn, &mut state, &home.join(".cursor/projects")),
+    ) {
+        total_inserted += inserted;
+        checkpoint_sync_state(&state_path, &state);
+    }
+    if let Some(inserted) = report.capture(
+        "grok",
+        sync_grok(conn, &mut state, &home.join(".grok/sessions")),
+    ) {
+        total_inserted += inserted;
+        checkpoint_sync_state(&state_path, &state);
+    }
+    if let Some(inserted) = report.capture("trajectory", sync_trajectories(conn, &mut state)) {
+        total_inserted += inserted;
+        checkpoint_sync_state(&state_path, &state);
+    }
     let opencode = std::env::var_os("OPENCODE_DB")
         .map(PathBuf::from)
         .unwrap_or_else(default_opencode_db_path);
-    let open_inserted = sync_opencode_db(conn, &opencode)?;
-    if opencode.exists() {
-        sync_note!("  [opencode] +{open_inserted} rows");
-    } else {
-        sync_note!("  [opencode] not found: {} (skipped)", opencode.display());
+    if let Some(open_inserted) = report.capture("opencode", sync_opencode_db(conn, &opencode)) {
+        if opencode.exists() {
+            sync_note!("  [opencode] +{open_inserted} rows");
+        } else {
+            sync_note!("  [opencode] not found: {} (skipped)", opencode.display());
+        }
+        total_inserted += open_inserted;
     }
-    total_inserted += open_inserted;
-    total_inserted += sync_relaycast(conn, &mut state)?;
-    checkpoint_sync_state(&state_path, &state);
+    if let Some(inserted) = report.capture("relay", sync_relaycast(conn, &mut state)) {
+        total_inserted += inserted;
+        checkpoint_sync_state(&state_path, &state);
+    }
+    report.finish(db_path)?;
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
     // Fold the WAL back into the database now that the writes are done. Best
     // effort: a concurrent reader pinning an old snapshot blocks a full
@@ -2204,8 +2417,8 @@ fn sync_exclusive(db_path: &Path) -> Result<bool> {
         sync_note!("  [sync] another sync is already running; skipped");
         return Ok(false);
     };
-    let conn = open_db(db_path)?;
-    sync_basic(&conn, db_path)?;
+    let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
+    sync_basic(&conn, db_path).map_err(|error| enrich_sync_error(db_path, error))?;
     Ok(true)
 }
 
@@ -2214,8 +2427,9 @@ fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool>
         sync_note!("  [sync-opencode] another sync is already running; skipped");
         return Ok(false);
     };
-    let conn = open_db(db_path)?;
-    let inserted = sync_opencode_db(&conn, opencode_path)?;
+    let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
+    let inserted = sync_opencode_db(&conn, opencode_path)
+        .map_err(|error| enrich_sync_error(db_path, error))?;
     sync_note!("  [opencode] +{inserted} rows");
     Ok(true)
 }
@@ -2232,8 +2446,8 @@ fn prepare_sync_and_push_db(db_path: &Path) -> Result<(Connection, bool)> {
         })?;
         return Ok((conn, true));
     };
-    let conn = open_db(db_path)?;
-    sync_basic(&conn, db_path)?;
+    let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
+    sync_basic(&conn, db_path).map_err(|error| enrich_sync_error(db_path, error))?;
     drop(sync_lock);
     Ok((conn, false))
 }
@@ -2243,7 +2457,7 @@ fn watch_loop(db_path: &Path, interval: u64) -> Result<()> {
     loop {
         match sync_exclusive(db_path) {
             Ok(_) => {}
-            Err(err) => eprintln!("Error: {err}"),
+            Err(err) => eprintln!("Error: {err:#}"),
         }
         std::thread::sleep(Duration::from_secs(interval));
     }
@@ -3527,6 +3741,78 @@ fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Ma
         changed = true;
     }
     Ok(if changed { Some(merged) } else { None })
+}
+
+const STALE_SYNC_STATE_TMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 does not deliver a signal; it performs only existence
+    // and permission checks. EPERM therefore still means the process is live.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    // The age bound below still provides portable cleanup without guessing at
+    // platform-specific process APIs.
+    true
+}
+
+/// Remove uniquely named state temp files whose writer is gone or whose write
+/// has been abandoned for a full day.
+fn cleanup_stale_sync_state_temps(path: &Path) -> Result<usize> {
+    let Some(parent) = path.parent() else {
+        return Ok(0);
+    };
+    if !parent.exists() {
+        return Ok(0);
+    }
+    let Some(state_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(0);
+    };
+    let prefix = format!("{state_name}.tmp.");
+    let own_pid = std::process::id();
+    let mut removed = 0;
+
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let owner_pid = suffix
+            .split_once('.')
+            .and_then(|(pid, _)| pid.parse::<u32>().ok());
+        let abandoned_by_age = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE_SYNC_STATE_TMP_AGE);
+        let owner_is_gone = owner_pid.is_some_and(|pid| pid != own_pid && !process_is_alive(pid));
+        if !owner_is_gone && !abandoned_by_age {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("removing stale sync state temp {}", entry.path().display())
+                })
+            }
+        }
+    }
+    Ok(removed)
 }
 
 /// Writes via a temp file + rename so an interrupted or out-of-space write
@@ -5488,13 +5774,16 @@ fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpoint_sync_state, cron_schedule, file_stamp, git_commit_time_ms, git_stdout,
-        ingest_claude_transcript, link_git_commit, load_sync_state, parse_trajectory_file,
-        paths_overlap, prepare_sync_and_push_db, save_sync_state, search_all, service_command_args,
-        shell_single_quote, strip_url_credentials, sync_claude_session_metadata, sync_exclusive,
-        sync_opencode_exclusive, try_acquire_sync_lock, xml_escape, SearchRole, PUSH_SERVICE,
+        checkpoint_sync_state, cleanup_stale_sync_state_temps, cron_schedule, file_stamp,
+        git_commit_time_ms, git_stdout, ingest_claude_transcript, is_sqlite_contention,
+        link_git_commit, load_sync_state, parse_trajectory_file, paths_overlap,
+        prepare_sync_and_push_db, process_status_with_programs, save_sync_state, search_all,
+        service_command_args, shell_single_quote, source_database_path, strip_url_credentials,
+        sync_claude_session_metadata, sync_exclusive, sync_opencode_exclusive,
+        try_acquire_sync_lock, wal_contention_line, write_contention_diagnostic, xml_escape,
+        SearchRole, SyncSourceReport, PUSH_SERVICE, WAL_WARN_BYTES,
     };
-    use ai_hist_core::{init_db, open_db, QueryFilter};
+    use ai_hist_core::{init_db, open_db, QueryFilter, SourceDatabaseError};
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::fs;
@@ -5630,6 +5919,99 @@ mod tests {
             .collect();
         found.sort();
         found
+    }
+
+    #[test]
+    fn stale_sync_state_temps_are_removed_without_touching_a_live_writer() {
+        let dir =
+            std::env::temp_dir().join(format!("ai-hist-state-cleanup-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".sync-state.json");
+        let stale = dir.join(".sync-state.json.tmp.999999999.0");
+        let live = dir.join(format!(".sync-state.json.tmp.{}.0", std::process::id()));
+        fs::write(&stale, "stale").unwrap();
+        fs::write(&live, "live").unwrap();
+
+        assert_eq!(cleanup_stale_sync_state_temps(&path).unwrap(), 1);
+        assert!(!stale.exists());
+        assert!(live.exists());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_source_does_not_prevent_later_sources_from_completing() {
+        let mut report = SyncSourceReport::default();
+        assert!(report
+            .capture::<usize>("broken", Err(anyhow::anyhow!("bad source")))
+            .is_none());
+        assert_eq!(report.capture("healthy", Ok(7)), Some(7));
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(report.failures.len(), 1);
+        assert!(report.finish(std::path::Path::new("unused.db")).is_ok());
+
+        let mut all_failed = SyncSourceReport::default();
+        all_failed.capture::<usize>("only", Err(anyhow::anyhow!("still bad")));
+        assert!(all_failed
+            .finish(std::path::Path::new("unused.db"))
+            .is_err());
+    }
+
+    #[test]
+    fn contention_diagnostics_reprobe_write_capability() {
+        let dir = std::env::temp_dir().join(format!("ai-hist-contention-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("contention.db");
+        let holder = open_db(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let contender = Connection::open(&path).unwrap();
+        contender.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let busy = contender
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect_err("the competing writer must be busy");
+        assert!(is_sqlite_contention(&anyhow::Error::new(busy)));
+        let blocked = write_contention_diagnostic(&path);
+        assert!(blocked.contains("write capability probe is still blocked"));
+
+        holder.execute_batch("ROLLBACK").unwrap();
+        let recovered = write_contention_diagnostic(&path);
+        assert!(recovered.contains("write capability probe now succeeds"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn contention_diagnostics_keep_source_paths_and_recovered_wal_wording_accurate() {
+        let source = std::path::PathBuf::from("/tmp/opencode-source.db");
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        let error = anyhow::Error::new(SourceDatabaseError::new(&source, busy));
+        assert!(is_sqlite_contention(&error));
+        assert_eq!(source_database_path(&error), Some(source.as_path()));
+
+        let recovered = wal_contention_line(WAL_WARN_BYTES + 1, false).unwrap();
+        assert!(
+            recovered.contains("write capability recovered"),
+            "{recovered}"
+        );
+        assert!(!recovered.contains("write path is failing"), "{recovered}");
+        let blocked = wal_contention_line(WAL_WARN_BYTES + 1, true).unwrap();
+        assert!(blocked.contains("write path is failing"), "{blocked}");
+    }
+
+    #[test]
+    fn process_status_uses_an_absolute_fallback_when_path_lookup_fails() {
+        let pid = std::process::id().to_string();
+        let (state, command) = process_status_with_programs(
+            &pid,
+            &["/definitely/missing/ps", "/bin/ps", "/usr/bin/ps"],
+        )
+        .expect("an absolute system ps should describe the current process");
+        assert!(!state.is_empty());
+        assert!(!command.is_empty());
     }
 
     #[test]
