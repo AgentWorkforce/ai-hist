@@ -2150,6 +2150,14 @@ struct SyncRunLock {
     _file: fs::File,
 }
 
+impl Drop for SyncRunLock {
+    fn drop(&mut self) {
+        // Do not rely solely on platform-specific close timing. Linux CI exposed a race where
+        // a just-dropped guard was not immediately reacquirable through an alias path.
+        let _ = fs2::FileExt::unlock(&self._file);
+    }
+}
+
 fn canonical_db_identity(db_path: &Path) -> Result<PathBuf> {
     if db_path.exists() {
         return fs::canonicalize(db_path)
@@ -5555,7 +5563,12 @@ mod tests {
         );
 
         drop(first);
-        assert!(try_acquire_sync_lock(&alias).unwrap().is_some());
+        for _ in 0..16 {
+            let reacquired = try_acquire_sync_lock(&alias)
+                .unwrap()
+                .expect("a dropped sync guard must release the lock immediately");
+            drop(reacquired);
+        }
     }
 
     #[test]
