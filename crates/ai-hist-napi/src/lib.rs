@@ -13,6 +13,8 @@ pub struct SyncPushResult {
     pub accepted: u32,
     /// `false` when there's no stored relayhistory auth yet (a no-op, not an error).
     pub authenticated: bool,
+    /// `true` when another process owned the history scan; existing rows were still pushed.
+    pub sync_skipped: bool,
 }
 
 /// Sync local agent history into the ai-hist DB, then push new records to
@@ -28,5 +30,6 @@ pub async fn sync_and_push() -> napi::Result<SyncPushResult> {
         sent: outcome.sent as u32,
         accepted: outcome.accepted as u32,
         authenticated: outcome.authenticated,
+        sync_skipped: outcome.sync_skipped,
     })
 }

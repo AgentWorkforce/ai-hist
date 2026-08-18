@@ -625,6 +625,17 @@ fn ingest_status_error(code: u16, body: String, attempted_records: usize) -> any
     }
 }
 
+fn map_ingest_http_err(error: ureq::Error, attempted_records: usize) -> anyhow::Error {
+    match error {
+        ureq::Error::Status(code, response) => ingest_status_error(
+            code,
+            response.into_string().unwrap_or_default(),
+            attempted_records,
+        ),
+        other => other.into(),
+    }
+}
+
 // ----- ureq-backed live transport -----
 
 /// Live `Ingestor` over `ureq` (blocking HTTP — no async runtime, never compiled into the
@@ -635,19 +646,123 @@ impl Ingestor for UreqIngestor {
     fn ingest(&self, auth: &StoredAuth, req: &IngestRequest) -> Result<IngestResponse> {
         require_secure_transport(&auth.base_url)?;
         let url = format!("{}/v1/ingest", auth.base_url.trim_end_matches('/'));
-        let resp = ureq::post(&url)
-            .set("Authorization", &format!("Bearer {}", auth.access_token))
-            .set("Content-Type", "application/json")
-            .send_json(serde_json::to_value(req)?);
-        match resp {
-            Ok(r) => Ok(r.into_json::<IngestResponse>()?),
-            Err(ureq::Error::Status(code, r)) => {
-                let body = r.into_string().unwrap_or_default();
-                Err(ingest_status_error(code, body, req.records.len()))
-            }
-            Err(e) => Err(e.into()),
+        let payload = serde_json::to_value(req)?;
+        let response = send_with_auth_refresh(
+            auth,
+            |current| {
+                ureq::post(&url)
+                    .set("Authorization", &format!("Bearer {}", current.access_token))
+                    .set("Content-Type", "application/json")
+                    .send_json(payload.clone())
+                    .map_err(Box::new)
+            },
+            |error| map_ingest_http_err(error, req.records.len()),
+        )
+        .context("ingest failed")?;
+        Ok(response.into_json::<IngestResponse>()?)
+    }
+}
+
+struct AuthRefreshLock {
+    _file: fs::File,
+}
+
+fn refresh_lock_path(base_url: &str) -> Result<PathBuf> {
+    let auth = auth_path(base_url)?;
+    let mut name = auth
+        .file_name()
+        .context("stage auth path has no file name")?
+        .to_os_string();
+    name.push(".refresh.lock");
+    Ok(auth.with_file_name(name))
+}
+
+fn acquire_refresh_lock(base_url: &str) -> Result<AuthRefreshLock> {
+    let path = refresh_lock_path(base_url)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    fs2::FileExt::lock_exclusive(&file)
+        .with_context(|| format!("locking token refresh state at {}", path.display()))?;
+    Ok(AuthRefreshLock { _file: file })
+}
+
+fn is_unauthorized(error: &ureq::Error) -> bool {
+    matches!(error, ureq::Error::Status(401, _))
+}
+
+/// Send one authenticated request and rotate an expired session at most once. The persisted
+/// session is loaded before each request so a long-lived caller holding an older `StoredAuth`
+/// transparently adopts a pair rotated by an earlier call. Refresh-token rotation is serialized
+/// per stage: a waiter reloads credentials after acquiring the lock and reuses a pair already
+/// rotated by another process instead of submitting the revoked old token.
+fn send_with_auth_refresh(
+    auth: &StoredAuth,
+    send: impl Fn(&StoredAuth) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+    map_error: impl Fn(ureq::Error) -> anyhow::Error,
+) -> Result<ureq::Response> {
+    let attempted = load_auth(Some(&auth.base_url))?.unwrap_or_else(|| auth.clone());
+    let mut unauthorized = match send(&attempted) {
+        Ok(response) => return Ok(response),
+        Err(error) if is_unauthorized(&error) => *error,
+        Err(error) => return Err(map_error(*error)),
+    };
+
+    let _refresh_lock = acquire_refresh_lock(&auth.base_url)?;
+    let current = load_auth(Some(&auth.base_url))?.unwrap_or_else(|| auth.clone());
+
+    // A concurrent process may have completed rotation while this caller waited. Try its
+    // persisted access token before touching the one-time refresh token again.
+    if current.access_token != attempted.access_token {
+        match send(&current) {
+            Ok(response) => return Ok(response),
+            Err(error) if is_unauthorized(&error) => unauthorized = *error,
+            Err(error) => return Err(map_error(*error)),
         }
     }
+
+    if current
+        .refresh_token
+        .as_deref()
+        .is_none_or(|token| token.trim().is_empty())
+    {
+        return Err(map_error(unauthorized));
+    }
+    let refreshed = refresh_auth(&current).context("refreshing relayhistory session")?;
+    // Refresh tokens rotate and invalidate their predecessor. Persist the new pair atomically
+    // before retrying so a crash or network failure cannot strand the client on the old token.
+    save_auth(&refreshed).context("persisting refreshed relayhistory session")?;
+    send(&refreshed).map_err(|error| map_error(*error))
+}
+
+fn refresh_auth(auth: &StoredAuth) -> Result<StoredAuth> {
+    require_secure_transport(&auth.base_url)?;
+    let refresh_token = auth
+        .refresh_token
+        .as_deref()
+        .context("stored relayhistory session has no refresh token; run `ai-hist login`")?;
+    let url = format!(
+        "{}/v1/auth/token/refresh",
+        auth.base_url.trim_end_matches('/')
+    );
+    let response = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(serde_json::json!({ "refreshToken": refresh_token }))
+        .map_err(map_http_err)?;
+    let payload: serde_json::Value = response.into_json()?;
+    Ok(StoredAuth {
+        base_url: auth.base_url.clone(),
+        access_token: field(&payload, "accessToken")?,
+        refresh_token: Some(field(&payload, "refreshToken")?),
+        org_id: auth.org_id.clone(),
+        workspace_id: auth.workspace_id.clone(),
+    })
 }
 
 /// `POST /v1/admin/mint` (dev-only bootstrap) → store the `rth_at_` session.
@@ -938,18 +1053,20 @@ pub fn pair_check(auth: &StoredAuth, context: &PairContext, limit: usize) -> Res
     require_secure_transport(&auth.base_url)?;
     let url = format!("{}/v1/pair/check", auth.base_url.trim_end_matches('/'));
     let req = PairRequest { context, limit };
-    let resp = ureq::post(&url)
-        .set("Authorization", &format!("Bearer {}", auth.access_token))
-        .set("Content-Type", "application/json")
-        .send_json(serde_json::to_value(req)?);
-    match resp {
-        Ok(r) => Ok(r.into_json::<PairResponse>()?),
-        Err(ureq::Error::Status(code, r)) => {
-            let body = r.into_string().unwrap_or_default();
-            anyhow::bail!("pair check failed: HTTP {code}: {body}")
-        }
-        Err(e) => Err(e.into()),
-    }
+    let payload = serde_json::to_value(req)?;
+    let response = send_with_auth_refresh(
+        auth,
+        |current| {
+            ureq::post(&url)
+                .set("Authorization", &format!("Bearer {}", current.access_token))
+                .set("Content-Type", "application/json")
+                .send_json(payload.clone())
+                .map_err(Box::new)
+        },
+        map_http_err,
+    )
+    .context("pair check failed")?;
+    Ok(response.into_json::<PairResponse>()?)
 }
 
 /// Human-readable rendering of Pair warnings (the non-`--json` output).
@@ -1080,24 +1197,26 @@ pub struct CoverageQuery {
 pub fn fleet_coverage(auth: &StoredAuth, query: &CoverageQuery) -> Result<CoverageResponse> {
     require_secure_transport(&auth.base_url)?;
     let url = format!("{}/v1/machines", auth.base_url.trim_end_matches('/'));
-    let mut req = ureq::get(&url).set("Authorization", &format!("Bearer {}", auth.access_token));
-    if let Some(v) = query.stale_after_seconds {
-        req = req.query("staleAfterSeconds", &v.to_string());
-    }
-    if let Some(v) = query.missing_after_seconds {
-        req = req.query("missingAfterSeconds", &v.to_string());
-    }
-    if let Some(v) = query.window_hours {
-        req = req.query("windowHours", &v.to_string());
-    }
-    match req.call() {
-        Ok(r) => Ok(r.into_json::<CoverageResponse>()?),
-        Err(ureq::Error::Status(code, r)) => {
-            let body = r.into_string().unwrap_or_default();
-            anyhow::bail!("coverage query failed: HTTP {code}: {body}")
-        }
-        Err(e) => Err(e.into()),
-    }
+    let response = send_with_auth_refresh(
+        auth,
+        |current| {
+            let mut request =
+                ureq::get(&url).set("Authorization", &format!("Bearer {}", current.access_token));
+            if let Some(v) = query.stale_after_seconds {
+                request = request.query("staleAfterSeconds", &v.to_string());
+            }
+            if let Some(v) = query.missing_after_seconds {
+                request = request.query("missingAfterSeconds", &v.to_string());
+            }
+            if let Some(v) = query.window_hours {
+                request = request.query("windowHours", &v.to_string());
+            }
+            request.call().map_err(Box::new)
+        },
+        map_http_err,
+    )
+    .context("coverage query failed")?;
+    Ok(response.into_json::<CoverageResponse>()?)
 }
 
 /// Human-readable fleet table (the non-`--json` output).
@@ -1489,6 +1608,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _relayhistory_home = EnvVarGuard::set("RELAYHISTORY_HOME", dir.path());
         f()
+    }
+
+    fn read_http_request(
+        stream: &mut std::net::TcpStream,
+    ) -> (String, std::collections::HashMap<String, String>, String) {
+        use std::io::{BufRead, BufReader, Read};
+
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut first_line = String::new();
+        reader.read_line(&mut first_line).unwrap();
+        let mut headers = std::collections::HashMap::new();
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = trimmed.split_once(':') {
+                let name = name.to_ascii_lowercase();
+                let value = value.trim().to_string();
+                if name == "content-length" {
+                    content_length = value.parse().unwrap();
+                }
+                headers.insert(name, value);
+            }
+        }
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).unwrap();
+        (first_line, headers, String::from_utf8(body).unwrap())
+    }
+
+    fn write_http_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+        use std::io::Write;
+
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
     }
 
     #[test]
@@ -1886,6 +2049,241 @@ mod tests {
             };
             save_cursor(&auth.base_url, &c).unwrap();
             assert_eq!(load_cursor(&auth.base_url).unwrap(), c);
+        });
+    }
+
+    #[test]
+    fn concurrent_auth_saves_never_publish_partial_json() {
+        with_temp_home(|| {
+            let mut writers = Vec::new();
+            for writer in 0..8 {
+                writers.push(std::thread::spawn(move || {
+                    for revision in 0..40 {
+                        save_auth(&StoredAuth {
+                            base_url: "http://localhost:8787".into(),
+                            access_token: format!("rth_at_{writer}_{revision}"),
+                            refresh_token: Some(format!("rth_rt_{writer}_{revision}")),
+                            ..Default::default()
+                        })
+                        .unwrap();
+                    }
+                }));
+            }
+            for writer in writers {
+                writer.join().unwrap();
+            }
+
+            let stored = load_auth(Some("http://localhost:8787")).unwrap().unwrap();
+            assert!(stored.access_token.starts_with("rth_at_"));
+            assert!(stored
+                .refresh_token
+                .as_deref()
+                .is_some_and(|token| token.starts_with("rth_rt_")));
+            let leftovers: Vec<_> = fs::read_dir(stage_dir())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "leftover auth temp files: {leftovers:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn concurrent_401s_share_one_rotated_refresh_token() {
+        with_temp_home(|| {
+            use std::sync::{Arc, Barrier};
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let server_refreshes = Arc::clone(&refreshes);
+            let server = std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let mut handled = 0;
+                while handled < 5 && started.elapsed() < std::time::Duration::from_secs(10) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("accept failed: {error}"),
+                    };
+                    handled += 1;
+                    let (line, headers, body) = read_http_request(&mut stream);
+                    if line.starts_with("POST /v1/auth/token/refresh ") {
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(&body).unwrap()
+                                ["refreshToken"],
+                            "rth_rt_old"
+                        );
+                        let prior = server_refreshes.fetch_add(1, Ordering::SeqCst);
+                        if prior == 0 {
+                            write_http_response(
+                                &mut stream,
+                                "200 OK",
+                                r#"{"accessToken":"rth_at_fresh","refreshToken":"rth_rt_fresh"}"#,
+                            );
+                        } else {
+                            write_http_response(
+                                &mut stream,
+                                "401 Unauthorized",
+                                r#"{"error":"refresh token already rotated"}"#,
+                            );
+                        }
+                        continue;
+                    }
+
+                    assert!(line.starts_with("POST /v1/ingest "), "{line}");
+                    match headers.get("authorization").map(String::as_str) {
+                        Some("Bearer rth_at_expired") => write_http_response(
+                            &mut stream,
+                            "401 Unauthorized",
+                            r#"{"error":"invalid_token"}"#,
+                        ),
+                        Some("Bearer rth_at_fresh") => write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            r#"{"batchId":"b_test","received":0,"accepted":0}"#,
+                        ),
+                        other => panic!("unexpected authorization header: {other:?}"),
+                    }
+                }
+                assert_eq!(
+                    handled, 5,
+                    "expected two initial calls, one refresh, two retries"
+                );
+            });
+
+            let auth = StoredAuth {
+                base_url: format!("http://{addr}"),
+                access_token: "rth_at_expired".into(),
+                refresh_token: Some("rth_rt_old".into()),
+                org_id: Some("org-a".into()),
+                workspace_id: Some("ws-a".into()),
+            };
+            save_auth(&auth).unwrap();
+            let barrier = Arc::new(Barrier::new(3));
+            let mut clients = Vec::new();
+            for _ in 0..2 {
+                let auth = auth.clone();
+                let barrier = Arc::clone(&barrier);
+                clients.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    UreqIngestor.ingest(
+                        &auth,
+                        &IngestRequest {
+                            machine: MachineIdentity {
+                                id: "m1".into(),
+                                ..Default::default()
+                            },
+                            batch_id: "b_test".into(),
+                            cursors: None,
+                            records: Vec::new(),
+                        },
+                    )
+                }));
+            }
+            barrier.wait();
+            for client in clients {
+                assert_eq!(client.join().unwrap().unwrap().batch_id, "b_test");
+            }
+            server.join().unwrap();
+
+            assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+            let stored = load_auth(Some(&auth.base_url)).unwrap().unwrap();
+            assert_eq!(stored.access_token, "rth_at_fresh");
+            assert_eq!(stored.refresh_token.as_deref(), Some("rth_rt_fresh"));
+        });
+    }
+
+    #[test]
+    fn a_reused_auth_value_adopts_the_persisted_rotation() {
+        with_temp_home(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stale_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let refreshes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let server_stale_requests = std::sync::Arc::clone(&stale_requests);
+            let server_refreshes = std::sync::Arc::clone(&refreshes);
+            let server = std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let mut handled = 0;
+                while handled < 4 && started.elapsed() < std::time::Duration::from_secs(10) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("accept failed: {error}"),
+                    };
+                    handled += 1;
+                    let (line, headers, _) = read_http_request(&mut stream);
+                    if line.starts_with("POST /v1/auth/token/refresh ") {
+                        server_refreshes.fetch_add(1, Ordering::SeqCst);
+                        write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            r#"{"accessToken":"rth_at_fresh","refreshToken":"rth_rt_fresh"}"#,
+                        );
+                        continue;
+                    }
+
+                    assert!(line.starts_with("POST /v1/ingest "), "{line}");
+                    match headers.get("authorization").map(String::as_str) {
+                        Some("Bearer rth_at_expired") => {
+                            server_stale_requests.fetch_add(1, Ordering::SeqCst);
+                            write_http_response(
+                                &mut stream,
+                                "401 Unauthorized",
+                                r#"{"error":"invalid_token"}"#,
+                            );
+                        }
+                        Some("Bearer rth_at_fresh") => write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            r#"{"batchId":"b_test","received":0,"accepted":0}"#,
+                        ),
+                        other => panic!("unexpected authorization header: {other:?}"),
+                    }
+                }
+                assert_eq!(
+                    handled, 4,
+                    "expected one stale call, one refresh, and two successful calls"
+                );
+            });
+
+            let auth = StoredAuth {
+                base_url: format!("http://{addr}"),
+                access_token: "rth_at_expired".into(),
+                refresh_token: Some("rth_rt_old".into()),
+                ..Default::default()
+            };
+            save_auth(&auth).unwrap();
+            let request = IngestRequest {
+                machine: MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                batch_id: "b_test".into(),
+                cursors: None,
+                records: Vec::new(),
+            };
+
+            UreqIngestor.ingest(&auth, &request).unwrap();
+            // Deliberately reuse the stale value. The persisted rotated pair must be selected
+            // before sending, without another guaranteed-to-fail request or refresh.
+            UreqIngestor.ingest(&auth, &request).unwrap();
+            server.join().unwrap();
+
+            assert_eq!(stale_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(refreshes.load(Ordering::SeqCst), 1);
         });
     }
 

@@ -44,6 +44,8 @@ pub struct SyncPushOutcome {
     /// `false` when there's no stored relayhistory auth yet (treated as a no-op
     /// rather than an error, for background callers).
     pub authenticated: bool,
+    /// `true` when another process owned the scan lock. Already-indexed rows are still pushed.
+    pub sync_skipped: bool,
 }
 
 /// Sync local agent history into the DB, then push new records to
@@ -55,8 +57,7 @@ pub fn sync_and_push() -> Result<SyncPushOutcome> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
 
     let db_path = default_db_path();
-    let conn = open_db(&db_path)?;
-    sync_basic(&conn, &db_path)?;
+    let (conn, sync_skipped) = prepare_sync_and_push_db(&db_path)?;
 
     // The in-process runtime has no CLI argument channel. Keep it pinned to the normal Cloud
     // origin rather than following whichever stage happened to be logged into most recently.
@@ -68,6 +69,7 @@ pub fn sync_and_push() -> Result<SyncPushOutcome> {
                 sent: 0,
                 accepted: 0,
                 authenticated: false,
+                sync_skipped,
             })
         }
     };
@@ -92,6 +94,7 @@ pub fn sync_and_push() -> Result<SyncPushOutcome> {
         sent: report.sent as u64,
         accepted: report.accepted,
         authenticated: true,
+        sync_skipped,
     })
 }
 
@@ -560,6 +563,32 @@ fn read_only_connection(command: &Command, db_path: &Path) -> Option<Connection>
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let db_path = cli.db.unwrap_or_else(default_db_path);
+
+    // Sync commands must acquire their advisory lock before opening a writable connection.
+    // Pre-dispatch them so the common connection setup below cannot initialize the schema or
+    // wait on SQLite before contention is detected.
+    match &cli.command {
+        Command::Sync {
+            install_service,
+            uninstall_service,
+            interval,
+        } => {
+            if *install_service {
+                return install_managed_service(&SYNC_SERVICE, *interval, &[]);
+            }
+            if *uninstall_service {
+                return uninstall_managed_service(&SYNC_SERVICE);
+            }
+            return sync_exclusive(&db_path).map(|_| ());
+        }
+        Command::Watch { interval } => return watch_loop(&db_path, *interval),
+        Command::SyncOpencode { opencode_db } => {
+            let source = opencode_db.clone().unwrap_or_else(default_opencode_db_path);
+            return sync_opencode_exclusive(&db_path, &source).map(|_| ());
+        }
+        _ => {}
+    }
+
     // Read-only commands get a handle that cannot take the write lock, so a
     // query never contends with the writer. Falls back to a writable open when
     // the database does not exist yet (that first open creates it) or when it
@@ -768,26 +797,9 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::SyncOpencode { opencode_db } => {
-            let path = opencode_db.unwrap_or_else(default_opencode_db_path);
-            let inserted = sync_opencode_db(&conn, &path)?;
-            sync_note!("  [opencode] +{inserted} rows");
-            Ok(())
+        Command::SyncOpencode { .. } | Command::Sync { .. } | Command::Watch { .. } => {
+            unreachable!("sync commands are handled before opening the shared database")
         }
-        Command::Sync {
-            install_service,
-            uninstall_service,
-            interval,
-        } => {
-            if install_service {
-                install_managed_service(&SYNC_SERVICE, interval, &[])
-            } else if uninstall_service {
-                uninstall_managed_service(&SYNC_SERVICE)
-            } else {
-                sync_basic(&conn, &db_path)
-            }
-        }
-        Command::Watch { interval } => watch_loop(&db_path, interval),
         Command::Export {
             output,
             format,
@@ -2102,8 +2114,20 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
     // effort: a concurrent reader pinning an old snapshot blocks a full
     // checkpoint, and that is not a reason to fail a sync that did its work.
     // Left unchecked the WAL grows without bound (156MB observed in the wild).
-    if let Err(err) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-        sync_note!("  [wal] checkpoint skipped: {err}");
+    match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    }) {
+        Ok((busy, log_frames, checkpointed_frames)) if busy != 0 => {
+            sync_note!(
+                "  [wal] checkpoint incomplete: {checkpointed_frames}/{log_frames} frames; another reader is active"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => sync_note!("  [wal] checkpoint skipped: {err}"),
     }
     let wal_bytes = fs::metadata(wal_path(db_path))
         .map(|m| m.len())
@@ -2120,10 +2144,104 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Cross-process sync guard for one canonical database identity. Reflex, launchd, cron, and
+/// manual invocations can otherwise all walk the same multi-gigabyte history at once.
+struct SyncRunLock {
+    _file: fs::File,
+}
+
+impl Drop for SyncRunLock {
+    fn drop(&mut self) {
+        // Do not rely solely on platform-specific close timing. Linux CI exposed a race where
+        // a just-dropped guard was not immediately reacquirable through an alias path.
+        let _ = fs2::FileExt::unlock(&self._file);
+    }
+}
+
+fn canonical_db_identity(db_path: &Path) -> Result<PathBuf> {
+    if db_path.exists() {
+        return fs::canonicalize(db_path)
+            .with_context(|| format!("canonicalizing database path {}", db_path.display()));
+    }
+    let file_name = db_path
+        .file_name()
+        .context("database path has no file name")?;
+    let parent = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    Ok(fs::canonicalize(parent)?.join(file_name))
+}
+
+fn sync_lock_path(db_path: &Path) -> Result<PathBuf> {
+    let canonical = canonical_db_identity(db_path)?;
+    let mut name = canonical
+        .file_name()
+        .context("canonical database path has no file name")?
+        .to_os_string();
+    name.push(".sync.lock");
+    Ok(canonical.with_file_name(name))
+}
+
+fn try_acquire_sync_lock(db_path: &Path) -> Result<Option<SyncRunLock>> {
+    let path = sync_lock_path(db_path)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(SyncRunLock { _file: file })),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn sync_exclusive(db_path: &Path) -> Result<bool> {
+    let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
+        sync_note!("  [sync] another sync is already running; skipped");
+        return Ok(false);
+    };
+    let conn = open_db(db_path)?;
+    sync_basic(&conn, db_path)?;
+    Ok(true)
+}
+
+fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool> {
+    let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
+        sync_note!("  [sync-opencode] another sync is already running; skipped");
+        return Ok(false);
+    };
+    let conn = open_db(db_path)?;
+    let inserted = sync_opencode_db(&conn, opencode_path)?;
+    sync_note!("  [opencode] +{inserted} rows");
+    Ok(true)
+}
+
+fn prepare_sync_and_push_db(db_path: &Path) -> Result<(Connection, bool)> {
+    let Some(sync_lock) = try_acquire_sync_lock(db_path)? else {
+        // Pushing already-indexed rows only reads SQLite and remains useful while another
+        // process scans. A read-only connection avoids joining the writer contention.
+        let conn = open_db_readonly(db_path).with_context(|| {
+            format!(
+                "another sync owns the lock and no readable database is available at {}",
+                db_path.display()
+            )
+        })?;
+        return Ok((conn, true));
+    };
+    let conn = open_db(db_path)?;
+    sync_basic(&conn, db_path)?;
+    drop(sync_lock);
+    Ok((conn, false))
+}
+
 fn watch_loop(db_path: &Path, interval: u64) -> Result<()> {
     println!("Watching every {interval}s (Ctrl-C to stop)...");
     loop {
-        match open_db(db_path).and_then(|conn| sync_basic(&conn, db_path)) {
+        match sync_exclusive(db_path) {
             Ok(_) => {}
             Err(err) => eprintln!("Error: {err}"),
         }
@@ -5372,10 +5490,11 @@ mod tests {
     use super::{
         checkpoint_sync_state, cron_schedule, file_stamp, git_commit_time_ms, git_stdout,
         ingest_claude_transcript, link_git_commit, load_sync_state, parse_trajectory_file,
-        paths_overlap, save_sync_state, search_all, service_command_args, shell_single_quote,
-        strip_url_credentials, sync_claude_session_metadata, xml_escape, SearchRole, PUSH_SERVICE,
+        paths_overlap, prepare_sync_and_push_db, save_sync_state, search_all, service_command_args,
+        shell_single_quote, strip_url_credentials, sync_claude_session_metadata, sync_exclusive,
+        sync_opencode_exclusive, try_acquire_sync_lock, xml_escape, SearchRole, PUSH_SERVICE,
     };
-    use ai_hist_core::{init_db, QueryFilter};
+    use ai_hist_core::{init_db, open_db, QueryFilter};
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::fs;
@@ -5420,6 +5539,55 @@ mod tests {
                 "--limit".to_string(),
                 "50".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn sync_lock_canonicalizes_aliases_and_blocks_every_sync_entry_point_before_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.db");
+        let alias = dir.path().join(".").join("history.db");
+        let missing_opencode = dir.path().join("missing-opencode.db");
+
+        let first = try_acquire_sync_lock(&db_path).unwrap().unwrap();
+        assert!(try_acquire_sync_lock(&alias).unwrap().is_none());
+        assert!(
+            !db_path.exists(),
+            "the sidecar lock must not initialize SQLite"
+        );
+        assert!(!sync_exclusive(&alias).unwrap());
+        assert!(!sync_opencode_exclusive(&alias, &missing_opencode).unwrap());
+        assert!(
+            !db_path.exists(),
+            "contended sync paths must not create the DB"
+        );
+
+        drop(first);
+        for _ in 0..16 {
+            let reacquired = try_acquire_sync_lock(&alias)
+                .unwrap()
+                .expect("a dropped sync guard must release the lock immediately");
+            drop(reacquired);
+        }
+    }
+
+    #[test]
+    fn reflex_uses_a_read_only_database_and_keeps_pushing_when_scan_lock_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.db");
+        drop(open_db(&db_path).unwrap());
+        let _scan_owner = try_acquire_sync_lock(&db_path).unwrap().unwrap();
+
+        let (conn, sync_skipped) = prepare_sync_and_push_db(&db_path).unwrap();
+        assert!(sync_skipped);
+        assert!(conn
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row
+                .get::<_, i64>(0))
+            .is_ok());
+        assert!(
+            conn.execute("CREATE TABLE should_not_write(id INTEGER)", [])
+                .is_err(),
+            "the push-only fallback must not join SQLite writer contention"
         );
     }
 
