@@ -486,13 +486,22 @@ fn push_once(
 ) -> Result<PushReport> {
     let batch = build_outbox_batch(conn, cursor, batch_limit, incognito)?;
     if batch.records.is_empty() {
+        // Incognito and zero-emission rows still advance scan cursors. Persist that progress
+        // even though there is no payload, otherwise a reduced capacity retry can report a
+        // no-op and rebuild the original oversized request on the next run.
+        if batch.cursor != *cursor {
+            save_cursor(&auth.base_url, &batch.cursor)?;
+        }
         return Ok(PushReport {
             sent: 0,
             accepted: 0,
-            cursor: cursor.clone(),
+            cursor: batch.cursor,
             batch_id: None,
             batch_limit,
-            attempts: 0,
+            // `attempts` names the next attempted HTTP call. If this empty batch followed
+            // rejected requests, retain the number of calls already made; a first-run no-op
+            // still reports zero.
+            attempts: attempts.saturating_sub(1),
         });
     }
     let bid = batch_id(&machine.id, cursor, &batch.cursor, batch.records.len());
@@ -1270,12 +1279,16 @@ mod tests {
     }
 
     fn add(conn: &Connection, prompt: &str, ts: i64) {
+        add_for_session(conn, "s1", prompt, ts);
+    }
+
+    fn add_for_session(conn: &Connection, session: &str, prompt: &str, ts: i64) {
         insert_history(
             conn,
             &HistoryEntry {
                 id: 0,
                 source: "claude".into(),
-                session_id: Some("s1".into()),
+                session_id: Some(session.into()),
                 project: None,
                 prompt: prompt.into(),
                 prompt_hash: Some(ai_hist_core::prompt_hash(prompt)),
@@ -1526,6 +1539,78 @@ mod tests {
             assert_eq!(report.attempts, 2);
             assert_eq!(report.cursor.history_id, 3);
             assert_eq!(report.cursor.trajectory_rowid, 3);
+        });
+    }
+
+    #[test]
+    fn empty_reduced_retry_persists_skipped_source_cursors() {
+        with_temp_home(|| {
+            let conn = mem();
+            add_for_session(&conn, "private-history", "private", 1);
+            add_for_session(&conn, "public-history", "public", 2);
+            add_trajectory(&conn, "private-trajectory");
+            add_trajectory(&conn, "public-trajectory");
+            let incognito: HashSet<String> = [
+                "private-history".to_string(),
+                "private-trajectory".to_string(),
+            ]
+            .into_iter()
+            .collect();
+            let client = CapacityLimitedIngestor {
+                max_records: 1,
+                attempted_record_counts: RefCell::new(Vec::new()),
+            };
+            let auth = StoredAuth {
+                base_url: "http://localhost:8787".into(),
+                access_token: "test-access-token".into(),
+                ..Default::default()
+            };
+            let report = push(
+                &conn,
+                &client,
+                &auth,
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &SyncCursor::default(),
+                2,
+                &incognito,
+            )
+            .unwrap();
+
+            // The first request contains the two public rows and is rejected. Limit one then
+            // scans only the two private rows, producing no records but advancing both cursors.
+            assert_eq!(*client.attempted_record_counts.borrow(), vec![2]);
+            assert_eq!(report.sent, 0);
+            assert_eq!(report.attempts, 1);
+            assert_eq!(report.cursor.history_id, 1);
+            assert_eq!(report.cursor.trajectory_rowid, 1);
+            assert_eq!(load_cursor(&auth.base_url).unwrap(), report.cursor);
+
+            // A later run starts after the skipped rows and can send the public rows instead of
+            // reconstructing the original rejected span.
+            let accepting = CapacityLimitedIngestor {
+                max_records: 2,
+                attempted_record_counts: RefCell::new(Vec::new()),
+            };
+            let next = push(
+                &conn,
+                &accepting,
+                &auth,
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &report.cursor,
+                2,
+                &incognito,
+            )
+            .unwrap();
+            assert_eq!(*accepting.attempted_record_counts.borrow(), vec![2]);
+            assert_eq!(next.sent, 2);
+            assert_eq!(next.cursor.history_id, 2);
+            assert_eq!(next.cursor.trajectory_rowid, 2);
         });
     }
 
