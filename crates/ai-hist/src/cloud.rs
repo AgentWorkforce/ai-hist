@@ -454,13 +454,20 @@ pub fn push(
                 let Some(attempted_records) = worker_capacity_attempted_records(&err) else {
                     return Err(err);
                 };
-                if attempted_records <= 1 {
+                if batch_limit <= 1 || attempted_records <= 1 {
                     return Err(err.context(format!(
-                        "cloud ingest still exceeded its resource limit with one record after \
-                         {attempts} attempt(s); cursor was not advanced"
+                        "cloud ingest still exceeded its resource limit at the minimum batch \
+                         limit after {attempts} attempt(s) ({attempted_records} emitted \
+                         record(s)); cursor was not advanced"
                     )));
                 }
-                batch_limit = (attempted_records / 2).max(1);
+                // The outbox applies this limit per source, and one trajectory row can emit
+                // several records. Halving the emitted count can therefore reproduce the same
+                // per-source limit and retry the identical rejected payload forever. Every
+                // retry must strictly lower the controlling limit.
+                batch_limit = (attempted_records / 2)
+                    .max(1)
+                    .min(batch_limit.saturating_sub(1));
                 attempts += 1;
             }
         }
@@ -1278,6 +1285,28 @@ mod tests {
         .unwrap();
     }
 
+    fn add_trajectory(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO trajectories (id, version, persona_id, project_id, task_title, \
+             task_description, status, decisions_json, retrospective_json, search_text, path, \
+             updated_ms, timestamp_ms) VALUES (?,1,?,?,?,?,?,?,?,?,NULL,?,?)",
+            rusqlite::params![
+                id,
+                "planner",
+                "proj",
+                "Build forms",
+                "desc",
+                "completed",
+                "[]",
+                format!(r#"{{"summary":"summary {id}"}}"#),
+                "search",
+                1,
+                1_782_036_000_000i64
+            ],
+        )
+        .unwrap();
+    }
+
     /// Captures the request and returns a canned response.
     struct FakeIngestor {
         last: RefCell<Option<IngestRequest>>,
@@ -1455,6 +1484,48 @@ mod tests {
             assert_eq!(report.attempts, 3);
             assert_eq!(report.cursor.history_id, 8);
             assert_eq!(load_cursor(&auth.base_url).unwrap().history_id, 8);
+        });
+    }
+
+    #[test]
+    fn capacity_retry_strictly_reduces_a_per_source_limit() {
+        with_temp_home(|| {
+            let conn = mem();
+            for id in 1..=4 {
+                add(&conn, &format!("entry {id}"), id);
+                add_trajectory(&conn, &format!("trajectory-{id}"));
+            }
+            let client = CapacityLimitedIngestor {
+                max_records: 6,
+                attempted_record_counts: RefCell::new(Vec::new()),
+            };
+            let auth = StoredAuth {
+                base_url: "http://localhost:8787".into(),
+                access_token: "test-access-token".into(),
+                ..Default::default()
+            };
+            let report = push(
+                &conn,
+                &client,
+                &auth,
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &SyncCursor::default(),
+                4,
+                &HashSet::new(),
+            )
+            .unwrap();
+
+            // Four rows from each source emit eight records. Halving the emitted count would
+            // leave the per-source limit at four and retry those same eight forever; the retry
+            // must lower it to three and make progress.
+            assert_eq!(*client.attempted_record_counts.borrow(), vec![8, 6]);
+            assert_eq!(report.batch_limit, 3);
+            assert_eq!(report.attempts, 2);
+            assert_eq!(report.cursor.history_id, 3);
+            assert_eq!(report.cursor.trajectory_rowid, 3);
         });
     }
 
