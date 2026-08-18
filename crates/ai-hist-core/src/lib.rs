@@ -244,10 +244,12 @@ pub fn default_db_path() -> PathBuf {
 /// two scheduled syncs from waking and colliding in lockstep. The callback is
 /// never useful for a permanently suspended holder, so the sequence stays
 /// bounded while preserving the previous 30-second grace window for a healthy writer that is
-/// merely slow. At maximum jitter the sequence returns `SQLITE_BUSY` after roughly 30 seconds.
-const BUSY_RETRY_ATTEMPTS: i32 = 35;
+/// merely slow. Even with zero jitter the sequence waits at least 30 seconds; jitter can extend
+/// that to roughly 33 seconds so simultaneous syncs do not keep waking in lockstep.
+const BUSY_RETRY_ATTEMPTS: i32 = 65;
 const BUSY_RETRY_BASE_MS: u64 = 10;
 const BUSY_RETRY_CAP_MS: u64 = 500;
+const BUSY_RETRY_JITTER_DIVISOR: u64 = 10;
 
 fn busy_retry_backoff_ms(prior_attempts: i32) -> Option<u64> {
     if !(0..BUSY_RETRY_ATTEMPTS).contains(&prior_attempts) {
@@ -271,7 +273,7 @@ fn busy_retry_handler(prior_attempts: i32) -> bool {
         .unwrap_or_default()
         .subsec_nanos() as u64;
     let seed = clock ^ u64::from(std::process::id()) ^ prior_attempts as u64;
-    let jitter_ms = seed % (backoff_ms + 1);
+    let jitter_ms = seed % (backoff_ms / BUSY_RETRY_JITTER_DIVISOR + 1);
     std::thread::sleep(Duration::from_millis(backoff_ms + jitter_ms));
     true
 }
@@ -1122,12 +1124,22 @@ mod tests {
 
     #[test]
     fn busy_retry_sequence_is_bounded() {
-        let worst_case_ms: u64 = (0..BUSY_RETRY_ATTEMPTS)
-            .map(|attempt| busy_retry_backoff_ms(attempt).unwrap() * 2)
+        let minimum_ms: u64 = (0..BUSY_RETRY_ATTEMPTS)
+            .map(|attempt| busy_retry_backoff_ms(attempt).unwrap())
             .sum();
         assert!(
-            (30_000..31_000).contains(&worst_case_ms),
-            "retry grace changed unexpectedly: {worst_case_ms}ms"
+            (30_000..31_000).contains(&minimum_ms),
+            "minimum retry grace changed unexpectedly: {minimum_ms}ms"
+        );
+        let maximum_ms: u64 = (0..BUSY_RETRY_ATTEMPTS)
+            .map(|attempt| {
+                let backoff = busy_retry_backoff_ms(attempt).unwrap();
+                backoff + backoff / BUSY_RETRY_JITTER_DIVISOR
+            })
+            .sum();
+        assert!(
+            (33_000..34_000).contains(&maximum_ms),
+            "maximum retry grace changed unexpectedly: {maximum_ms}ms"
         );
         assert!(busy_retry_backoff_ms(BUSY_RETRY_ATTEMPTS).is_none());
         assert!(!busy_retry_handler(BUSY_RETRY_ATTEMPTS));
