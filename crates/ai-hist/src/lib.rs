@@ -2,7 +2,8 @@ use ai_hist_core::convergence::MachineIdentity;
 use ai_hist_core::{
     default_db_path, import_json, insert_history, normalize_tag_name, open_db, open_db_readonly,
     parse_cursor_text, prompt_hash, raw_fts_query_error, recent, resume_command, schema_is_current,
-    search, session, sync_opencode_db, untag_session, HistoryEntry, QueryFilter, SOURCE_CHOICES,
+    search, session, sync_opencode_db, untag_session, HistoryEntry, QueryFilter,
+    SourceDatabaseError, SOURCE_CHOICES,
 };
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
@@ -1901,19 +1902,32 @@ fn db_holders(db_path: &Path) -> Vec<DbHolder> {
         // Our own read-only handle is not a finding.
         .filter(|pid| *pid != own_pid)
         .filter_map(|pid| {
-            let info = std::process::Command::new("ps")
-                .args(["-o", "stat=,command=", "-p", pid])
-                .output()
-                .ok()?;
-            let line = String::from_utf8_lossy(&info.stdout).trim().to_string();
-            let (state, command) = line.split_once(char::is_whitespace)?;
+            let (state, command) = process_status(pid)?;
             Some(DbHolder {
                 pid: pid.to_string(),
-                state: state.to_string(),
-                command: command.trim().to_string(),
+                state,
+                command,
             })
         })
         .collect()
+}
+
+/// Process state with stable-path fallbacks for reduced-PATH launchd and embedded hosts.
+fn process_status(pid: &str) -> Option<(String, String)> {
+    process_status_with_programs(pid, &["ps", "/bin/ps", "/usr/bin/ps"])
+}
+
+fn process_status_with_programs(pid: &str, programs: &[&str]) -> Option<(String, String)> {
+    programs.iter().find_map(|program| {
+        let output = std::process::Command::new(program)
+            .args(["-o", "stat=,command=", "-p", pid])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())?;
+        let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let (state, command) = line.split_once(char::is_whitespace)?;
+        Some((state.to_string(), command.trim().to_string()))
+    })
 }
 
 /// Can a writer actually start right now?
@@ -1976,22 +1990,47 @@ fn write_contention_diagnostic(db_path: &Path) -> String {
             }
         }
     }
-    if wal_bytes > WAL_WARN_BYTES {
-        lines.push(format!(
-            "WAL is {} while the write path is failing; checkpoint progress is starved",
-            human_bytes(wal_bytes)
-        ));
+    if let Some(wal_line) = wal_contention_line(wal_bytes, lock.is_err()) {
+        lines.push(wal_line);
     }
 
     format!("ai-hist contention diagnostic: {}", lines.join("; "))
 }
 
+fn wal_contention_line(wal_bytes: u64, write_blocked: bool) -> Option<String> {
+    if wal_bytes <= WAL_WARN_BYTES {
+        return None;
+    }
+    Some(if write_blocked {
+        format!(
+            "WAL is {} while the write path is failing; checkpoint progress is starved",
+            human_bytes(wal_bytes)
+        )
+    } else {
+        format!(
+            "WAL is {} after write capability recovered; a long-lived reader may still be delaying checkpoints",
+            human_bytes(wal_bytes)
+        )
+    })
+}
+
 fn enrich_sync_error(db_path: &Path, error: anyhow::Error) -> anyhow::Error {
     if is_sqlite_contention(&error) {
-        error.context(write_contention_diagnostic(db_path))
+        let diagnostic_path = source_database_path(&error)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| db_path.to_path_buf());
+        error.context(write_contention_diagnostic(&diagnostic_path))
     } else {
         error
     }
+}
+
+fn source_database_path(error: &anyhow::Error) -> Option<&Path> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<SourceDatabaseError>()
+            .map(SourceDatabaseError::path)
+    })
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -2126,8 +2165,14 @@ fn doctor(db_path: &Path, json: bool) -> Result<()> {
 #[derive(Default)]
 struct SyncSourceReport {
     succeeded: usize,
-    failures: Vec<(String, String)>,
-    saw_contention: bool,
+    failures: Vec<SyncSourceFailure>,
+}
+
+struct SyncSourceFailure {
+    source: String,
+    error: String,
+    is_contention: bool,
+    contention_path: Option<PathBuf>,
 }
 
 impl SyncSourceReport {
@@ -2138,9 +2183,12 @@ impl SyncSourceReport {
                 Some(value)
             }
             Err(error) => {
-                self.saw_contention |= is_sqlite_contention(&error);
-                self.failures
-                    .push((source.to_string(), format!("{error:#}")));
+                self.failures.push(SyncSourceFailure {
+                    source: source.to_string(),
+                    error: format!("{error:#}"),
+                    is_contention: is_sqlite_contention(&error),
+                    contention_path: source_database_path(&error).map(Path::to_path_buf),
+                });
                 None
             }
         }
@@ -2156,11 +2204,15 @@ impl SyncSourceReport {
             self.failures.len(),
             self.succeeded
         );
-        for (source, error) in &self.failures {
-            eprintln!("  [{source}] {error}");
+        for failure in &self.failures {
+            eprintln!("  [{}] {}", failure.source, failure.error);
         }
-        if self.saw_contention {
-            eprintln!("{}", write_contention_diagnostic(db_path));
+        let mut diagnosed = HashSet::new();
+        for failure in self.failures.iter().filter(|failure| failure.is_contention) {
+            let path = failure.contention_path.as_deref().unwrap_or(db_path);
+            if diagnosed.insert(path.to_path_buf()) {
+                eprintln!("{}", write_contention_diagnostic(path));
+            }
         }
         if self.succeeded == 0 {
             anyhow::bail!(
@@ -5725,12 +5777,13 @@ mod tests {
         checkpoint_sync_state, cleanup_stale_sync_state_temps, cron_schedule, file_stamp,
         git_commit_time_ms, git_stdout, ingest_claude_transcript, is_sqlite_contention,
         link_git_commit, load_sync_state, parse_trajectory_file, paths_overlap,
-        prepare_sync_and_push_db, save_sync_state, search_all, service_command_args,
-        shell_single_quote, strip_url_credentials, sync_claude_session_metadata, sync_exclusive,
-        sync_opencode_exclusive, try_acquire_sync_lock, write_contention_diagnostic, xml_escape,
-        SearchRole, SyncSourceReport, PUSH_SERVICE,
+        prepare_sync_and_push_db, process_status_with_programs, save_sync_state, search_all,
+        service_command_args, shell_single_quote, source_database_path, strip_url_credentials,
+        sync_claude_session_metadata, sync_exclusive, sync_opencode_exclusive,
+        try_acquire_sync_lock, wal_contention_line, write_contention_diagnostic, xml_escape,
+        SearchRole, SyncSourceReport, PUSH_SERVICE, WAL_WARN_BYTES,
     };
-    use ai_hist_core::{init_db, open_db, QueryFilter};
+    use ai_hist_core::{init_db, open_db, QueryFilter, SourceDatabaseError};
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::fs;
@@ -5926,6 +5979,39 @@ mod tests {
         assert!(recovered.contains("write capability probe now succeeds"));
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn contention_diagnostics_keep_source_paths_and_recovered_wal_wording_accurate() {
+        let source = std::path::PathBuf::from("/tmp/opencode-source.db");
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        let error = anyhow::Error::new(SourceDatabaseError::new(&source, busy));
+        assert!(is_sqlite_contention(&error));
+        assert_eq!(source_database_path(&error), Some(source.as_path()));
+
+        let recovered = wal_contention_line(WAL_WARN_BYTES + 1, false).unwrap();
+        assert!(
+            recovered.contains("write capability recovered"),
+            "{recovered}"
+        );
+        assert!(!recovered.contains("write path is failing"), "{recovered}");
+        let blocked = wal_contention_line(WAL_WARN_BYTES + 1, true).unwrap();
+        assert!(blocked.contains("write path is failing"), "{blocked}");
+    }
+
+    #[test]
+    fn process_status_uses_an_absolute_fallback_when_path_lookup_fails() {
+        let pid = std::process::id().to_string();
+        let (state, command) = process_status_with_programs(
+            &pid,
+            &["/definitely/missing/ps", "/bin/ps", "/usr/bin/ps"],
+        )
+        .expect("an absolute system ps should describe the current process");
+        assert!(!state.is_empty());
+        assert!(!command.is_empty());
     }
 
     #[test]

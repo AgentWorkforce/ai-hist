@@ -243,20 +243,29 @@ pub fn default_db_path() -> PathBuf {
 /// exponential delays stop hammering the lock and per-process/time jitter keeps
 /// two scheduled syncs from waking and colliding in lockstep. The callback is
 /// never useful for a permanently suspended holder, so the sequence stays
-/// bounded and returns `SQLITE_BUSY` after roughly five seconds at worst.
-const BUSY_RETRY_ATTEMPTS: i32 = 10;
+/// bounded while preserving the previous 30-second grace window for a healthy writer that is
+/// merely slow. At maximum jitter the sequence returns `SQLITE_BUSY` after roughly 30 seconds.
+const BUSY_RETRY_ATTEMPTS: i32 = 35;
 const BUSY_RETRY_BASE_MS: u64 = 10;
 const BUSY_RETRY_CAP_MS: u64 = 500;
 
-fn busy_retry_handler(prior_attempts: i32) -> bool {
+fn busy_retry_backoff_ms(prior_attempts: i32) -> Option<u64> {
     if !(0..BUSY_RETRY_ATTEMPTS).contains(&prior_attempts) {
-        return false;
+        return None;
     }
 
     let shift = (prior_attempts as u32).min(6);
-    let backoff_ms = BUSY_RETRY_BASE_MS
-        .saturating_mul(1_u64 << shift)
-        .min(BUSY_RETRY_CAP_MS);
+    Some(
+        BUSY_RETRY_BASE_MS
+            .saturating_mul(1_u64 << shift)
+            .min(BUSY_RETRY_CAP_MS),
+    )
+}
+
+fn busy_retry_handler(prior_attempts: i32) -> bool {
+    let Some(backoff_ms) = busy_retry_backoff_ms(prior_attempts) else {
+        return false;
+    };
     let clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -281,6 +290,45 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     configure_busy_retry(&conn)?;
     init_db(&conn)?;
     Ok(conn)
+}
+
+/// An operation against an attached/source SQLite database failed. Keeping the source path in
+/// the error chain lets callers diagnose that database rather than incorrectly probing the
+/// destination history store.
+#[derive(Debug)]
+pub struct SourceDatabaseError {
+    path: PathBuf,
+    source: rusqlite::Error,
+}
+
+impl SourceDatabaseError {
+    pub fn new(path: impl Into<PathBuf>, source: rusqlite::Error) -> Self {
+        Self {
+            path: path.into(),
+            source,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::fmt::Display for SourceDatabaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "reading source database {}: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for SourceDatabaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// Objects and columns [`init_db`] adds, checked before trusting a read-only
@@ -922,7 +970,9 @@ pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> 
     )
     .with_context(|| format!("opening {}", opencode_db.display()))?;
     src_live.busy_timeout(std::time::Duration::from_secs(5))?;
-    src_live.backup(DatabaseName::Main, &tmp, None)?;
+    src_live
+        .backup(DatabaseName::Main, &tmp, None)
+        .map_err(|source| SourceDatabaseError::new(opencode_db, source))?;
     let src = Connection::open(&tmp)?;
     let mut stmt = src.prepare(
         "SELECT s.id, s.directory, p.data, COALESCE(p.time_created, m.time_created, s.time_created) FROM part p JOIN message m ON m.id = p.message_id JOIN session s ON s.id = p.session_id WHERE json_extract(m.data, '$.role') = 'user' AND json_extract(p.data, '$.type') = 'text' ORDER BY p.time_created ASC",
@@ -1072,6 +1122,14 @@ mod tests {
 
     #[test]
     fn busy_retry_sequence_is_bounded() {
+        let worst_case_ms: u64 = (0..BUSY_RETRY_ATTEMPTS)
+            .map(|attempt| busy_retry_backoff_ms(attempt).unwrap() * 2)
+            .sum();
+        assert!(
+            (30_000..31_000).contains(&worst_case_ms),
+            "retry grace changed unexpectedly: {worst_case_ms}ms"
+        );
+        assert!(busy_retry_backoff_ms(BUSY_RETRY_ATTEMPTS).is_none());
         assert!(!busy_retry_handler(BUSY_RETRY_ATTEMPTS));
         assert!(!busy_retry_handler(BUSY_RETRY_ATTEMPTS + 1));
     }

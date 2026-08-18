@@ -65,8 +65,11 @@ regardless of the intended transaction duration.
 
 ## Supported remediation
 
-- Retry transient `SQLITE_BUSY`/`SQLITE_LOCKED` conflicts with bounded
-  exponential backoff and jitter (#49).
+- Retry cross-process `SQLITE_BUSY` conflicts with bounded exponential backoff
+  and jitter while preserving the prior 30-second grace period (#49).
+- Diagnose `SQLITE_LOCKED` as contention, but do not blindly replay it:
+  SQLite uses that code for same-connection/shared-cache conflicts that require
+  the owning statement or transaction to finish, not a busy-handler delay.
 - Continue syncing independent sources after one source fails, preserving
   successful cursors and reporting partial failure (#48).
 - Remove abandoned uniquely named sync-state temp files whose writer is gone or
