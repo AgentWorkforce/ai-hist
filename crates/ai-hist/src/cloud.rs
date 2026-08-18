@@ -195,7 +195,10 @@ fn write_private(path: &std::path::Path, body: &str) -> Result<()> {
             .with_context(|| format!("creating private state at {}", tmp_path.display()))?;
         tmp.write_all(body.as_bytes())?;
         tmp.sync_all()?;
-        fs::rename(&tmp_path, path)
+        // `std::fs::rename` replaces an existing file on Unix, but not on
+        // Windows. `replace_atomic` uses the platform replacement primitive so
+        // every cursor/auth update has the same atomic overwrite semantics.
+        atomicwrites::replace_atomic(&tmp_path, path)
             .with_context(|| format!("atomically replacing {}", path.display()))?;
         // A directory fsync makes the rename durable on filesystems that support it. Some
         // platforms reject directory sync, so it remains best effort after the file itself is
@@ -1486,6 +1489,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _relayhistory_home = EnvVarGuard::set("RELAYHISTORY_HOME", dir.path());
         f()
+    }
+
+    #[test]
+    fn write_private_replaces_existing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor.json");
+
+        write_private(&path, r#"{"history_id":1}"#).unwrap();
+        write_private(&path, r#"{"history_id":2}"#).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"history_id":2}"#);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

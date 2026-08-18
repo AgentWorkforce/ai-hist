@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 ai-hist-core = { path = "../ai-hist-core" }
 anyhow = "1"
+atomicwrites = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }
 flate2 = "1"
