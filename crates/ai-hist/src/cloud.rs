@@ -19,7 +19,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use url::Url;
 
 const DEFAULT_BASE_URL: &str = "https://history.agentrelay.com";
@@ -163,17 +165,48 @@ fn machine_path() -> PathBuf {
 }
 
 fn write_private(path: &std::path::Path, body: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+    let file_name = path
+        .file_name()
+        .context("private state path has no file name")?
+        .to_string_lossy();
+    let tmp_path = parent.join(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let saved = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut tmp = options
+            .open(&tmp_path)
+            .with_context(|| format!("creating private state at {}", tmp_path.display()))?;
+        tmp.write_all(body.as_bytes())?;
+        tmp.sync_all()?;
+        fs::rename(&tmp_path, path)
+            .with_context(|| format!("atomically replacing {}", path.display()))?;
+        // A directory fsync makes the rename durable on filesystems that support it. Some
+        // platforms reject directory sync, so it remains best effort after the file itself is
+        // safely flushed and replaced.
+        let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
+        Ok(())
+    })();
+    if saved.is_err() {
+        let _ = fs::remove_file(&tmp_path);
     }
-    fs::write(path, body)?;
-    // best-effort 0600 on unix (token/secret hygiene)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    saved
 }
 
 fn read_auth(path: &std::path::Path) -> Result<StoredAuth> {
@@ -314,10 +347,48 @@ pub fn load_cursor(base_url: &str) -> Result<SyncCursor> {
 }
 
 pub fn save_cursor(base_url: &str, cursor: &SyncCursor) -> Result<()> {
+    let _cursor_lock = acquire_cursor_lock(base_url)?;
+    let current = load_cursor(base_url)?;
+    let merged = SyncCursor {
+        history_id: current.history_id.max(cursor.history_id),
+        trajectory_rowid: current.trajectory_rowid.max(cursor.trajectory_rowid),
+    };
     write_private(
         &cursor_path(base_url)?,
-        &serde_json::to_string_pretty(cursor)?,
+        &serde_json::to_string_pretty(&merged)?,
     )
+}
+
+struct CursorWriteLock {
+    file: fs::File,
+}
+
+impl Drop for CursorWriteLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+fn acquire_cursor_lock(base_url: &str) -> Result<CursorWriteLock> {
+    let cursor = cursor_path(base_url)?;
+    let mut name = cursor
+        .file_name()
+        .context("stage cursor path has no file name")?
+        .to_os_string();
+    name.push(".lock");
+    let path = cursor.with_file_name(name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    fs2::FileExt::lock_exclusive(&file)
+        .with_context(|| format!("locking cursor state at {}", path.display()))?;
+    Ok(CursorWriteLock { file })
 }
 
 /// Stable per-machine id (the WS-1 `machineId` sub-tenant), generated once and persisted.
@@ -465,9 +536,7 @@ pub fn push(
                 // several records. Halving the emitted count can therefore reproduce the same
                 // per-source limit and retry the identical rejected payload forever. Every
                 // retry must strictly lower the controlling limit.
-                batch_limit = (attempted_records / 2)
-                    .max(1)
-                    .min(batch_limit.saturating_sub(1));
+                batch_limit = (attempted_records / 2).min(batch_limit / 2).max(1);
                 attempts += 1;
             }
         }
@@ -1534,11 +1603,72 @@ mod tests {
             // Four rows from each source emit eight records. Halving the emitted count would
             // leave the per-source limit at four and retry those same eight forever; the retry
             // must lower it to three and make progress.
-            assert_eq!(*client.attempted_record_counts.borrow(), vec![8, 6]);
-            assert_eq!(report.batch_limit, 3);
+            assert_eq!(*client.attempted_record_counts.borrow(), vec![8, 4]);
+            assert_eq!(report.batch_limit, 2);
             assert_eq!(report.attempts, 2);
-            assert_eq!(report.cursor.history_id, 3);
-            assert_eq!(report.cursor.trajectory_rowid, 3);
+            assert_eq!(report.cursor.history_id, 2);
+            assert_eq!(report.cursor.trajectory_rowid, 2);
+        });
+    }
+
+    #[test]
+    fn cursor_saves_merge_monotonically_across_concurrent_pushes() {
+        with_temp_home(|| {
+            let base_url = "http://localhost:8787";
+            save_cursor(
+                base_url,
+                &SyncCursor {
+                    history_id: 100,
+                    trajectory_rowid: 1,
+                },
+            )
+            .unwrap();
+            // Even a later stale writer cannot rewind either watermark.
+            save_cursor(
+                base_url,
+                &SyncCursor {
+                    history_id: 1,
+                    trajectory_rowid: 100,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                load_cursor(base_url).unwrap(),
+                SyncCursor {
+                    history_id: 100,
+                    trajectory_rowid: 100,
+                }
+            );
+
+            let mut writers = Vec::new();
+            for writer in 0..8 {
+                writers.push(std::thread::spawn(move || {
+                    for revision in 1..=25 {
+                        let cursor = if writer % 2 == 0 {
+                            SyncCursor {
+                                history_id: 100 + revision,
+                                trajectory_rowid: 1,
+                            }
+                        } else {
+                            SyncCursor {
+                                history_id: 1,
+                                trajectory_rowid: 100 + revision,
+                            }
+                        };
+                        save_cursor("http://localhost:8787", &cursor).unwrap();
+                    }
+                }));
+            }
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            assert_eq!(
+                load_cursor(base_url).unwrap(),
+                SyncCursor {
+                    history_id: 125,
+                    trajectory_rowid: 125,
+                }
+            );
         });
     }
 
