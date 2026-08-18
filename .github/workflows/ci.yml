@@ -51,3 +51,13 @@ jobs:
 
       - name: End-to-end wrapper verification
         run: AI_HIST_RUST_BIN="$PWD/target/debug/ai-hist" ./scripts/verify-e2e.sh
+
+  windows-state-replacement:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify repeated private-state replacement
+        run: cargo test -p ai-hist-cli write_private_replaces_existing_state

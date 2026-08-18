@@ -19,7 +19,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use url::Url;
 
 const DEFAULT_BASE_URL: &str = "https://history.agentrelay.com";
@@ -163,17 +165,51 @@ fn machine_path() -> PathBuf {
 }
 
 fn write_private(path: &std::path::Path, body: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+    let file_name = path
+        .file_name()
+        .context("private state path has no file name")?
+        .to_string_lossy();
+    let tmp_path = parent.join(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let saved = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut tmp = options
+            .open(&tmp_path)
+            .with_context(|| format!("creating private state at {}", tmp_path.display()))?;
+        tmp.write_all(body.as_bytes())?;
+        tmp.sync_all()?;
+        // `std::fs::rename` replaces an existing file on Unix, but not on
+        // Windows. `replace_atomic` uses the platform replacement primitive so
+        // every cursor/auth update has the same atomic overwrite semantics.
+        atomicwrites::replace_atomic(&tmp_path, path)
+            .with_context(|| format!("atomically replacing {}", path.display()))?;
+        // A directory fsync makes the rename durable on filesystems that support it. Some
+        // platforms reject directory sync, so it remains best effort after the file itself is
+        // safely flushed and replaced.
+        let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
+        Ok(())
+    })();
+    if saved.is_err() {
+        let _ = fs::remove_file(&tmp_path);
     }
-    fs::write(path, body)?;
-    // best-effort 0600 on unix (token/secret hygiene)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    saved
 }
 
 fn read_auth(path: &std::path::Path) -> Result<StoredAuth> {
@@ -314,10 +350,48 @@ pub fn load_cursor(base_url: &str) -> Result<SyncCursor> {
 }
 
 pub fn save_cursor(base_url: &str, cursor: &SyncCursor) -> Result<()> {
+    let _cursor_lock = acquire_cursor_lock(base_url)?;
+    let current = load_cursor(base_url)?;
+    let merged = SyncCursor {
+        history_id: current.history_id.max(cursor.history_id),
+        trajectory_rowid: current.trajectory_rowid.max(cursor.trajectory_rowid),
+    };
     write_private(
         &cursor_path(base_url)?,
-        &serde_json::to_string_pretty(cursor)?,
+        &serde_json::to_string_pretty(&merged)?,
     )
+}
+
+struct CursorWriteLock {
+    file: fs::File,
+}
+
+impl Drop for CursorWriteLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+fn acquire_cursor_lock(base_url: &str) -> Result<CursorWriteLock> {
+    let cursor = cursor_path(base_url)?;
+    let mut name = cursor
+        .file_name()
+        .context("stage cursor path has no file name")?
+        .to_os_string();
+    name.push(".lock");
+    let path = cursor.with_file_name(name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    fs2::FileExt::lock_exclusive(&file)
+        .with_context(|| format!("locking cursor state at {}", path.display()))?;
+    Ok(CursorWriteLock { file })
 }
 
 /// Stable per-machine id (the WS-1 `machineId` sub-tenant), generated once and persisted.
@@ -395,7 +469,34 @@ pub struct PushReport {
     pub accepted: u64,
     pub cursor: SyncCursor,
     pub batch_id: Option<String>,
+    /// The per-source scan limit that produced the accepted batch.
+    pub batch_limit: usize,
+    /// Number of ingest attempts in this push run, including any smaller retry.
+    pub attempts: usize,
 }
+
+/// A typed Cloudflare Worker capacity rejection. Keeping the status, body, and attempted
+/// record count together lets the retry loop distinguish a real resource-limit response from
+/// an unrelated 503 and shrink from the payload that was actually emitted.
+#[derive(Debug)]
+struct WorkerCapacityError {
+    status: u16,
+    body: String,
+    attempted_records: usize,
+}
+
+impl std::fmt::Display for WorkerCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ingest failed: HTTP {}: {}",
+            self.status,
+            self.body.trim()
+        )
+    }
+}
+
+impl std::error::Error for WorkerCapacityError {}
 
 /// Build the next outbox batch and push it. On success, persists the advanced cursor.
 /// No-op (no HTTP call) when there's nothing new to send.
@@ -408,13 +509,71 @@ pub fn push(
     limit: usize,
     incognito: &HashSet<String>,
 ) -> Result<PushReport> {
-    let batch = build_outbox_batch(conn, cursor, limit, incognito)?;
+    let mut batch_limit = limit.max(1);
+    let mut attempts = 1;
+
+    loop {
+        match push_once(
+            conn,
+            client,
+            auth,
+            machine,
+            cursor,
+            batch_limit,
+            incognito,
+            attempts,
+        ) {
+            Ok(report) => return Ok(report),
+            Err(err) => {
+                let Some(attempted_records) = worker_capacity_attempted_records(&err) else {
+                    return Err(err);
+                };
+                if batch_limit <= 1 || attempted_records <= 1 {
+                    return Err(err.context(format!(
+                        "cloud ingest still exceeded its resource limit at the minimum batch \
+                         limit after {attempts} attempt(s) ({attempted_records} emitted \
+                         record(s)); cursor was not advanced"
+                    )));
+                }
+                // The outbox applies this limit per source, and one trajectory row can emit
+                // several records. Halving the emitted count can therefore reproduce the same
+                // per-source limit and retry the identical rejected payload forever. Every
+                // retry must strictly lower the controlling limit.
+                batch_limit = (attempted_records / 2).min(batch_limit / 2).max(1);
+                attempts += 1;
+            }
+        }
+    }
+}
+
+fn push_once(
+    conn: &Connection,
+    client: &dyn Ingestor,
+    auth: &StoredAuth,
+    machine: &MachineIdentity,
+    cursor: &SyncCursor,
+    batch_limit: usize,
+    incognito: &HashSet<String>,
+    attempts: usize,
+) -> Result<PushReport> {
+    let batch = build_outbox_batch(conn, cursor, batch_limit, incognito)?;
     if batch.records.is_empty() {
+        // Incognito and zero-emission rows still advance scan cursors. Persist that progress
+        // even though there is no payload, otherwise a reduced capacity retry can report a
+        // no-op and rebuild the original oversized request on the next run.
+        if batch.cursor != *cursor {
+            save_cursor(&auth.base_url, &batch.cursor)?;
+        }
         return Ok(PushReport {
             sent: 0,
             accepted: 0,
-            cursor: cursor.clone(),
+            cursor: batch.cursor,
             batch_id: None,
+            batch_limit,
+            // `attempts` names the next attempted HTTP call. If this empty batch followed
+            // rejected requests, retain the number of calls already made; a first-run no-op
+            // still reports zero.
+            attempts: attempts.saturating_sub(1),
         });
     }
     let bid = batch_id(&machine.id, cursor, &batch.cursor, batch.records.len());
@@ -435,7 +594,35 @@ pub fn push(
         accepted: resp.accepted,
         cursor: batch.cursor,
         batch_id: Some(bid),
+        batch_limit,
+        attempts,
     })
+}
+
+fn worker_capacity_attempted_records(err: &anyhow::Error) -> Option<usize> {
+    err.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<WorkerCapacityError>()
+            .map(|failure| failure.attempted_records)
+    })
+}
+
+fn ingest_status_error(code: u16, body: String, attempted_records: usize) -> anyhow::Error {
+    let normalized = body.to_ascii_lowercase();
+    let is_capacity = code == 503
+        && (normalized.contains("worker exceeded resource limits")
+            || normalized.contains("error code: 1102")
+            || normalized.contains("worker_capacity"));
+    if is_capacity {
+        WorkerCapacityError {
+            status: code,
+            body,
+            attempted_records,
+        }
+        .into()
+    } else {
+        anyhow::anyhow!("ingest failed: HTTP {code}: {body}")
+    }
 }
 
 // ----- ureq-backed live transport -----
@@ -456,7 +643,7 @@ impl Ingestor for UreqIngestor {
             Ok(r) => Ok(r.into_json::<IngestResponse>()?),
             Err(ureq::Error::Status(code, r)) => {
                 let body = r.into_string().unwrap_or_default();
-                anyhow::bail!("ingest failed: HTTP {code}: {body}")
+                Err(ingest_status_error(code, body, req.records.len()))
             }
             Err(e) => Err(e.into()),
         }
@@ -1164,17 +1351,43 @@ mod tests {
     }
 
     fn add(conn: &Connection, prompt: &str, ts: i64) {
+        add_for_session(conn, "s1", prompt, ts);
+    }
+
+    fn add_for_session(conn: &Connection, session: &str, prompt: &str, ts: i64) {
         insert_history(
             conn,
             &HistoryEntry {
                 id: 0,
                 source: "claude".into(),
-                session_id: Some("s1".into()),
+                session_id: Some(session.into()),
                 project: None,
                 prompt: prompt.into(),
                 prompt_hash: Some(ai_hist_core::prompt_hash(prompt)),
                 timestamp_ms: ts,
             },
+        )
+        .unwrap();
+    }
+
+    fn add_trajectory(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO trajectories (id, version, persona_id, project_id, task_title, \
+             task_description, status, decisions_json, retrospective_json, search_text, path, \
+             updated_ms, timestamp_ms) VALUES (?,1,?,?,?,?,?,?,?,?,NULL,?,?)",
+            rusqlite::params![
+                id,
+                "planner",
+                "proj",
+                "Build forms",
+                "desc",
+                "completed",
+                "[]",
+                format!(r#"{{"summary":"summary {id}"}}"#),
+                "search",
+                1,
+                1_782_036_000_000i64
+            ],
         )
         .unwrap();
     }
@@ -1192,6 +1405,49 @@ mod tests {
                 accepted: req.records.len() as u64,
                 cursors: None,
             })
+        }
+    }
+
+    /// Simulates the Worker rejecting a request whose encoded records are too large. It records
+    /// every attempt so the test verifies we retry from the same cursor at a smaller limit.
+    struct CapacityLimitedIngestor {
+        max_records: usize,
+        attempted_record_counts: RefCell<Vec<usize>>,
+    }
+
+    impl Ingestor for CapacityLimitedIngestor {
+        fn ingest(&self, _auth: &StoredAuth, req: &IngestRequest) -> Result<IngestResponse> {
+            self.attempted_record_counts
+                .borrow_mut()
+                .push(req.records.len());
+            if req.records.len() > self.max_records {
+                return Err(ingest_status_error(
+                    503,
+                    "Worker exceeded resource limits".to_string(),
+                    req.records.len(),
+                ));
+            }
+            Ok(IngestResponse {
+                batch_id: req.batch_id.clone(),
+                received: req.records.len() as u64,
+                accepted: req.records.len() as u64,
+                cursors: None,
+            })
+        }
+    }
+
+    struct GenericUnavailableIngestor {
+        attempts: RefCell<usize>,
+    }
+
+    impl Ingestor for GenericUnavailableIngestor {
+        fn ingest(&self, _auth: &StoredAuth, _req: &IngestRequest) -> Result<IngestResponse> {
+            *self.attempts.borrow_mut() += 1;
+            Err(ingest_status_error(
+                503,
+                "service temporarily unavailable".to_string(),
+                32,
+            ))
         }
     }
 
@@ -1236,6 +1492,18 @@ mod tests {
     }
 
     #[test]
+    fn write_private_replaces_existing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor.json");
+
+        write_private(&path, r#"{"history_id":1}"#).unwrap();
+        write_private(&path, r#"{"history_id":2}"#).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"history_id":2}"#);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn push_sends_batch_advances_and_persists_cursor() {
         with_temp_home(|| {
             let conn = mem();
@@ -1273,6 +1541,292 @@ mod tests {
             assert_eq!(sent.records.len(), 2);
             // cursor persisted to disk and reloads to the advanced value
             assert_eq!(load_cursor(&auth.base_url).unwrap().history_id, 2);
+        });
+    }
+
+    #[test]
+    fn push_shrinks_from_the_emitted_batch_size_and_makes_progress() {
+        with_temp_home(|| {
+            let conn = mem();
+            for id in 1..=32 {
+                add(&conn, &format!("entry {id}"), id);
+            }
+            let client = CapacityLimitedIngestor {
+                max_records: 10,
+                attempted_record_counts: RefCell::new(Vec::new()),
+            };
+            let auth = StoredAuth {
+                base_url: "http://localhost:8787".into(),
+                access_token: "test-access-token".into(),
+                ..Default::default()
+            };
+            let report = push(
+                &conn,
+                &client,
+                &auth,
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &SyncCursor::default(),
+                500,
+                &HashSet::new(),
+            )
+            .unwrap();
+
+            // The configured limit is 500 but only 32 rows are pending. Retrying from 250
+            // would resend the same 32-record payload; shrink from the emitted size instead.
+            assert_eq!(*client.attempted_record_counts.borrow(), vec![32, 16, 8]);
+            assert_eq!(report.batch_limit, 8);
+            assert_eq!(report.attempts, 3);
+            assert_eq!(report.cursor.history_id, 8);
+            assert_eq!(load_cursor(&auth.base_url).unwrap().history_id, 8);
+        });
+    }
+
+    #[test]
+    fn capacity_retry_strictly_reduces_a_per_source_limit() {
+        with_temp_home(|| {
+            let conn = mem();
+            for id in 1..=4 {
+                add(&conn, &format!("entry {id}"), id);
+                add_trajectory(&conn, &format!("trajectory-{id}"));
+            }
+            let client = CapacityLimitedIngestor {
+                max_records: 6,
+                attempted_record_counts: RefCell::new(Vec::new()),
+            };
+            let auth = StoredAuth {
+                base_url: "http://localhost:8787".into(),
+                access_token: "test-access-token".into(),
+                ..Default::default()
+            };
+            let report = push(
+                &conn,
+                &client,
+                &auth,
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &SyncCursor::default(),
+                4,
+                &HashSet::new(),
+            )
+            .unwrap();
+
+            // Four rows from each source emit eight records. Halving the emitted count would
+            // leave the per-source limit at four and retry those same eight forever; the retry
+            // must lower it to three and make progress.
+            assert_eq!(*client.attempted_record_counts.borrow(), vec![8, 4]);
+            assert_eq!(report.batch_limit, 2);
+            assert_eq!(report.attempts, 2);
+            assert_eq!(report.cursor.history_id, 2);
+            assert_eq!(report.cursor.trajectory_rowid, 2);
+        });
+    }
+
+    #[test]
+    fn cursor_saves_merge_monotonically_across_concurrent_pushes() {
+        with_temp_home(|| {
+            let base_url = "http://localhost:8787";
+            save_cursor(
+                base_url,
+                &SyncCursor {
+                    history_id: 100,
+                    trajectory_rowid: 1,
+                },
+            )
+            .unwrap();
+            // Even a later stale writer cannot rewind either watermark.
+            save_cursor(
+                base_url,
+                &SyncCursor {
+                    history_id: 1,
+                    trajectory_rowid: 100,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                load_cursor(base_url).unwrap(),
+                SyncCursor {
+                    history_id: 100,
+                    trajectory_rowid: 100,
+                }
+            );
+
+            let mut writers = Vec::new();
+            for writer in 0..8 {
+                writers.push(std::thread::spawn(move || {
+                    for revision in 1..=25 {
+                        let cursor = if writer % 2 == 0 {
+                            SyncCursor {
+                                history_id: 100 + revision,
+                                trajectory_rowid: 1,
+                            }
+                        } else {
+                            SyncCursor {
+                                history_id: 1,
+                                trajectory_rowid: 100 + revision,
+                            }
+                        };
+                        save_cursor("http://localhost:8787", &cursor).unwrap();
+                    }
+                }));
+            }
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            assert_eq!(
+                load_cursor(base_url).unwrap(),
+                SyncCursor {
+                    history_id: 125,
+                    trajectory_rowid: 125,
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn empty_reduced_retry_persists_skipped_source_cursors() {
+        with_temp_home(|| {
+            let conn = mem();
+            add_for_session(&conn, "private-history", "private", 1);
+            add_for_session(&conn, "public-history", "public", 2);
+            add_trajectory(&conn, "private-trajectory");
+            add_trajectory(&conn, "public-trajectory");
+            let incognito: HashSet<String> = [
+                "private-history".to_string(),
+                "private-trajectory".to_string(),
+            ]
+            .into_iter()
+            .collect();
+            let client = CapacityLimitedIngestor {
+                max_records: 1,
+                attempted_record_counts: RefCell::new(Vec::new()),
+            };
+            let auth = StoredAuth {
+                base_url: "http://localhost:8787".into(),
+                access_token: "test-access-token".into(),
+                ..Default::default()
+            };
+            let report = push(
+                &conn,
+                &client,
+                &auth,
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &SyncCursor::default(),
+                2,
+                &incognito,
+            )
+            .unwrap();
+
+            // The first request contains the two public rows and is rejected. Limit one then
+            // scans only the two private rows, producing no records but advancing both cursors.
+            assert_eq!(*client.attempted_record_counts.borrow(), vec![2]);
+            assert_eq!(report.sent, 0);
+            assert_eq!(report.attempts, 1);
+            assert_eq!(report.cursor.history_id, 1);
+            assert_eq!(report.cursor.trajectory_rowid, 1);
+            assert_eq!(load_cursor(&auth.base_url).unwrap(), report.cursor);
+
+            // A later run starts after the skipped rows and can send the public rows instead of
+            // reconstructing the original rejected span.
+            let accepting = CapacityLimitedIngestor {
+                max_records: 2,
+                attempted_record_counts: RefCell::new(Vec::new()),
+            };
+            let next = push(
+                &conn,
+                &accepting,
+                &auth,
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &report.cursor,
+                2,
+                &incognito,
+            )
+            .unwrap();
+            assert_eq!(*accepting.attempted_record_counts.borrow(), vec![2]);
+            assert_eq!(next.sent, 2);
+            assert_eq!(next.cursor.history_id, 2);
+            assert_eq!(next.cursor.trajectory_rowid, 2);
+        });
+    }
+
+    #[test]
+    fn an_unrelated_503_is_not_retried_as_a_capacity_failure() {
+        with_temp_home(|| {
+            let conn = mem();
+            for id in 1..=32 {
+                add(&conn, &format!("entry {id}"), id);
+            }
+            let client = GenericUnavailableIngestor {
+                attempts: RefCell::new(0),
+            };
+            let auth = StoredAuth {
+                base_url: "http://localhost:8787".into(),
+                access_token: "test-access-token".into(),
+                ..Default::default()
+            };
+            let err = push(
+                &conn,
+                &client,
+                &auth,
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &SyncCursor::default(),
+                500,
+                &HashSet::new(),
+            )
+            .unwrap_err();
+            let message = format!("{err:#}");
+
+            assert!(message.contains("temporarily unavailable"), "{message}");
+            assert_eq!(*client.attempts.borrow(), 1);
+            assert_eq!(load_cursor(&auth.base_url).unwrap(), SyncCursor::default());
+        });
+    }
+
+    #[test]
+    fn worker_rejection_at_the_minimum_limit_is_loud_and_keeps_the_cursor() {
+        with_temp_home(|| {
+            let conn = mem();
+            add(&conn, "too large even alone", 1);
+            let client = CapacityLimitedIngestor {
+                max_records: 0,
+                attempted_record_counts: RefCell::new(Vec::new()),
+            };
+            let auth = StoredAuth {
+                base_url: "http://localhost:8787".into(),
+                access_token: "test-access-token".into(),
+                ..Default::default()
+            };
+            let err = push(
+                &conn,
+                &client,
+                &auth,
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &SyncCursor::default(),
+                1,
+                &HashSet::new(),
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(err.contains("cursor was not advanced"), "{err}");
+            assert_eq!(*client.attempted_record_counts.borrow(), vec![1]);
+            assert_eq!(load_cursor(&auth.base_url).unwrap(), SyncCursor::default());
         });
     }
 
