@@ -1074,9 +1074,11 @@ mod tests {
             .iter()
             .all(|e| e.project_id.as_deref() == Some("relayhistory")));
         assert!(events.iter().all(|e| e.task_title.is_none()));
-        assert!(events.iter().all(|e| e.record.as_ref().map_or(true, |r| {
-            r.get("sourceTrajectories").is_none() && r.get("raw").is_none()
-        })));
+        assert!(events
+            .iter()
+            .all(|e| e.record.as_ref().is_none_or(|r| {
+                r.get("sourceTrajectories").is_none() && r.get("raw").is_none()
+            })));
         assert!(events[0]
             .content
             .contains("Impact: Pair can rank prior work"));

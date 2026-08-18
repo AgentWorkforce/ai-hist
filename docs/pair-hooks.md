@@ -13,6 +13,11 @@ ai-hist pair check --json --task "refactor auth middleware" --file src/auth/midd
 ```
 
 That primitive owns relayhistory-cloud auth and reads the same auth file as cloud sync.
+Stage selection uses this precedence: an explicit `--base-url`, then
+`RELAYHISTORY_BASE_URL`, then `AI_HIST_BASE_URL`, and finally the production default. Hooks
+and MCP calls use the environment/default selection; pass `--base-url` for direct CLI calls
+that need another stage. This keeps Pair active even when the same home contains sessions
+for multiple stages.
 For production users, auth should come from Agent Relay Cloud login; `admin-mint` is
 dev/team-internal only and requires an admin secret:
 
