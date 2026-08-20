@@ -5043,7 +5043,9 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
             first_ts.get_or_insert(ts);
             last_ts = Some(ts);
         }
-        if value.get("type").and_then(Value::as_str) == Some("assistant") {
+        if value.get("type").and_then(Value::as_str) == Some("assistant")
+            && value.get("isSidechain").and_then(Value::as_bool) != Some(true)
+        {
             if let Some(content) = value.pointer("/message/content") {
                 if let Some(text) = content.as_str() {
                     last_assistant_text = Some(text.chars().take(4096).collect());
@@ -5087,6 +5089,33 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
             Some(s) if !s.is_empty() => s,
             _ => continue,
         };
+        // Subagent sidecar transcripts share the parent's sessionId with
+        // isSidechain rows. The subagent's assistant output is real session
+        // activity (text and token spend), but its user-role rows are the
+        // parent agent's own prompts and tool results — ingesting those
+        // manufactures fake human turns.
+        let sidechain = obj
+            .get("isSidechain")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if sidechain
+            && obj
+                .get("message")
+                .and_then(|m| m.get("role"))
+                .and_then(Value::as_str)
+                != Some("assistant")
+        {
+            // Heal databases that ingested these rows before this guard:
+            // the uid prefix is this row's uuid, so stale events (and any
+            // per-block siblings) can be removed as the file is re-read.
+            if let Some(uuid) = obj.get("uuid").and_then(Value::as_str) {
+                conn.execute(
+                    "DELETE FROM session_events WHERE source = 'claude' AND session_id = ? AND (event_uid = ? || ':0' OR event_uid LIKE ? || ':%')",
+                    params![session_id, uuid, uuid],
+                )?;
+            }
+            continue;
+        }
         let cwd = obj.get("cwd").and_then(Value::as_str);
         let project = cwd;
         let git_branch = obj.get("gitBranch").and_then(Value::as_str);
@@ -7793,5 +7822,33 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn sidechain_rows_keep_assistant_output_but_drop_fake_user_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-sub.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"su1","sessionId":"s-parent","isSidechain":true,"cwd":"/tmp/proj","timestamp":"2026-06-25T10:00:00.000Z","message":{"role":"user","content":"Research the repo thoroughly."}}"#, "\n",
+                r#"{"type":"assistant","uuid":"sa1","sessionId":"s-parent","isSidechain":true,"cwd":"/tmp/proj","timestamp":"2026-06-25T10:01:00.000Z","message":{"id":"msg_sub","role":"assistant","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":20},"content":[{"type":"text","text":"Here is the report."}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT role, text FROM session_events ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![("assistant".into(), "Here is the report.".into())]
+        );
     }
 }
