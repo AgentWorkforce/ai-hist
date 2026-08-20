@@ -12,6 +12,8 @@ export interface SyncPushResult {
   /** `true` when another process owned the history scan; existing rows were still pushed. */
   syncSkipped: boolean
 }
+/** Refresh the local ai-hist database without performing any cloud operation. */
+export declare function syncLocal(): Promise<void>
 /**
  * Sync local agent history into the ai-hist DB, then push new records to
  * relayhistory-cloud. The blocking work (file/SQLite/HTTP) runs on a worker

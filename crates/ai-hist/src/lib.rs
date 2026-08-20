@@ -49,6 +49,15 @@ pub struct SyncPushOutcome {
     pub sync_skipped: bool,
 }
 
+/// Refresh local agent history without performing any cloud operation.
+/// Embedding applications should use this before opening the local catalog.
+pub fn sync_local() -> Result<()> {
+    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    let db_path = default_db_path();
+    let conn = open_db(&db_path)?;
+    sync_basic(&conn, &db_path)
+}
+
 /// Sync local agent history into the DB, then push new records to
 /// relayhistory-cloud — the in-process equivalent of `ai-hist sync && ai-hist
 /// push`, with sync progress output suppressed. This is the entry point the
@@ -3938,14 +3947,14 @@ fn sync_jsonl_incremental(
 
 fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) -> Result<usize> {
     let (cwds, branches) = build_codex_session_maps(state, home)?;
+    let mut inserted = sync_codex_rollout_prompts(conn, state, home)?;
     let path = home.join(".codex/history.jsonl");
     if !path.exists() {
         sync_note!("  [codex] not found: {} (skipped)", path.display());
-        return Ok(0);
+        return Ok(inserted);
     }
     let size = path.metadata()?.len();
     let offset = state.get("codex").and_then(Value::as_u64).unwrap_or(0);
-    let mut inserted = 0;
     let mut errors = 0;
     if offset < size {
         sync_note!("  [codex] syncing {} new bytes...", size - offset);
@@ -3989,6 +3998,108 @@ fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) ->
         sync_note!("  [codex] {}", parts.join(", "));
     }
     Ok(inserted)
+}
+
+/// Codex Desktop records complete conversations in rollout JSONL files but does
+/// not mirror those prompts into `~/.codex/history.jsonl`. Import user turns
+/// here so desktop and CLI sessions converge on the same normalized history.
+fn sync_codex_rollout_prompts(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    home: &Path,
+) -> Result<usize> {
+    let mut seen = state
+        .get("codex_rollout_user_messages_v2")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut inserted = 0;
+    let mut scanned = 0;
+    for root in [
+        home.join(".codex/sessions"),
+        home.join(".codex/archived_sessions"),
+    ] {
+        if !root.exists() {
+            continue;
+        }
+        for rollout in collect_matching_files(&root, "rollout-", "jsonl")? {
+            let key = rollout.to_string_lossy().to_string();
+            let stamp = file_stamp(&rollout)?;
+            if seen.get(&key).and_then(Value::as_str) == Some(stamp.as_str()) {
+                continue;
+            }
+            let Some((session_id, cwd, _)) = read_codex_session_meta(&rollout)? else {
+                seen.insert(key, json!(stamp));
+                continue;
+            };
+            scanned += 1;
+            let file = fs::File::open(&rollout)?;
+            for line in BufReader::new(file).lines() {
+                let Ok(line) = line else { continue };
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let timestamp_ms = value
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(parse_iso_ms)
+                    .unwrap_or(0);
+                for prompt in codex_rollout_user_prompts(&value) {
+                    if is_codex_control_context(&prompt) {
+                        continue;
+                    }
+                    inserted += insert_history(
+                        conn,
+                        &HistoryEntry {
+                            id: 0,
+                            source: "codex".into(),
+                            session_id: Some(session_id.clone()),
+                            project: Some(cwd.clone()),
+                            prompt_hash: Some(prompt_hash(&prompt)),
+                            prompt,
+                            timestamp_ms,
+                        },
+                    )?;
+                }
+            }
+            seen.insert(key, json!(stamp));
+        }
+    }
+    state.insert("codex_rollout_user_messages_v2".to_string(), Value::Object(seen));
+    if scanned > 0 {
+        sync_note!("  [codex-rollouts] scanned {scanned} files; +{inserted} rows");
+    }
+    Ok(inserted)
+}
+
+fn codex_rollout_user_prompts(value: &Value) -> Vec<String> {
+    let mut prompts = Vec::new();
+    let payload = value.get("payload").and_then(Value::as_object);
+    if value.get("type").and_then(Value::as_str) == Some("event_msg")
+        && payload.and_then(|p| p.get("type")).and_then(Value::as_str) == Some("user_message")
+    {
+        if let Some(message) = payload
+            .and_then(|p| p.get("message"))
+            .and_then(Value::as_str)
+        {
+            if !message.trim().is_empty() {
+                prompts.push(message.trim().to_string());
+            }
+        }
+    }
+    prompts
+}
+
+fn is_codex_control_context(prompt: &str) -> bool {
+    let value = prompt.trim_start();
+    [
+        "<environment_context",
+        "<permissions instructions",
+        "<app-context",
+        "<skills_instructions",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
 }
 
 fn build_codex_session_maps(
@@ -5774,19 +5885,48 @@ fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpoint_sync_state, cleanup_stale_sync_state_temps, cron_schedule, file_stamp,
-        git_commit_time_ms, git_stdout, ingest_claude_transcript, is_sqlite_contention,
-        link_git_commit, load_sync_state, parse_trajectory_file, paths_overlap,
-        prepare_sync_and_push_db, process_status_with_programs, save_sync_state, search_all,
-        service_command_args, shell_single_quote, source_database_path, strip_url_credentials,
-        sync_claude_session_metadata, sync_exclusive, sync_opencode_exclusive,
-        try_acquire_sync_lock, wal_contention_line, write_contention_diagnostic, xml_escape,
-        SearchRole, SyncSourceReport, PUSH_SERVICE, WAL_WARN_BYTES,
+        checkpoint_sync_state, cleanup_stale_sync_state_temps, codex_rollout_user_prompts,
+        cron_schedule, file_stamp, git_commit_time_ms, git_stdout, ingest_claude_transcript,
+        is_sqlite_contention, link_git_commit, load_sync_state, parse_trajectory_file,
+        paths_overlap, prepare_sync_and_push_db, process_status_with_programs, save_sync_state,
+        search_all, service_command_args, shell_single_quote, source_database_path,
+        strip_url_credentials, sync_claude_session_metadata, sync_exclusive,
+        sync_opencode_exclusive, try_acquire_sync_lock, wal_contention_line,
+        write_contention_diagnostic, xml_escape, SearchRole, SyncSourceReport, PUSH_SERVICE,
+        WAL_WARN_BYTES,
     };
     use ai_hist_core::{init_db, open_db, QueryFilter, SourceDatabaseError};
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::fs;
+
+    #[test]
+    fn codex_rollout_prompts_normalize_desktop_user_turns() {
+        let event = json!({
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "  fix the importer  "}
+        });
+        assert_eq!(codex_rollout_user_prompts(&event), vec!["fix the importer"]);
+
+        let mirrored_response_item = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "summarize this task"},
+                    {"type": "image", "url": "ignored"}
+                ]
+            }
+        });
+        assert!(codex_rollout_user_prompts(&mirrored_response_item).is_empty());
+
+        let assistant = json!({
+            "type": "response_item",
+            "payload": {"type": "message", "role": "assistant", "content": "ignored"}
+        });
+        assert!(codex_rollout_user_prompts(&assistant).is_empty());
+    }
 
     #[test]
     fn cron_schedule_maps_intervals_to_step_expressions() {
