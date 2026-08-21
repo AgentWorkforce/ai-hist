@@ -1325,31 +1325,37 @@ fn print_session_events(
 ) -> Result<()> {
     if json {
         // One replay stream, merged chronologically across the three record
-        // types (unknown timestamps last, ties broken by row id).
-        let mut lines: Vec<(Option<i64>, i64, String)> = Vec::new();
+        // types (unknown timestamps last, ties broken by row id). Sorting
+        // references and serializing at write time keeps peak memory at the
+        // fetched rows themselves, not a second serialized copy.
+        enum ReplayRecord<'a> {
+            Event(&'a ai_hist_core::SessionEvent),
+            ToolCall(&'a ai_hist_core::SessionToolCall),
+            FileEdit(&'a ai_hist_core::SessionFileEdit),
+        }
+        let mut records: Vec<(Option<i64>, i64, ReplayRecord)> = Vec::new();
         for event in &events {
-            lines.push((
-                Some(event.ts_ms),
-                event.id,
-                serde_json::to_string(&json!({ "type": "event", "record": event }))?,
-            ));
+            records.push((Some(event.ts_ms), event.id, ReplayRecord::Event(event)));
         }
         for call in &tool_calls {
-            lines.push((
-                call.ts_ms,
-                call.id,
-                serde_json::to_string(&json!({ "type": "tool_call", "record": call }))?,
-            ));
+            records.push((call.ts_ms, call.id, ReplayRecord::ToolCall(call)));
         }
         for edit in &file_edits {
-            lines.push((
-                edit.ts_ms,
-                edit.id,
-                serde_json::to_string(&json!({ "type": "file_edit", "record": edit }))?,
-            ));
+            records.push((edit.ts_ms, edit.id, ReplayRecord::FileEdit(edit)));
         }
-        lines.sort_by_key(|(ts, id, _)| (ts.is_none(), ts.unwrap_or(0), *id));
-        for (_, _, line) in lines {
+        records.sort_by_key(|(ts, id, _)| (ts.is_none(), ts.unwrap_or(0), *id));
+        for (_, _, record) in records {
+            let line = match record {
+                ReplayRecord::Event(event) => {
+                    serde_json::to_string(&json!({ "type": "event", "record": event }))?
+                }
+                ReplayRecord::ToolCall(call) => {
+                    serde_json::to_string(&json!({ "type": "tool_call", "record": call }))?
+                }
+                ReplayRecord::FileEdit(edit) => {
+                    serde_json::to_string(&json!({ "type": "file_edit", "record": edit }))?
+                }
+            };
             println!("{line}");
         }
         return Ok(());

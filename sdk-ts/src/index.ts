@@ -1115,8 +1115,10 @@ export class AiHist {
       params.push(opts.source);
     }
     // tool_calls has no project column; the configured scope constrains
-    // through the session's events.
+    // through the session's events. Without that table the scoped answer is
+    // unknowable — fail closed rather than throw.
     if (this._projectScope) {
+      if (!tableExists(this.db, 'session_events')) return [];
       const scope = scopedPathClause('e.project', this._projectScope);
       clauses.push(
         `EXISTS (SELECT 1 FROM session_events e

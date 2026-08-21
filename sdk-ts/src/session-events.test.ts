@@ -70,6 +70,11 @@ async function writeEventsFixtureDb(dbPath: string): Promise<void> {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ['codex', 'sess-1', 'fc_1', 'call_1', 'exec_command', 'git status', '{"cmd":"git status"}', 0, 2000],
     );
+    db.run(
+      `INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name, target, args_json, is_error, ts_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ['claude', 'sess-other', 'msg_1', 'toolu_1', 'Bash', 'ls', '{"command":"ls"}', null, 1500],
+    );
     await writeFile(dbPath, Buffer.from(db.export()));
   } finally {
     db.close();
@@ -154,6 +159,7 @@ test('a configured project scope constrains event and tool-call reads', async ()
       assert.deepEqual(scoped.getToolCalls('sess-1'), []);
       // sess-other lives in /tmp/other — inside it.
       assert.equal(scoped.getSessionEvents('sess-other').length, 1);
+      assert.equal(scoped.getToolCalls('sess-other').length, 1);
     } finally {
       scoped.close();
     }
