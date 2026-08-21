@@ -4588,7 +4588,12 @@ fn ingest_codex_rollout(
                         // carried-over baseline of a resumed session (a fresh
                         // session's opening snapshot has `info: null`).
                         None if !saw_model_output => prev_totals = Some(totals),
-                        Some(prev) if totals.regressed_from(&prev) => prev_totals = Some(totals),
+                        // A regressed snapshot is treated as a transient
+                        // glitch: keeping the prior baseline means the next
+                        // advancing snapshot's delta covers exactly the spend
+                        // since that baseline, so per-event sums still
+                        // reproduce the cumulative totals.
+                        Some(prev) if totals.regressed_from(&prev) => {}
                         Some(prev) if !totals.advanced_from(&prev) => {}
                         _ => {
                             let baseline = prev_totals.unwrap_or_default();
@@ -7765,6 +7770,7 @@ mod tests {
                 r#"{"timestamp":"2026-08-02T09:00:00.000Z","type":"session_meta","payload":{"id":"sess-resumed","cwd":"/tmp/proj"}}"#, "\n",
                 r#"{"timestamp":"2026-08-02T09:00:00.100Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":120,"reasoning_output_tokens":0,"total_tokens":1120}}}}"#, "\n",
                 r#"{"timestamp":"2026-08-02T09:00:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Picking the work back up."}}"#, "\n",
+                r#"{"timestamp":"2026-08-02T09:00:01.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":40,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":4,"reasoning_output_tokens":0,"total_tokens":44}}}}"#, "\n",
                 r#"{"timestamp":"2026-08-02T09:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1500,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":150,"reasoning_output_tokens":0,"total_tokens":1650}}}}"#, "\n",
             ),
         )
