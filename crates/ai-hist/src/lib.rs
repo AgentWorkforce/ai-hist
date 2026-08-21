@@ -51,11 +51,11 @@ pub struct SyncPushOutcome {
 
 /// Refresh local agent history without performing any cloud operation.
 /// Embedding applications should use this before opening the local catalog.
+/// When another process owns the sync lock the refresh is skipped — the
+/// concurrent scan is already producing the fresh data this caller wants.
 pub fn sync_local() -> Result<()> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    let db_path = default_db_path();
-    let conn = open_db(&db_path)?;
-    sync_basic(&conn, &db_path)
+    sync_exclusive(&default_db_path()).map(|_| ())
 }
 
 /// Sync local agent history into the DB, then push new records to
@@ -708,9 +708,9 @@ pub fn run() -> Result<()> {
             let tool_calls = session_tool_calls(&conn, &session_id, source.as_deref())?;
             let file_edits = session_file_edits(&conn, &session_id, source.as_deref())?;
             if events.is_empty() && tool_calls.is_empty() {
-                if json {
-                    println!("[]");
-                } else {
+                // JSON mode emits record lines only; an empty session is just
+                // an empty stream plus the exit code.
+                if !json {
                     println!("No events for session {session_id}");
                 }
                 std::process::exit(1);
@@ -1324,23 +1324,33 @@ fn print_session_events(
     json: bool,
 ) -> Result<()> {
     if json {
+        // One replay stream, merged chronologically across the three record
+        // types (unknown timestamps last, ties broken by row id).
+        let mut lines: Vec<(Option<i64>, i64, String)> = Vec::new();
         for event in &events {
-            println!(
-                "{}",
-                serde_json::to_string(&json!({ "type": "event", "record": event }))?
-            );
+            lines.push((
+                Some(event.ts_ms),
+                event.id,
+                serde_json::to_string(&json!({ "type": "event", "record": event }))?,
+            ));
         }
         for call in &tool_calls {
-            println!(
-                "{}",
-                serde_json::to_string(&json!({ "type": "tool_call", "record": call }))?
-            );
+            lines.push((
+                call.ts_ms,
+                call.id,
+                serde_json::to_string(&json!({ "type": "tool_call", "record": call }))?,
+            ));
         }
         for edit in &file_edits {
-            println!(
-                "{}",
-                serde_json::to_string(&json!({ "type": "file_edit", "record": edit }))?
-            );
+            lines.push((
+                edit.ts_ms,
+                edit.id,
+                serde_json::to_string(&json!({ "type": "file_edit", "record": edit }))?,
+            ));
+        }
+        lines.sort_by_key(|(ts, id, _)| (ts.is_none(), ts.unwrap_or(0), *id));
+        for (_, _, line) in lines {
+            println!("{line}");
         }
         return Ok(());
     }
@@ -1364,6 +1374,20 @@ fn print_session_events(
             format!("{}/{}", event.role, event.kind),
             shown
         );
+    }
+    // Tool calls already render above as their tool_use events; file edits
+    // have no event row, so list them explicitly.
+    if !file_edits.is_empty() {
+        println!("\n  Files changed:");
+        for edit in &file_edits {
+            let counts = match (edit.lines_added, edit.lines_removed) {
+                (Some(added), Some(removed)) if added + removed > 0 => {
+                    format!(" (+{added} -{removed})")
+                }
+                _ => String::new(),
+            };
+            println!("    {}{}", edit.file_path, counts);
+        }
     }
     Ok(())
 }
@@ -4148,9 +4172,26 @@ fn sync_codex_rollouts(
                 continue;
             };
             scanned += 1;
-            cwds.insert(meta.session_id.clone(), meta.cwd.clone());
-            if let Some(branch) = &meta.git_branch {
-                branches.insert(meta.session_id.clone(), branch.clone());
+            if meta.is_subagent {
+                // Earlier syncs (before subagent detection) registered these
+                // threads: their map entries feed backfill_codex_metadata and
+                // their history rows feed session discovery, either of which
+                // would resurrect the session row this walk refuses to create.
+                cwds.remove(&meta.session_id);
+                branches.remove(&meta.session_id);
+                conn.execute(
+                    "DELETE FROM history WHERE source = 'codex' AND session_id = ?",
+                    [meta.session_id.as_str()],
+                )?;
+                conn.execute(
+                    "DELETE FROM sessions WHERE source = 'codex' AND session_id = ?",
+                    [meta.session_id.as_str()],
+                )?;
+            } else {
+                cwds.insert(meta.session_id.clone(), meta.cwd.clone());
+                if let Some(branch) = &meta.git_branch {
+                    branches.insert(meta.session_id.clone(), branch.clone());
+                }
             }
             let outcome = ingest_codex_rollout(conn, &rollout, &meta)?;
             inserted += outcome.prompts;
@@ -4467,6 +4508,12 @@ fn ingest_codex_rollout(
                             &uid, None, None,
                         )?;
                         outcome.events += 1;
+                        // A subagent's "user" turns are the parent agent's
+                        // task prompts; only human threads feed the prompt
+                        // history that session discovery is built on.
+                        if meta.is_subagent {
+                            continue;
+                        }
                         outcome.prompts += insert_history(
                             conn,
                             &HistoryEntry {
@@ -4947,11 +4994,15 @@ fn sync_claude_session_metadata(
     if !root.exists() {
         return Ok(());
     }
+    // The v2 key forces one full re-scan on upgrade: transcripts whose
+    // stamps never change again still need the sidechain healing pass that
+    // removes previously ingested fake user turns.
     let mut session_state = state
-        .get("claude_sessions")
+        .get("claude_sessions_v2")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    state.remove("claude_sessions");
     let mut scanned = 0;
     let mut upserted = 0;
     for path in collect_matching_files(root, "", "jsonl")? {
@@ -4980,7 +5031,10 @@ fn sync_claude_session_metadata(
             upserted += 1;
         }
     }
-    state.insert("claude_sessions".to_string(), Value::Object(session_state));
+    state.insert(
+        "claude_sessions_v2".to_string(),
+        Value::Object(session_state),
+    );
     if scanned > 0 {
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
@@ -7392,7 +7446,7 @@ mod tests {
         );
         let mut state = Map::new();
         state.insert(
-            "claude_sessions".to_string(),
+            "claude_sessions_v2".to_string(),
             Value::Object(claude_sessions),
         );
 
@@ -7786,9 +7840,35 @@ mod tests {
             "codex_rollout_user_messages_v2".into(),
             json!({"old": "1:1"}),
         );
+        // A sync predating subagent detection left the thread registered:
+        // a cwd-map entry, a prompt row, and a session row.
+        state.insert(
+            "codex_session_cwds".into(),
+            json!({"sess-sub": "/tmp/proj"}),
+        );
+        conn.execute(
+            "INSERT INTO history (source, session_id, project, prompt, timestamp_ms) VALUES ('codex', 'sess-sub', '/tmp/proj', 'do a review', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) VALUES ('sess-sub', 'codex', '/tmp/proj')",
+            [],
+        )
+        .unwrap();
         let (cwds, _, inserted) = super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
         assert_eq!(inserted, 1);
-        assert_eq!(cwds.get("sess-sub").map(String::as_str), Some("/tmp/proj"));
+        // Subagent threads never reach the maps, prompt history, or session
+        // registration — including rows left behind by earlier syncs.
+        assert_eq!(cwds.get("sess-sub"), None);
+        let sub_history: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE session_id = 'sess-sub'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sub_history, 0);
         assert!(state.get("codex_rollouts").is_none());
         assert!(state.get("codex_rollout_user_messages_v2").is_none());
 

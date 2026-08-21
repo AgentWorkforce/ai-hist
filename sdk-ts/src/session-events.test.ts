@@ -142,6 +142,26 @@ test('getSessionEvents returns ordered typed events with parsed token usage', as
   }
 });
 
+test('a configured project scope constrains event and tool-call reads', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ai-hist-events-scope-'));
+  const dbPath = join(dir, 'events.db');
+  try {
+    await writeEventsFixtureDb(dbPath);
+    const scoped = await openAiHist({ dbPath, projectScope: '/tmp/other' });
+    try {
+      // sess-1 lives in /tmp/proj — outside the scope.
+      assert.deepEqual(scoped.getSessionEvents('sess-1'), []);
+      assert.deepEqual(scoped.getToolCalls('sess-1'), []);
+      // sess-other lives in /tmp/other — inside it.
+      assert.equal(scoped.getSessionEvents('sess-other').length, 1);
+    } finally {
+      scoped.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('events reads return [] on databases that predate session_events', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'ai-hist-preevents-'));
   const dbPath = join(dir, 'old.db');

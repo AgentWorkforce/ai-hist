@@ -819,7 +819,7 @@ pub fn session_events(
         sql.push_str(" AND source = ?");
         params_vec.push(source.to_string());
     }
-    sql.push_str(" ORDER BY ts_ms ASC, id ASC");
+    sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
         Ok(SessionEvent {
@@ -855,7 +855,7 @@ pub fn session_tool_calls(
         sql.push_str(" AND source = ?");
         params_vec.push(source.to_string());
     }
-    sql.push_str(" ORDER BY ts_ms ASC, id ASC");
+    sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
         Ok(SessionToolCall {
@@ -886,7 +886,7 @@ pub fn session_file_edits(
         sql.push_str(" AND source = ?");
         params_vec.push(source.to_string());
     }
-    sql.push_str(" ORDER BY ts_ms ASC, id ASC");
+    sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
         Ok(SessionFileEdit {

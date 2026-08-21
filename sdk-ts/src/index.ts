@@ -1060,6 +1060,7 @@ export class AiHist {
       clauses.push('source = ?');
       params.push(opts.source);
     }
+    appendProjectFilter(clauses, params, undefined, this._projectScope);
     interface RawEventRow {
       id: number;
       source: Source;
@@ -1083,7 +1084,7 @@ export class AiHist {
               ts_ms, role, kind, text, model, token_json, event_uid
        FROM session_events
        WHERE ${clauses.join(' AND ')}
-       ORDER BY ts_ms ASC, id ASC`,
+       ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC`,
       params,
     ).map((row) => ({
       id: row.id,
@@ -1113,6 +1114,17 @@ export class AiHist {
       clauses.push('source = ?');
       params.push(opts.source);
     }
+    // tool_calls has no project column; the configured scope constrains
+    // through the session's events.
+    if (this._projectScope) {
+      const scope = scopedPathClause('e.project', this._projectScope);
+      clauses.push(
+        `EXISTS (SELECT 1 FROM session_events e
+                 WHERE e.source = tool_calls.source AND e.session_id = tool_calls.session_id
+                   AND ${scope.sql})`,
+      );
+      params.push(...scope.params);
+    }
     interface RawToolCallRow {
       id: number;
       source: Source;
@@ -1130,7 +1142,7 @@ export class AiHist {
       `SELECT id, source, session_id, message_id, tool_use_id, name, target, args_json, is_error, ts_ms
        FROM tool_calls
        WHERE ${clauses.join(' AND ')}
-       ORDER BY ts_ms ASC, id ASC`,
+       ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC`,
       params,
     ).map((row) => ({
       id: row.id,
