@@ -181,35 +181,20 @@ test('SDK fallback ingests OpenCode rows committed in WAL files', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ai-hist-opencode-wal-'));
   const dbPath = join(root, 'opencode.db');
   const readyPath = join(root, 'ready');
-  const child = spawn(
-    'python3',
-    [
-      '-c',
-      `
-import json, pathlib, sqlite3, time
-db = pathlib.Path(${JSON.stringify(dbPath)})
-ready = pathlib.Path(${JSON.stringify(readyPath)})
-conn = sqlite3.connect(db)
-conn.execute("PRAGMA journal_mode=WAL")
-conn.execute("PRAGMA wal_autocheckpoint=0")
-conn.execute("CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER)")
-conn.execute("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)")
-conn.execute("CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT)")
-conn.execute("INSERT INTO session VALUES ('oc-ts-wal', '/tmp/opencode-ts', 1700000000000)")
-conn.execute("INSERT INTO message VALUES ('msg-ts-wal', 'oc-ts-wal', 1700000001000, ?)", (json.dumps({"role":"user"}),))
-conn.execute("INSERT INTO part VALUES ('part-ts-wal', 'msg-ts-wal', 'oc-ts-wal', 1700000002000, ?)", (json.dumps({"type":"text","text":"ts wal opencode prompt"}),))
-conn.commit()
-live = sqlite3.connect(db)
-assert live.execute("SELECT COUNT(*) FROM part").fetchone()[0] == 1
-live.close()
-ready.write_text("ready")
-time.sleep(60)
-`,
-    ],
-    { stdio: ['ignore', 'ignore', 'pipe'] },
-  );
+  const child = spawn('sqlite3', [dbPath], { stdio: ['pipe', 'ignore', 'pipe'] });
   const stderr: Buffer[] = [];
   child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+  child.stdin.write(`
+PRAGMA journal_mode=WAL;
+PRAGMA wal_autocheckpoint=0;
+CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER);
+CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+INSERT INTO session VALUES ('oc-ts-wal', '/tmp/opencode-ts', 1700000000000);
+INSERT INTO message VALUES ('msg-ts-wal', 'oc-ts-wal', 1700000001000, '{"role":"user"}');
+INSERT INTO part VALUES ('part-ts-wal', 'msg-ts-wal', 'oc-ts-wal', 1700000002000, '{"type":"text","text":"ts wal opencode prompt"}');
+.shell touch ${readyPath}
+`);
 
   const previousDb = process.env.AI_HIST_DB;
   const previousOpenCode = process.env.OPENCODE_DB;

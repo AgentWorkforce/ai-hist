@@ -125,54 +125,18 @@ install_binary_launchers() {
 
   cat > "$BIN_DIR/ai-hist" <<EOF
 #!/usr/bin/env sh
-if [ "\${AI_HIST_CLI:-auto}" = "python" ]; then
-  exec "$BIN_DIR/ai-hist-python" "\$@"
-fi
 exec "\${AI_HIST_RUST_BIN:-$rust_bin}" "\$@"
 EOF
 
-  cat > "$BIN_DIR/ai-hist-rust" <<EOF
-#!/usr/bin/env sh
-exec "\${AI_HIST_RUST_BIN:-$rust_bin}" "\$@"
-EOF
-
-  cat > "$BIN_DIR/ai-hist-python" <<EOF
-#!/usr/bin/env sh
-if [ ! -f "$INSTALL_DIR/ai-hist-python" ]; then
-  echo "ai-hist-python was not installed with this ai-hist binary install." >&2
-  exit 127
-fi
-exec python3 "$INSTALL_DIR/ai-hist-python" "\$@"
-EOF
-
-  chmod 755 "$BIN_DIR/ai-hist" "$BIN_DIR/ai-hist-rust" "$BIN_DIR/ai-hist-python"
+  chmod 755 "$BIN_DIR/ai-hist"
 }
 
-install_python_fallback() {
-  mkdir -p "$INSTALL_DIR"
-
-  if [ -n "${AI_HIST_WRAPPER_SOURCE_DIR:-}" ] && [ -f "$AI_HIST_WRAPPER_SOURCE_DIR/ai-hist-python" ]; then
-    cp "$AI_HIST_WRAPPER_SOURCE_DIR/ai-hist-python" "$INSTALL_DIR/ai-hist-python"
-    chmod 755 "$INSTALL_DIR/ai-hist-python"
-    return 0
-  fi
-
-  if [ -f "$(script_dir)/ai-hist-python" ]; then
-    cp "$(script_dir)/ai-hist-python" "$INSTALL_DIR/ai-hist-python"
-    chmod 755 "$INSTALL_DIR/ai-hist-python"
-    return 0
-  fi
-
-  need curl || return 1
-  ref="$(raw_ref)"
-  url="https://raw.githubusercontent.com/$REPO_SLUG/$ref/ai-hist-python"
-  if curl -fsSL "$url" -o "$INSTALL_DIR/ai-hist-python" 2>/dev/null; then
-    chmod 755 "$INSTALL_DIR/ai-hist-python"
-    return 0
-  fi
-
-  warn "could not install ai-hist-python fallback from $url"
-  return 1
+remove_legacy_launchers() {
+  rm -f \
+    "$BIN_DIR/ai-hist-python" \
+    "$BIN_DIR/ai-hist-rust" \
+    "$INSTALL_DIR/ai-hist-python" \
+    "$INSTALL_DIR/ai-hist-wrapper"
 }
 
 install_prebuilt() {
@@ -205,7 +169,6 @@ install_prebuilt() {
   fi
 
   install_binary_launchers "$rust_bin"
-  install_python_fallback || true
   info "installed prebuilt binary"
   return 0
 }
@@ -237,11 +200,6 @@ install_from_source() {
     echo "Install Rust from https://rustup.rs/ and rerun this script, or use AI_HIST_INSTALL_METHOD=binary with a published prebuilt binary." >&2
     exit 1
   }
-  need python3 || {
-    echo "Install Python 3 and rerun this script." >&2
-    exit 1
-  }
-
   if [ "$BUILD_PROFILE" = "release" ]; then
     (cd "$src_dir" && cargo build --release -q -p ai-hist-cli)
   else
@@ -255,28 +213,9 @@ install_from_source() {
   fi
 
   mkdir -p "$BIN_DIR" "$INSTALL_DIR"
-  cp "$src_dir/ai-hist" "$INSTALL_DIR/ai-hist-wrapper"
-  cp "$src_dir/ai-hist-python" "$INSTALL_DIR/ai-hist-python"
   cp "$rust_bin" "$INSTALL_DIR/ai-hist-rust-bin"
-  chmod 755 "$INSTALL_DIR/ai-hist-wrapper" "$INSTALL_DIR/ai-hist-python" "$INSTALL_DIR/ai-hist-rust-bin"
-
-  cat > "$BIN_DIR/ai-hist" <<EOF
-#!/usr/bin/env sh
-export AI_HIST_RUST_BIN="\${AI_HIST_RUST_BIN:-$INSTALL_DIR/ai-hist-rust-bin}"
-exec "$INSTALL_DIR/ai-hist-wrapper" "\$@"
-EOF
-
-  cat > "$BIN_DIR/ai-hist-python" <<EOF
-#!/usr/bin/env sh
-exec python3 "$INSTALL_DIR/ai-hist-python" "\$@"
-EOF
-
-  cat > "$BIN_DIR/ai-hist-rust" <<EOF
-#!/usr/bin/env sh
-exec "$INSTALL_DIR/ai-hist-rust-bin" "\$@"
-EOF
-
-  chmod 755 "$BIN_DIR/ai-hist" "$BIN_DIR/ai-hist-python" "$BIN_DIR/ai-hist-rust"
+  chmod 755 "$INSTALL_DIR/ai-hist-rust-bin"
+  install_binary_launchers "$INSTALL_DIR/ai-hist-rust-bin"
   info "installed from source"
 }
 
@@ -289,6 +228,8 @@ elif [ -z "${AI_HIST_SOURCE_DIR:-}" ] && ! { [ -f "$(script_dir)/Cargo.toml" ] &
 else
   install_from_source
 fi
+
+remove_legacy_launchers
 
 # Register the background sync service so history stays fresh automatically.
 # Opt out with AI_HIST_NO_AUTOSYNC=1 (e.g. CI, or to manage scheduling yourself).
@@ -306,8 +247,6 @@ ai-hist installed.
 
 Commands:
   $BIN_DIR/ai-hist
-  $BIN_DIR/ai-hist-python
-  $BIN_DIR/ai-hist-rust
 
 Add this to your shell profile if needed:
   export PATH="$BIN_DIR:\$PATH"

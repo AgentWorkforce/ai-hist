@@ -33,23 +33,19 @@ Privacy model (default **Team/Growth** tier — vendor-readable):
 
 ---
 
-## Step 0 — Build & install the CLI (required first)
+## Step 0 — Install the CLI (required first)
 
-The cloud commands (`login` / `admin-mint` / `push`) are in the **Rust** binary. The
-`~/.local/bin/ai-hist` you may already have is the **Python** CLI and does **not** include
-them — rebuild from `main`:
+The cloud commands (`login` / `admin-mint` / `push`) are included in the standard
+`ai-hist` binary. Install the latest release:
 
 ```bash
-cd <relayhistory repo>            # e.g. ~/Projects/AgentWorkforce/ai-hist
-git checkout main && git pull --ff-only origin main
-cargo build --release -p ai-hist-cli
-cp target/release/ai-hist ~/.local/bin/ai-hist
-ai-hist --help                    # should list: login, admin-mint, push
+curl -fsSL https://raw.githubusercontent.com/AgentWorkforce/relayhistory/main/install.sh | sh
+ai-hist --help                    # lists login, admin-mint, and push
 ```
 
-Both CLIs read the **same** local DB (`~/.local/share/ai-hist/ai-history.db`), so your
-existing captured history is what `push` sends. If you have nothing captured yet, run
-`ai-hist sync` first. (If `push` ever says `Nothing new to push.`, run `ai-hist sync`.)
+Existing captured history in `~/.local/share/ai-hist/ai-history.db` is what `push`
+sends. If you have nothing captured yet, run `ai-hist sync` first. (If `push` ever
+says `Nothing new to push.`, run `ai-hist sync`.)
 
 ---
 
@@ -138,7 +134,7 @@ overlapping scans as a safeguard, and a contended Reflex tick still pushes alrea
 
 | Message | Fix |
 |---|---|
-| `ai-hist: command not found` / no `login`/`push` | rebuild from `main` (Step 0) — old binary is Python |
+| `ai-hist: command not found` / no `login`/`push` | install the latest release using Step 0 |
 | `not authenticated …` | run Agent Relay Cloud login (prod) or team-internal `admin-mint` (dev) first |
 | `Nothing new to push.` | `ai-hist sync` first, then push |
 | `HTTP 404 admin mint disabled` | you hit prod with `admin-mint` — use Agent Relay Cloud login for prod |

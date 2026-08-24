@@ -80,19 +80,14 @@ cat > "$TRAJECTORY_ROOT/planner/compacted/trajectory-e2e.json" <<'JSON'
 }
 JSON
 
-python3 - <<'PY'
-import json, sqlite3, os
-db = os.environ["OPENCODE_DB"]
-conn = sqlite3.connect(db)
-conn.execute("CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER)")
-conn.execute("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)")
-conn.execute("CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT)")
-conn.execute("INSERT INTO session VALUES ('opencode-e2e', '/tmp/e2e/opencode', 1700000002000)")
-conn.execute("INSERT INTO message VALUES ('msg-e2e', 'opencode-e2e', 1700000002000, ?)", (json.dumps({"role":"user"}),))
-conn.execute("INSERT INTO part VALUES ('part-e2e', 'msg-e2e', 'opencode-e2e', 1700000002000, ?)", (json.dumps({"type":"text","text":"e2e opencode release tagging prompt"}),))
-conn.commit()
-conn.close()
-PY
+sqlite3 "$OPENCODE_DB" <<'SQL'
+CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER);
+CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+INSERT INTO session VALUES ('opencode-e2e', '/tmp/e2e/opencode', 1700000002000);
+INSERT INTO message VALUES ('msg-e2e', 'opencode-e2e', 1700000002000, '{"role":"user"}');
+INSERT INTO part VALUES ('part-e2e', 'msg-e2e', 'opencode-e2e', 1700000002000, '{"type":"text","text":"e2e opencode release tagging prompt"}');
+SQL
 
 "$ROOT/ai-hist" sync
 "$ROOT/ai-hist" tag claude-e2e release-e2e --source claude
@@ -109,32 +104,24 @@ PY
 "$ROOT/ai-hist" stats --json >/dev/null
 "$ROOT/ai-hist" tags --sessions --json >/dev/null
 
-python3 - <<'PY'
-import os, sqlite3
-conn = sqlite3.connect(os.environ["AI_HIST_DB"])
-sources = {row[0] for row in conn.execute("SELECT DISTINCT source FROM history")}
-expected = {"claude", "codex", "cursor", "grok", "opencode", "trajectory"}
-missing = expected - sources
-if missing:
-    raise SystemExit(f"missing sources from Rust sync: {sorted(missing)}")
-codex_project = conn.execute("SELECT project FROM history WHERE source='codex' AND session_id='codex-e2e'").fetchone()[0]
-if codex_project != "/tmp/e2e/codex":
-    raise SystemExit(f"codex project metadata not backfilled: {codex_project!r}")
-claude_session = conn.execute("SELECT cwd, git_branch, last_assistant_text FROM sessions WHERE source='claude' AND session_id='claude-e2e'").fetchone()
-if not claude_session or claude_session[0] != "/tmp/e2e/project" or claude_session[1] != "main" or "assistant summary" not in (claude_session[2] or ""):
-    raise SystemExit(f"claude session metadata missing: {claude_session!r}")
-grok_session = conn.execute("SELECT cwd, git_branch, last_assistant_text FROM sessions WHERE source='grok' AND session_id='grok-e2e'").fetchone()
-if not grok_session or grok_session[0] != "/tmp/e2e/grok" or grok_session[1] != "main" or "grok assistant summary" not in (grok_session[2] or ""):
-    raise SystemExit(f"grok session metadata missing: {grok_session!r}")
-synthetic = conn.execute("SELECT COUNT(*) FROM history WHERE source='grok' AND prompt LIKE '%synthetic prompt%'").fetchone()[0]
-if synthetic:
-    raise SystemExit("grok synthetic prompt was imported")
-conn.close()
-PY
+sources=$(sqlite3 "$AI_HIST_DB" "SELECT group_concat(source, ',') FROM (SELECT DISTINCT source FROM history ORDER BY source)")
+test "$sources" = "claude,codex,cursor,grok,opencode,trajectory"
+
+codex_project=$(sqlite3 "$AI_HIST_DB" "SELECT project FROM history WHERE source='codex' AND session_id='codex-e2e'")
+test "$codex_project" = "/tmp/e2e/codex"
+
+claude_session=$(sqlite3 "$AI_HIST_DB" "SELECT cwd || '|' || git_branch || '|' || last_assistant_text FROM sessions WHERE source='claude' AND session_id='claude-e2e'")
+test "$claude_session" = "/tmp/e2e/project|main|assistant summary"
+
+grok_session=$(sqlite3 "$AI_HIST_DB" "SELECT cwd || '|' || git_branch || '|' || last_assistant_text FROM sessions WHERE source='grok' AND session_id='grok-e2e'")
+test "$grok_session" = "/tmp/e2e/grok|main|grok assistant summary"
+
+synthetic=$(sqlite3 "$AI_HIST_DB" "SELECT COUNT(*) FROM history WHERE source='grok' AND prompt LIKE '%synthetic prompt%'")
+test "$synthetic" = "0"
 
 rust_ai_hist --db "$AI_HIST_DB" tag codex-e2e release-e2e --source codex
 rust_ai_hist --db "$AI_HIST_DB" search release --tag release-e2e --json
 
-(cd "$ROOT/sdk-ts" && npm ci && npm test)
+(cd "$ROOT/sdk-ts" && npm test)
 
 echo "E2E verification completed with temp DB: $AI_HIST_DB"

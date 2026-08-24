@@ -2628,8 +2628,7 @@ fn launchd_plist_path(spec: &ServiceSpec) -> PathBuf {
 }
 
 /// Resolve the absolute path of the running ai-hist binary so the service
-/// invokes it directly — never through a shell wrapper or `python3`, which is
-/// what historically broke the launchd job.
+/// invokes it directly rather than through a development launcher.
 fn service_binary() -> Result<PathBuf> {
     std::env::current_exe().context("could not resolve the ai-hist binary path for the service")
 }

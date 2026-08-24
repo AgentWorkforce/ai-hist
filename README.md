@@ -44,9 +44,9 @@ Make sure `~/.local/bin` is in your `PATH`:
 export PATH="$HOME/.local/bin:$PATH"  # add to .zshrc / .bashrc
 ```
 
-The installer installs deterministic launchers for `ai-hist` and `ai-hist-rust`.
-For normal installs it downloads a prebuilt Rust binary from GitHub Releases, so
-users do not need a local Rust toolchain.
+The installer installs the `ai-hist` launcher. For normal installs it downloads
+a prebuilt Rust binary from GitHub Releases, so users do not need a local Rust
+toolchain.
 
 If no prebuilt binary is available for your platform, the installer falls back
 to building from source. That fallback requires `cargo`; install Rust from
@@ -237,9 +237,8 @@ ai-hist import --watch            # foreground alias for continuous live capture
 ```
 
 `--install-service` points the scheduler directly at the resolved `ai-hist`
-binary (no shell wrapper, no `python3`) and reloads idempotently, so it can't
-fall into the stale-interpreter trap the hand-written plist below historically
-hit. On macOS, pass `--interval <seconds>` to change the cadence (default 60;
+binary and reloads idempotently, avoiding stale development launchers. On
+macOS, pass `--interval <seconds>` to change the cadence (default 60;
 cron runs at 1-minute granularity). Verify health with:
 
 ```bash
@@ -329,8 +328,8 @@ If you prefer to write the launchd plist by hand, sync every 60 seconds with:
 
 The unquoted heredoc (`<< EOF`) expands `$HOME` to an absolute path as the
 file is written — launchd does **not** expand `${HOME}` in `ProgramArguments`,
-so the path must be literal. Point it directly at the `ai-hist` wrapper; do not
-prefix it with `python3` (the wrapper dispatches to the Rust binary itself).
+so the path must be literal. Point it directly at the installed `ai-hist`
+launcher.
 
 ```bash
 cat > ~/Library/LaunchAgents/com.ai-hist.sync.plist << EOF
