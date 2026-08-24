@@ -64,8 +64,8 @@ def _file_identity(stat):
     return getattr(stat, "st_dev", None), getattr(stat, "st_ino", None)
 
 
-def _hash_file_prefix(path: Path, offset: int):
-    """Hash exactly offset bytes, requiring the offset to end at a newline."""
+def _hash_file_prefix_state(path: Path, offset: int):
+    """Build a SHA-256 state for exactly offset newline-terminated bytes."""
     remaining = offset
     digest = hashlib.sha256()
     last = None
@@ -82,13 +82,18 @@ def _hash_file_prefix(path: Path, offset: int):
         return None
     if offset and last != ord("\n"):
         return None
-    return digest.hexdigest()
+    return digest
 
 
-def _new_sync_cursor(stat, rewrite_epoch=0):
+def _hash_file_prefix(path: Path, offset: int):
+    digest = _hash_file_prefix_state(path, offset)
+    return digest.hexdigest() if digest is not None else None
+
+
+def _new_sync_cursor(stat, rewrite_epoch=0, include_hasher=False):
     device, inode = _file_identity(stat)
     observed_at_ns = time.time_ns()
-    return {
+    cursor = {
         "offset": 0,
         "generation": {
             "device": device,
@@ -101,6 +106,9 @@ def _new_sync_cursor(stat, rewrite_epoch=0):
         "observed_mtime_ns": stat.st_mtime_ns,
         "prefix_hash": hashlib.sha256(b"").hexdigest(),
     }
+    if include_hasher:
+        cursor["_prefix_hasher"] = hashlib.sha256()
+    return cursor
 
 
 def _open_sync_cursor(path: Path, value):
@@ -109,7 +117,7 @@ def _open_sync_cursor(path: Path, value):
     if not isinstance(value, dict) or not isinstance(value.get("generation"), dict):
         # Numeric cursors have no file identity. Rescan once while upgrading;
         # history inserts are idempotent, so this cannot duplicate rows.
-        return _new_sync_cursor(stat)
+        return _new_sync_cursor(stat, include_hasher=True)
 
     saved_offset = _sync_offset(value)
     generation = value["generation"]
@@ -121,7 +129,8 @@ def _open_sync_cursor(path: Path, value):
         and device is not None
         and (saved_device, saved_inode) != (device, inode)
     )
-    prefix_hash = _hash_file_prefix(path, saved_offset)
+    prefix_hasher = _hash_file_prefix_state(path, saved_offset)
+    prefix_hash = prefix_hasher.hexdigest() if prefix_hasher is not None else None
     replaced = (
         identity_changed
         or stat.st_size < saved_offset
@@ -131,18 +140,19 @@ def _open_sync_cursor(path: Path, value):
     )
     if replaced:
         epoch = _sync_offset(generation.get("rewrite_epoch", 0)) + 1
-        return _new_sync_cursor(stat, epoch)
+        return _new_sync_cursor(stat, epoch, include_hasher=True)
 
     return {
         "offset": saved_offset,
         "generation": dict(generation),
         "observed_mtime_ns": stat.st_mtime_ns,
         "prefix_hash": prefix_hash,
+        "_prefix_hasher": prefix_hasher,
     }
 
 
 def _commit_sync_cursor(path: Path, opened: dict, offset: int, consumed_prefix_hash=None):
-    """Revalidate the starting prefix before publishing committed progress."""
+    """Verify the consumed prefix before publishing committed progress."""
     stat = path.stat()
     generation = opened["generation"]
     device, inode = _file_identity(stat)
@@ -152,20 +162,11 @@ def _commit_sync_cursor(path: Path, opened: dict, offset: int, consumed_prefix_h
         and device is not None
         and expected != (device, inode)
     )
-    start_offset = _sync_offset(opened)
-    start_hash = _hash_file_prefix(path, start_offset)
-    if (
-        identity_changed
-        or stat.st_size < start_offset
-        or start_hash is None
-        or start_hash != opened.get("prefix_hash")
-    ):
-        epoch = _sync_offset(generation.get("rewrite_epoch", 0)) + 1
-        return _new_sync_cursor(stat, epoch)
-
     committed_hash = _hash_file_prefix(path, offset)
     if (
-        committed_hash is None
+        identity_changed
+        or stat.st_size < offset
+        or committed_hash is None
         or (
             consumed_prefix_hash is not None
             and committed_hash != consumed_prefix_hash
@@ -181,17 +182,20 @@ def _commit_sync_cursor(path: Path, opened: dict, offset: int, consumed_prefix_h
     }
 
 
-def _complete_jsonl_lines(path: Path, offset: int):
+def _complete_jsonl_lines(path: Path, offset: int, prefix_hasher=None):
     """Yield complete records, offsets, and hashes of the bytes consumed."""
     with open(path, "rb") as source:
-        digest = hashlib.sha256()
-        remaining = offset
-        while remaining:
-            chunk = source.read(min(64 * 1024, remaining))
-            if not chunk:
-                return
-            digest.update(chunk)
-            remaining -= len(chunk)
+        digest = prefix_hasher.copy() if prefix_hasher is not None else hashlib.sha256()
+        if prefix_hasher is None:
+            remaining = offset
+            while remaining:
+                chunk = source.read(min(64 * 1024, remaining))
+                if not chunk:
+                    return
+                digest.update(chunk)
+                remaining -= len(chunk)
+        else:
+            source.seek(offset)
         while True:
             raw = source.readline()
             if not raw or not raw.endswith(b"\n"):
@@ -202,6 +206,7 @@ def _complete_jsonl_lines(path: Path, offset: int):
                 source.tell(),
                 digest.hexdigest(),
             )
+
 
 # --- Schema ------------------------------------------------------------------
 
@@ -831,7 +836,9 @@ def sync_codex(conn: sqlite3.Connection, state: dict):
 
     if offset < file_size:
         print(f"  [codex] syncing {file_size - offset:,} new bytes...")
-        for line, line_end, line_hash in _complete_jsonl_lines(path, offset):
+        for line, line_end, line_hash in _complete_jsonl_lines(
+            path, offset, opened_cursor["_prefix_hasher"]
+        ):
             committed_offset = line_end
             consumed_prefix_hash = line_hash
             line = line.strip()
@@ -948,7 +955,9 @@ def sync_cursor(conn: sqlite3.Connection, state: dict):
                     continue
                 ts_ms = int(stat.st_mtime * 1000)
                 committed_offset = offset
-                for line, line_end, line_hash in _complete_jsonl_lines(jsonl, offset):
+                for line, line_end, line_hash in _complete_jsonl_lines(
+                    jsonl, offset, opened_cursor["_prefix_hasher"]
+                ):
                     committed_offset = line_end
                     consumed_prefix_hash = line_hash
                     line = line.strip()
@@ -1670,7 +1679,9 @@ def cmd_sync(args=None):
 
         committed_offset = offset
         consumed_prefix_hash = opened_cursor["prefix_hash"]
-        for line, line_end, line_hash in _complete_jsonl_lines(path, offset):
+        for line, line_end, line_hash in _complete_jsonl_lines(
+            path, offset, opened_cursor["_prefix_hasher"]
+        ):
             committed_offset = line_end
             consumed_prefix_hash = line_hash
             line = line.strip()
