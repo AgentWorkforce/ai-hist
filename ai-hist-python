@@ -58,6 +58,133 @@ def _sync_offset(value) -> int:
     except (TypeError, ValueError):
         return 0
 
+
+def _file_identity(stat):
+    """Return the stable file identity fields used by Rust cursors."""
+    return getattr(stat, "st_dev", None), getattr(stat, "st_ino", None)
+
+
+def _hash_file_prefix(path: Path, offset: int):
+    """Hash exactly offset bytes, requiring the offset to end at a newline."""
+    remaining = offset
+    digest = hashlib.sha256()
+    last = None
+    try:
+        with open(path, "rb") as source:
+            while remaining:
+                chunk = source.read(min(64 * 1024, remaining))
+                if not chunk:
+                    return None
+                digest.update(chunk)
+                last = chunk[-1]
+                remaining -= len(chunk)
+    except OSError:
+        return None
+    if offset and last != ord("\n"):
+        return None
+    return digest.hexdigest()
+
+
+def _new_sync_cursor(stat, rewrite_epoch=0):
+    device, inode = _file_identity(stat)
+    observed_at_ns = time.time_ns()
+    return {
+        "offset": 0,
+        "generation": {
+            "device": device,
+            "inode": inode,
+            "started_mtime_ns": stat.st_mtime_ns,
+            "started_size": stat.st_size,
+            "observed_at_ns": observed_at_ns,
+            "rewrite_epoch": rewrite_epoch,
+        },
+        "observed_mtime_ns": stat.st_mtime_ns,
+        "prefix_hash": hashlib.sha256(b"").hexdigest(),
+    }
+
+
+def _open_sync_cursor(path: Path, value):
+    """Validate a Rust-compatible cursor, safely upgrading legacy offsets."""
+    stat = path.stat()
+    if not isinstance(value, dict) or not isinstance(value.get("generation"), dict):
+        # Numeric cursors have no file identity. Rescan once while upgrading;
+        # history inserts are idempotent, so this cannot duplicate rows.
+        return _new_sync_cursor(stat)
+
+    saved_offset = _sync_offset(value)
+    generation = value["generation"]
+    device, inode = _file_identity(stat)
+    saved_device = generation.get("device")
+    saved_inode = generation.get("inode")
+    identity_changed = (
+        saved_device is not None
+        and device is not None
+        and (saved_device, saved_inode) != (device, inode)
+    )
+    prefix_hash = _hash_file_prefix(path, saved_offset)
+    replaced = (
+        identity_changed
+        or stat.st_size < saved_offset
+        or stat.st_mtime_ns < _sync_offset(value.get("observed_mtime_ns", 0))
+        or prefix_hash is None
+        or prefix_hash != value.get("prefix_hash")
+    )
+    if replaced:
+        epoch = _sync_offset(generation.get("rewrite_epoch", 0)) + 1
+        return _new_sync_cursor(stat, epoch)
+
+    return {
+        "offset": saved_offset,
+        "generation": dict(generation),
+        "observed_mtime_ns": stat.st_mtime_ns,
+        "prefix_hash": prefix_hash,
+    }
+
+
+def _commit_sync_cursor(path: Path, opened: dict, offset: int):
+    """Revalidate the starting prefix before publishing committed progress."""
+    stat = path.stat()
+    generation = opened["generation"]
+    device, inode = _file_identity(stat)
+    expected = generation.get("device"), generation.get("inode")
+    identity_changed = (
+        expected[0] is not None
+        and device is not None
+        and expected != (device, inode)
+    )
+    start_offset = _sync_offset(opened)
+    start_hash = _hash_file_prefix(path, start_offset)
+    if (
+        identity_changed
+        or stat.st_size < start_offset
+        or start_hash is None
+        or start_hash != opened.get("prefix_hash")
+    ):
+        epoch = _sync_offset(generation.get("rewrite_epoch", 0)) + 1
+        return _new_sync_cursor(stat, epoch)
+
+    committed_hash = _hash_file_prefix(path, offset)
+    if committed_hash is None:
+        epoch = _sync_offset(generation.get("rewrite_epoch", 0)) + 1
+        return _new_sync_cursor(stat, epoch)
+    return {
+        "offset": offset,
+        "generation": dict(generation),
+        "observed_mtime_ns": stat.st_mtime_ns,
+        "prefix_hash": committed_hash,
+    }
+
+
+def _complete_jsonl_lines(path: Path, offset: int):
+    """Yield decoded complete records and their committed byte offsets."""
+    with open(path, "rb") as source:
+        source.seek(offset)
+        while True:
+            raw = source.readline()
+            if not raw or not raw.endswith(b"\n"):
+                return
+            yield raw.decode("utf-8", errors="replace"), source.tell()
+
 # --- Schema ------------------------------------------------------------------
 
 SCHEMA = """\
@@ -676,44 +803,45 @@ def sync_codex(conn: sqlite3.Connection, state: dict):
 
     cwds, branches = build_codex_session_map(state)
 
+    opened_cursor = _open_sync_cursor(path, state.get("codex", 0))
     file_size = path.stat().st_size
-    offset = _sync_offset(state.get("codex", 0))
+    offset = _sync_offset(opened_cursor)
+    committed_offset = offset
     inserted = 0
     errors = 0
 
     if offset < file_size:
         print(f"  [codex] syncing {file_size - offset:,} new bytes...")
-        with open(path, "r", encoding="utf-8") as f:
-            f.seek(offset)
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = parse_codex(line)
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    errors += 1
-                    continue
-                if row is None:
-                    continue
-                sid = row.get("session_id")
-                if sid:
-                    if not row.get("project"):
-                        row["project"] = cwds.get(sid)
-                    row["git_branch"] = branches.get(sid)
-                try:
-                    cur = conn.execute(
-                        "INSERT OR IGNORE INTO history "
-                        "(source, session_id, project, prompt, prompt_hash, timestamp_ms, git_branch) "
-                        "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms, :git_branch)",
-                        row,
-                    )
-                    if cur.rowcount > 0:
-                        inserted += 1
-                except sqlite3.Error:
-                    errors += 1
+        for line, line_end in _complete_jsonl_lines(path, offset):
+            committed_offset = line_end
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = parse_codex(line)
+            except (json.JSONDecodeError, KeyError, TypeError):
+                errors += 1
+                continue
+            if row is None:
+                continue
+            sid = row.get("session_id")
+            if sid:
+                if not row.get("project"):
+                    row["project"] = cwds.get(sid)
+                row["git_branch"] = branches.get(sid)
+            try:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO history "
+                    "(source, session_id, project, prompt, prompt_hash, timestamp_ms, git_branch) "
+                    "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms, :git_branch)",
+                    row,
+                )
+                if cur.rowcount > 0:
+                    inserted += 1
+            except sqlite3.Error:
+                errors += 1
         conn.commit()
-        state["codex"] = file_size
+    state["codex"] = _commit_sync_cursor(path, opened_cursor, committed_offset)
 
     backfilled = _backfill_codex_projects(conn, cwds, branches)
 
@@ -791,39 +919,43 @@ def sync_cursor(conn: sqlite3.Connection, state: dict):
             except OSError:
                 errors += 1
                 continue
-            offset = _sync_offset(cursor_state.get(str(jsonl), 0))
+            opened_cursor = _open_sync_cursor(jsonl, cursor_state.get(str(jsonl), 0))
+            offset = _sync_offset(opened_cursor)
             if offset >= stat.st_size:
+                cursor_state[str(jsonl)] = _commit_sync_cursor(jsonl, opened_cursor, offset)
                 continue
             ts_ms = int(stat.st_mtime * 1000)
+            committed_offset = offset
             try:
-                with open(jsonl, "r", encoding="utf-8") as f:
-                    f.seek(offset)
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            text = parse_cursor_line(line)
-                        except (json.JSONDecodeError, KeyError, TypeError):
-                            errors += 1
-                            continue
-                        if not text:
-                            continue
-                        try:
-                            cur = conn.execute(
-                                "INSERT OR IGNORE INTO history "
-                                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
-                                "VALUES (?, ?, ?, ?, ?, ?)",
-                                ("cursor", session_id, project_path, text, _prompt_hash(text), ts_ms),
-                            )
-                            if cur.rowcount > 0:
-                                inserted += 1
-                        except sqlite3.Error:
-                            errors += 1
+                for line, line_end in _complete_jsonl_lines(jsonl, offset):
+                    committed_offset = line_end
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        text = parse_cursor_line(line)
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        errors += 1
+                        continue
+                    if not text:
+                        continue
+                    try:
+                        cur = conn.execute(
+                            "INSERT OR IGNORE INTO history "
+                            "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            ("cursor", session_id, project_path, text, _prompt_hash(text), ts_ms),
+                        )
+                        if cur.rowcount > 0:
+                            inserted += 1
+                    except sqlite3.Error:
+                        errors += 1
             except OSError:
                 errors += 1
                 continue
-            cursor_state[str(jsonl)] = stat.st_size
+            cursor_state[str(jsonl)] = _commit_sync_cursor(
+                jsonl, opened_cursor, committed_offset
+            )
 
     conn.commit()
     state["cursor"] = cursor_state
@@ -1499,9 +1631,11 @@ def cmd_sync(args=None):
             print(f"  [{name}] not found: {path} (skipped)")
             continue
 
+        opened_cursor = _open_sync_cursor(path, state.get(name, 0))
         file_size = path.stat().st_size
-        offset = _sync_offset(state.get(name, 0))
+        offset = _sync_offset(opened_cursor)
         if offset >= file_size:
+            state[name] = _commit_sync_cursor(path, opened_cursor, offset)
             print(f"  [{name}] up to date")
             continue
 
@@ -1510,33 +1644,33 @@ def cmd_sync(args=None):
         inserted = 0
         errors = 0
 
-        with open(path, "r", encoding="utf-8") as f:
-            f.seek(offset)
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = parser(line)
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    errors += 1
-                    continue
-                if row is None:
-                    continue
-                try:
-                    cur = conn.execute(
-                        "INSERT OR IGNORE INTO history "
-                        "(source, session_id, project, prompt, prompt_hash, timestamp_ms, git_branch) "
-                        "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms, :git_branch)",
-                        row,
-                    )
-                    if cur.rowcount > 0:
-                        inserted += 1
-                except sqlite3.Error:
-                    errors += 1
+        committed_offset = offset
+        for line, line_end in _complete_jsonl_lines(path, offset):
+            committed_offset = line_end
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = parser(line)
+            except (json.JSONDecodeError, KeyError, TypeError):
+                errors += 1
+                continue
+            if row is None:
+                continue
+            try:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO history "
+                    "(source, session_id, project, prompt, prompt_hash, timestamp_ms, git_branch) "
+                    "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms, :git_branch)",
+                    row,
+                )
+                if cur.rowcount > 0:
+                    inserted += 1
+            except sqlite3.Error:
+                errors += 1
 
         conn.commit()
-        state[name] = file_size
+        state[name] = _commit_sync_cursor(path, opened_cursor, committed_offset)
         print(f"  [{name}] +{inserted:,} rows" + (f" ({errors} errors)" if errors else ""))
 
     # Sync Claude per-session JSONL files for gitBranch + last assistant text
