@@ -314,6 +314,52 @@ class TestFmtRow:
 # ---------------------------------------------------------------------------
 
 class TestCmdSync:
+    def test_sync_reads_typed_rust_cursor_offsets(self, tmp_env):
+        first = make_claude_entry("already imported", 1700000001000) + "\n"
+        second = make_claude_entry("new from fallback", 1700000002000) + "\n"
+        tmp_env.claude_hist.write_text(first + second)
+        opened = ai_hist._open_sync_cursor(tmp_env.claude_hist, None)
+        cursor = ai_hist._commit_sync_cursor(
+            tmp_env.claude_hist, opened, len(first.encode())
+        )
+        ai_hist.save_state({"claude": cursor})
+
+        ai_hist.cmd_sync()
+
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        prompts = conn.execute(
+            "SELECT prompt FROM history WHERE source = 'claude'"
+        ).fetchall()
+        conn.close()
+        assert prompts == [("new from fallback",)]
+
+    def test_sync_retries_unterminated_generic_and_codex_records(self, tmp_env):
+        claude = make_claude_entry("claude partial", 1700000001000)
+        codex = make_codex_entry("codex partial", 1700000001)
+        tmp_env.claude_hist.write_text(claude[:-1])
+        tmp_env.codex_hist.write_text(codex[:-1])
+
+        ai_hist.cmd_sync()
+        state = ai_hist.load_state()
+        assert state["claude"]["offset"] == 0
+        assert state["codex"]["offset"] == 0
+
+        with open(tmp_env.claude_hist, "a") as source:
+            source.write(claude[-1:] + "\n")
+        with open(tmp_env.codex_hist, "a") as source:
+            source.write(codex[-1:] + "\n")
+        ai_hist.cmd_sync()
+
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        prompts = conn.execute(
+            "SELECT source, prompt FROM history ORDER BY source"
+        ).fetchall()
+        conn.close()
+        assert prompts == [
+            ("claude", "claude partial"),
+            ("codex", "codex partial"),
+        ]
+
     def test_sync_claude_entries(self, tmp_env, capsys):
         tmp_env.claude_hist.write_text(
             make_claude_entry("first prompt", 1700000001000) + "\n"
@@ -347,6 +393,41 @@ class TestCmdSync:
         ai_hist.cmd_sync()
         captured = capsys.readouterr()
         assert "Total: 2" in captured.out
+
+    def test_typed_cursor_resets_after_same_size_replacement(self, tmp_env):
+        original = make_claude_entry("old", 1700000001000, session_id="old") + "\n"
+        replacement = make_claude_entry("new", 1700000002000, session_id="new") + "\n"
+        assert len(original.encode()) == len(replacement.encode())
+        tmp_env.claude_hist.write_text(original)
+        ai_hist.cmd_sync()
+
+        tmp_env.claude_hist.write_text(replacement)
+        ai_hist.cmd_sync()
+
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        prompts = conn.execute(
+            "SELECT prompt FROM history WHERE source='claude' ORDER BY prompt"
+        ).fetchall()
+        conn.close()
+        assert prompts == [("new",), ("old",)]
+        assert ai_hist.load_state()["claude"]["generation"]["rewrite_epoch"] == 1
+
+    def test_checkpoint_rejects_a_rewrite_after_records_are_consumed(self, tmp_env):
+        original = make_claude_entry("old", 1700000001000, session_id="old") + "\n"
+        replacement = make_claude_entry("new", 1700000002000, session_id="new") + "\n"
+        assert len(original.encode()) == len(replacement.encode())
+        tmp_env.claude_hist.write_text(original)
+        opened = ai_hist._open_sync_cursor(tmp_env.claude_hist, None)
+        records = list(ai_hist._complete_jsonl_lines(tmp_env.claude_hist, 0))
+        _, committed_offset, consumed_hash = records[-1]
+
+        tmp_env.claude_hist.write_text(replacement)
+        committed = ai_hist._commit_sync_cursor(
+            tmp_env.claude_hist, opened, committed_offset, consumed_hash
+        )
+
+        assert committed["offset"] == 0
+        assert committed["generation"]["rewrite_epoch"] == 1
 
     def test_sync_up_to_date(self, tmp_env, capsys):
         tmp_env.claude_hist.write_text(make_claude_entry("first", 1700000001000) + "\n")
@@ -1770,6 +1851,23 @@ class TestSyncCursor:
         ai_hist.sync_cursor(conn, {})
         conn.close()
 
+    def test_disappearing_transcript_is_recoverable(self, tmp_env, monkeypatch, capsys):
+        jsonl = make_cursor_session(tmp_env.cursor_root, "P", "s1", ["prompt"])
+        original_open = ai_hist._open_sync_cursor
+
+        def disappearing(path, value):
+            if path == jsonl:
+                raise FileNotFoundError(path)
+            return original_open(path, value)
+
+        monkeypatch.setattr(ai_hist, "_open_sync_cursor", disappearing)
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        ai_hist.sync_cursor(conn, {})
+        conn.close()
+
+        assert "1 errors" in capsys.readouterr().out
+
     def test_imports_user_prompts(self, tmp_env, capsys):
         make_cursor_session(
             tmp_env.cursor_root,
@@ -1828,13 +1926,39 @@ class TestSyncCursor:
         jsonl = make_cursor_session(tmp_env.cursor_root, "P", "s1", ["x"])
         conn = sqlite3.connect(str(tmp_env.db_path))
         ai_hist.init_db(conn)
-        state = {"cursor": {str(jsonl): jsonl.stat().st_size}}
+        opened = ai_hist._open_sync_cursor(jsonl, None)
+        cursor = ai_hist._commit_sync_cursor(jsonl, opened, jsonl.stat().st_size)
+        state = {"cursor": {str(jsonl): cursor}}
         ai_hist.sync_cursor(conn, state)
         count = conn.execute(
             "SELECT COUNT(*) FROM history WHERE source='cursor'"
         ).fetchone()[0]
         conn.close()
         assert count == 0
+
+    def test_retries_unterminated_record(self, tmp_env):
+        session_dir = tmp_env.cursor_root / "P" / "agent-transcripts" / "s1"
+        session_dir.mkdir(parents=True)
+        jsonl = session_dir / "s1.jsonl"
+        complete = json.dumps({
+            "role": "user",
+            "message": {"content": [{"type": "text", "text": "partial"}]},
+        })
+        jsonl.write_text(complete[:-1])
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {}
+
+        ai_hist.sync_cursor(conn, state)
+        assert state["cursor"][str(jsonl)]["offset"] == 0
+        with open(jsonl, "a") as source:
+            source.write(complete[-1:] + "\n")
+        ai_hist.sync_cursor(conn, state)
+        rows = conn.execute(
+            "SELECT prompt FROM history WHERE source='cursor'"
+        ).fetchall()
+        conn.close()
+        assert rows == [("partial",)]
 
     def test_handles_invalid_json(self, tmp_env, capsys):
         session_dir = tmp_env.cursor_root / "P" / "agent-transcripts" / "s1"
