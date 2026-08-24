@@ -141,7 +141,7 @@ def _open_sync_cursor(path: Path, value):
     }
 
 
-def _commit_sync_cursor(path: Path, opened: dict, offset: int):
+def _commit_sync_cursor(path: Path, opened: dict, offset: int, consumed_prefix_hash=None):
     """Revalidate the starting prefix before publishing committed progress."""
     stat = path.stat()
     generation = opened["generation"]
@@ -164,7 +164,13 @@ def _commit_sync_cursor(path: Path, opened: dict, offset: int):
         return _new_sync_cursor(stat, epoch)
 
     committed_hash = _hash_file_prefix(path, offset)
-    if committed_hash is None:
+    if (
+        committed_hash is None
+        or (
+            consumed_prefix_hash is not None
+            and committed_hash != consumed_prefix_hash
+        )
+    ):
         epoch = _sync_offset(generation.get("rewrite_epoch", 0)) + 1
         return _new_sync_cursor(stat, epoch)
     return {
@@ -176,14 +182,26 @@ def _commit_sync_cursor(path: Path, opened: dict, offset: int):
 
 
 def _complete_jsonl_lines(path: Path, offset: int):
-    """Yield decoded complete records and their committed byte offsets."""
+    """Yield complete records, offsets, and hashes of the bytes consumed."""
     with open(path, "rb") as source:
-        source.seek(offset)
+        digest = hashlib.sha256()
+        remaining = offset
+        while remaining:
+            chunk = source.read(min(64 * 1024, remaining))
+            if not chunk:
+                return
+            digest.update(chunk)
+            remaining -= len(chunk)
         while True:
             raw = source.readline()
             if not raw or not raw.endswith(b"\n"):
                 return
-            yield raw.decode("utf-8", errors="replace"), source.tell()
+            digest.update(raw)
+            yield (
+                raw.decode("utf-8", errors="replace"),
+                source.tell(),
+                digest.hexdigest(),
+            )
 
 # --- Schema ------------------------------------------------------------------
 
@@ -807,13 +825,15 @@ def sync_codex(conn: sqlite3.Connection, state: dict):
     file_size = path.stat().st_size
     offset = _sync_offset(opened_cursor)
     committed_offset = offset
+    consumed_prefix_hash = opened_cursor["prefix_hash"]
     inserted = 0
     errors = 0
 
     if offset < file_size:
         print(f"  [codex] syncing {file_size - offset:,} new bytes...")
-        for line, line_end in _complete_jsonl_lines(path, offset):
+        for line, line_end, line_hash in _complete_jsonl_lines(path, offset):
             committed_offset = line_end
+            consumed_prefix_hash = line_hash
             line = line.strip()
             if not line:
                 continue
@@ -841,7 +861,9 @@ def sync_codex(conn: sqlite3.Connection, state: dict):
             except sqlite3.Error:
                 errors += 1
         conn.commit()
-    state["codex"] = _commit_sync_cursor(path, opened_cursor, committed_offset)
+    state["codex"] = _commit_sync_cursor(
+        path, opened_cursor, committed_offset, consumed_prefix_hash
+    )
 
     backfilled = _backfill_codex_projects(conn, cwds, branches)
 
@@ -916,19 +938,19 @@ def sync_cursor(conn: sqlite3.Connection, state: dict):
             files_seen += 1
             try:
                 stat = jsonl.stat()
-            except OSError:
-                errors += 1
-                continue
-            opened_cursor = _open_sync_cursor(jsonl, cursor_state.get(str(jsonl), 0))
-            offset = _sync_offset(opened_cursor)
-            if offset >= stat.st_size:
-                cursor_state[str(jsonl)] = _commit_sync_cursor(jsonl, opened_cursor, offset)
-                continue
-            ts_ms = int(stat.st_mtime * 1000)
-            committed_offset = offset
-            try:
-                for line, line_end in _complete_jsonl_lines(jsonl, offset):
+                opened_cursor = _open_sync_cursor(jsonl, cursor_state.get(str(jsonl), 0))
+                offset = _sync_offset(opened_cursor)
+                consumed_prefix_hash = opened_cursor["prefix_hash"]
+                if offset >= stat.st_size:
+                    cursor_state[str(jsonl)] = _commit_sync_cursor(
+                        jsonl, opened_cursor, offset, consumed_prefix_hash
+                    )
+                    continue
+                ts_ms = int(stat.st_mtime * 1000)
+                committed_offset = offset
+                for line, line_end, line_hash in _complete_jsonl_lines(jsonl, offset):
                     committed_offset = line_end
+                    consumed_prefix_hash = line_hash
                     line = line.strip()
                     if not line:
                         continue
@@ -950,12 +972,12 @@ def sync_cursor(conn: sqlite3.Connection, state: dict):
                             inserted += 1
                     except sqlite3.Error:
                         errors += 1
+                cursor_state[str(jsonl)] = _commit_sync_cursor(
+                    jsonl, opened_cursor, committed_offset, consumed_prefix_hash
+                )
             except OSError:
                 errors += 1
                 continue
-            cursor_state[str(jsonl)] = _commit_sync_cursor(
-                jsonl, opened_cursor, committed_offset
-            )
 
     conn.commit()
     state["cursor"] = cursor_state
@@ -1635,7 +1657,9 @@ def cmd_sync(args=None):
         file_size = path.stat().st_size
         offset = _sync_offset(opened_cursor)
         if offset >= file_size:
-            state[name] = _commit_sync_cursor(path, opened_cursor, offset)
+            state[name] = _commit_sync_cursor(
+                path, opened_cursor, offset, opened_cursor["prefix_hash"]
+            )
             print(f"  [{name}] up to date")
             continue
 
@@ -1645,8 +1669,10 @@ def cmd_sync(args=None):
         errors = 0
 
         committed_offset = offset
-        for line, line_end in _complete_jsonl_lines(path, offset):
+        consumed_prefix_hash = opened_cursor["prefix_hash"]
+        for line, line_end, line_hash in _complete_jsonl_lines(path, offset):
             committed_offset = line_end
+            consumed_prefix_hash = line_hash
             line = line.strip()
             if not line:
                 continue
@@ -1670,7 +1696,9 @@ def cmd_sync(args=None):
                 errors += 1
 
         conn.commit()
-        state[name] = _commit_sync_cursor(path, opened_cursor, committed_offset)
+        state[name] = _commit_sync_cursor(
+            path, opened_cursor, committed_offset, consumed_prefix_hash
+        )
         print(f"  [{name}] +{inserted:,} rows" + (f" ({errors} errors)" if errors else ""))
 
     # Sync Claude per-session JSONL files for gitBranch + last assistant text

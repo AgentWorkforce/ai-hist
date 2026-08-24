@@ -412,6 +412,23 @@ class TestCmdSync:
         assert prompts == [("new",), ("old",)]
         assert ai_hist.load_state()["claude"]["generation"]["rewrite_epoch"] == 1
 
+    def test_checkpoint_rejects_a_rewrite_after_records_are_consumed(self, tmp_env):
+        original = make_claude_entry("old", 1700000001000, session_id="old") + "\n"
+        replacement = make_claude_entry("new", 1700000002000, session_id="new") + "\n"
+        assert len(original.encode()) == len(replacement.encode())
+        tmp_env.claude_hist.write_text(original)
+        opened = ai_hist._open_sync_cursor(tmp_env.claude_hist, None)
+        records = list(ai_hist._complete_jsonl_lines(tmp_env.claude_hist, 0))
+        _, committed_offset, consumed_hash = records[-1]
+
+        tmp_env.claude_hist.write_text(replacement)
+        committed = ai_hist._commit_sync_cursor(
+            tmp_env.claude_hist, opened, committed_offset, consumed_hash
+        )
+
+        assert committed["offset"] == 0
+        assert committed["generation"]["rewrite_epoch"] == 1
+
     def test_sync_up_to_date(self, tmp_env, capsys):
         tmp_env.claude_hist.write_text(make_claude_entry("first", 1700000001000) + "\n")
         ai_hist.cmd_sync()
@@ -1833,6 +1850,23 @@ class TestSyncCursor:
         ai_hist.init_db(conn)
         ai_hist.sync_cursor(conn, {})
         conn.close()
+
+    def test_disappearing_transcript_is_recoverable(self, tmp_env, monkeypatch, capsys):
+        jsonl = make_cursor_session(tmp_env.cursor_root, "P", "s1", ["prompt"])
+        original_open = ai_hist._open_sync_cursor
+
+        def disappearing(path, value):
+            if path == jsonl:
+                raise FileNotFoundError(path)
+            return original_open(path, value)
+
+        monkeypatch.setattr(ai_hist, "_open_sync_cursor", disappearing)
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        ai_hist.sync_cursor(conn, {})
+        conn.close()
+
+        assert "1 errors" in capsys.readouterr().out
 
     def test_imports_user_prompts(self, tmp_env, capsys):
         make_cursor_session(
