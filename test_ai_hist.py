@@ -314,6 +314,26 @@ class TestFmtRow:
 # ---------------------------------------------------------------------------
 
 class TestCmdSync:
+    def test_sync_reads_typed_rust_cursor_offsets(self, tmp_env):
+        first = make_claude_entry("already imported", 1700000001000) + "\n"
+        second = make_claude_entry("new from fallback", 1700000002000) + "\n"
+        tmp_env.claude_hist.write_text(first + second)
+        ai_hist.save_state({
+            "claude": {
+                "offset": len(first.encode()),
+                "generation": {"device": 1, "inode": 2},
+            }
+        })
+
+        ai_hist.cmd_sync()
+
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        prompts = conn.execute(
+            "SELECT prompt FROM history WHERE source = 'claude'"
+        ).fetchall()
+        conn.close()
+        assert prompts == [("new from fallback",)]
+
     def test_sync_claude_entries(self, tmp_env, capsys):
         tmp_env.claude_hist.write_text(
             make_claude_entry("first prompt", 1700000001000) + "\n"

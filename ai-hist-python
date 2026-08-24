@@ -48,6 +48,16 @@ TRAJECTORY_ROOT = os.environ.get("TRAJECTORY_ROOT", "")
 DEFAULT_TRAJECTORY_SEARCH_ROOT = Path.home() / "Projects"
 SOURCE_CHOICES = ["claude", "codex", "cursor", "grok", "relay", "trajectory", "opencode"]
 
+
+def _sync_offset(value) -> int:
+    """Read either a legacy numeric offset or Rust's typed cursor object."""
+    if isinstance(value, dict):
+        value = value.get("offset", 0)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
 # --- Schema ------------------------------------------------------------------
 
 SCHEMA = """\
@@ -667,7 +677,7 @@ def sync_codex(conn: sqlite3.Connection, state: dict):
     cwds, branches = build_codex_session_map(state)
 
     file_size = path.stat().st_size
-    offset = state.get("codex", 0)
+    offset = _sync_offset(state.get("codex", 0))
     inserted = 0
     errors = 0
 
@@ -781,7 +791,7 @@ def sync_cursor(conn: sqlite3.Connection, state: dict):
             except OSError:
                 errors += 1
                 continue
-            offset = cursor_state.get(str(jsonl), 0)
+            offset = _sync_offset(cursor_state.get(str(jsonl), 0))
             if offset >= stat.st_size:
                 continue
             ts_ms = int(stat.st_mtime * 1000)
@@ -1490,7 +1500,7 @@ def cmd_sync(args=None):
             continue
 
         file_size = path.stat().st_size
-        offset = state.get(name, 0)
+        offset = _sync_offset(state.get(name, 0))
         if offset >= file_size:
             print(f"  [{name}] up to date")
             continue

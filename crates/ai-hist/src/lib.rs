@@ -2,8 +2,8 @@ use ai_hist_core::convergence::MachineIdentity;
 use ai_hist_core::{
     default_db_path, import_json, insert_history, normalize_tag_name, open_db, open_db_readonly,
     parse_cursor_text, prompt_hash, raw_fts_query_error, recent, resume_command, schema_is_current,
-    search, session, sync_opencode_db, untag_session, HistoryEntry, QueryFilter,
-    SourceDatabaseError, SOURCE_CHOICES,
+    search, session, session_events, session_file_edits, session_tool_calls, sync_opencode_db,
+    untag_session, HistoryEntry, QueryFilter, SourceDatabaseError, SOURCE_CHOICES,
 };
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
@@ -14,6 +14,7 @@ use flate2::Compression;
 use rusqlite::{params, Connection, ErrorCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
@@ -48,6 +49,15 @@ pub struct SyncPushOutcome {
     pub authenticated: bool,
     /// `true` when another process owned the scan lock. Already-indexed rows are still pushed.
     pub sync_skipped: bool,
+}
+
+/// Refresh local agent history without performing any cloud operation.
+/// Embedding applications should use this before opening the local catalog.
+/// When another process owns the sync lock the refresh is skipped — the
+/// concurrent scan is already producing the fresh data this caller wants.
+pub fn sync_local() -> Result<()> {
+    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    sync_exclusive(&default_db_path()).map(|_| ())
 }
 
 /// Sync local agent history into the DB, then push new records to
@@ -162,6 +172,18 @@ enum Command {
         tag: Option<String>,
         #[arg(long)]
         full: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replay one session's normalized events: messages, thinking, tool calls, and file edits.
+    Events {
+        session_id: String,
+        #[arg(long)]
+        source: Option<String>,
+        /// Truncate event text to this many characters in the readable view (0 = no limit).
+        #[arg(long, default_value_t = 240)]
+        width: usize,
+        /// Emit JSON lines: {"type":"event"|"tool_call"|"file_edit", ...} per row.
         #[arg(long)]
         json: bool,
     },
@@ -525,6 +547,7 @@ fn is_read_only(command: &Command) -> bool {
         Command::Search { .. }
             | Command::Recent { .. }
             | Command::Session { .. }
+            | Command::Events { .. }
             | Command::Show { .. }
             | Command::Context { .. }
             | Command::Stats { .. }
@@ -675,6 +698,26 @@ pub fn run() -> Result<()> {
                 std::process::exit(1);
             }
             print_session_entries(&session_id, rows, json, full)
+        }
+        Command::Events {
+            session_id,
+            source,
+            width,
+            json,
+        } => {
+            validate_source(source.as_deref())?;
+            let events = session_events(&conn, &session_id, source.as_deref())?;
+            let tool_calls = session_tool_calls(&conn, &session_id, source.as_deref())?;
+            let file_edits = session_file_edits(&conn, &session_id, source.as_deref())?;
+            if events.is_empty() && tool_calls.is_empty() {
+                // JSON mode emits record lines only; an empty session is just
+                // an empty stream plus the exit code.
+                if !json {
+                    println!("No events for session {session_id}");
+                }
+                std::process::exit(1);
+            }
+            print_session_events(&session_id, events, tool_calls, file_edits, width, json)
         }
         Command::Show { id, json } => show_entry(&conn, id, json),
         Command::Context { id, window } => show_context(&conn, id, window),
@@ -1272,6 +1315,89 @@ fn fmt_search_row(row: &SearchRow) -> String {
         row.text.replace('\n', " ")
     };
     format!("  #{:<5} {}  ({}){}  {}", row.id, dt, label, project, text)
+}
+
+fn print_session_events(
+    session_id: &str,
+    events: Vec<ai_hist_core::SessionEvent>,
+    tool_calls: Vec<ai_hist_core::SessionToolCall>,
+    file_edits: Vec<ai_hist_core::SessionFileEdit>,
+    width: usize,
+    json: bool,
+) -> Result<()> {
+    if json {
+        // One replay stream, merged chronologically across the three record
+        // types (unknown timestamps last, ties broken by row id). Sorting
+        // references and serializing at write time keeps peak memory at the
+        // fetched rows themselves, not a second serialized copy.
+        enum ReplayRecord<'a> {
+            Event(&'a ai_hist_core::SessionEvent),
+            ToolCall(&'a ai_hist_core::SessionToolCall),
+            FileEdit(&'a ai_hist_core::SessionFileEdit),
+        }
+        let mut records: Vec<(Option<i64>, i64, ReplayRecord)> = Vec::new();
+        for event in &events {
+            records.push((Some(event.ts_ms), event.id, ReplayRecord::Event(event)));
+        }
+        for call in &tool_calls {
+            records.push((call.ts_ms, call.id, ReplayRecord::ToolCall(call)));
+        }
+        for edit in &file_edits {
+            records.push((edit.ts_ms, edit.id, ReplayRecord::FileEdit(edit)));
+        }
+        records.sort_by_key(|(ts, id, _)| (ts.is_none(), ts.unwrap_or(0), *id));
+        for (_, _, record) in records {
+            let line = match record {
+                ReplayRecord::Event(event) => {
+                    serde_json::to_string(&json!({ "type": "event", "record": event }))?
+                }
+                ReplayRecord::ToolCall(call) => {
+                    serde_json::to_string(&json!({ "type": "tool_call", "record": call }))?
+                }
+                ReplayRecord::FileEdit(edit) => {
+                    serde_json::to_string(&json!({ "type": "file_edit", "record": edit }))?
+                }
+            };
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    println!(
+        "  Session {session_id}: {} events, {} tool calls, {} file edits\n",
+        events.len(),
+        tool_calls.len(),
+        file_edits.len()
+    );
+    for event in &events {
+        let text = event.text.as_deref().unwrap_or("");
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let shown = if width > 0 && flat.chars().count() > width {
+            format!("{}…", flat.chars().take(width).collect::<String>())
+        } else {
+            flat
+        };
+        println!(
+            "  {}  {:<11} {}",
+            format_datetime(event.ts_ms),
+            format!("{}/{}", event.role, event.kind),
+            shown
+        );
+    }
+    // Tool calls already render above as their tool_use events; file edits
+    // have no event row, so list them explicitly.
+    if !file_edits.is_empty() {
+        println!("\n  Files changed:");
+        for edit in &file_edits {
+            let counts = match (edit.lines_added, edit.lines_removed) {
+                (Some(added), Some(removed)) if added + removed > 0 => {
+                    format!(" (+{added} -{removed})")
+                }
+                _ => String::new(),
+            };
+            println!("    {}{}", edit.file_path, counts);
+        }
+    }
+    Ok(())
 }
 
 fn print_session_entries(
@@ -3697,15 +3823,67 @@ fn load_sync_state(path: &Path) -> Result<Map<String, Value>> {
 /// leaves the previous state intact when a write fails, so the worst case is a
 /// re-scan rather than corruption.
 fn checkpoint_sync_state(path: &Path, state: &Map<String, Value>) {
-    match merged_sync_state(path, state) {
-        // Disk is already current; skip the rewrite.
-        Ok(None) => {}
-        Ok(Some(merged)) => {
-            if let Err(err) = save_sync_state(path, &merged) {
-                eprintln!("ai-hist: could not checkpoint sync state: {err:#}");
+    let checkpoint = || -> Result<()> {
+        let _lock = SyncStateLock::acquire(path)?;
+        match merged_sync_state(path, state)? {
+            // Disk is already current; skip the rewrite.
+            None => Ok(()),
+            Some(merged) => save_sync_state(path, &merged),
+        }
+    };
+    if let Err(err) = checkpoint() {
+        eprintln!("ai-hist: could not checkpoint sync state: {err:#}");
+    }
+}
+
+/// Serializes the complete load/merge/rename operation. Atomic rename prevents
+/// torn JSON, but without this lock two writers can both merge from the same
+/// snapshot and the later rename can still discard the earlier update.
+struct SyncStateLock {
+    file: fs::File,
+}
+
+impl SyncStateLock {
+    fn acquire(state_path: &Path) -> Result<Self> {
+        Self::acquire_with_timeout(state_path, SYNC_STATE_LOCK_TIMEOUT)
+    }
+
+    fn acquire_with_timeout(state_path: &Path, timeout: Duration) -> Result<Self> {
+        let parent = state_path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let name = state_path
+            .file_name()
+            .context("sync-state path has no file name")?;
+        let mut lock_name = name.to_os_string();
+        lock_name.push(".lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(parent.join(lock_name))?;
+        let started = std::time::Instant::now();
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if started.elapsed() >= timeout {
+                        anyhow::bail!("sync-state lock remained busy for {timeout:?}");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error.into()),
             }
         }
-        Err(err) => eprintln!("ai-hist: could not checkpoint sync state: {err:#}"),
+        Ok(Self { file })
+    }
+}
+
+const SYNC_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+impl Drop for SyncStateLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
     }
 }
 
@@ -3756,23 +3934,30 @@ fn merge_sync_value(on_disk: &Value, ours: &Value) -> Value {
         (Some(DecodedFileCursor::Legacy(on_disk)), Some(DecodedFileCursor::Legacy(ours))) => {
             json!(on_disk.max(ours))
         }
+        _ if on_disk.is_object() && ours.is_object() => merge_object_values(on_disk, ours),
         _ if on_disk == ours => on_disk.clone(),
         _ => ours.clone(),
     }
 }
 
-fn merge_file_cursor_map(on_disk: &Value, ours: &Value) -> Value {
-    let (Some(on_disk), Some(ours)) = (on_disk.as_object(), ours.as_object()) else {
-        return merge_sync_value(on_disk, ours);
-    };
+fn merge_object_values(on_disk: &Value, ours: &Value) -> Value {
+    let on_disk = on_disk.as_object().expect("checked object");
+    let ours = ours.as_object().expect("checked object");
     let mut merged = on_disk.clone();
-    for (path, cursor) in ours {
+    for (key, value) in ours {
         let next = merged
-            .get(path)
-            .map_or_else(|| cursor.clone(), |saved| merge_sync_value(saved, cursor));
-        merged.insert(path.clone(), next);
+            .get(key)
+            .map_or_else(|| value.clone(), |saved| merge_sync_value(saved, value));
+        merged.insert(key.clone(), next);
     }
     Value::Object(merged)
+}
+
+fn merge_file_cursor_map(on_disk: &Value, ours: &Value) -> Value {
+    if !on_disk.is_object() || !ours.is_object() {
+        return merge_sync_value(on_disk, ours);
+    }
+    merge_object_values(on_disk, ours)
 }
 
 const STALE_SYNC_STATE_TMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -3902,6 +4087,9 @@ struct FileGeneration {
     started_mtime_ns: u64,
     started_size: u64,
     observed_at_ns: u64,
+    /// Monotonic per-path generation for rewrites that retain the same inode.
+    #[serde(default)]
+    rewrite_epoch: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3911,6 +4099,10 @@ struct FileCursor {
     generation: FileGeneration,
     /// Latest mtime seen for this generation, used to catch backwards rewrites.
     observed_mtime_ns: u64,
+    /// SHA-256 of every complete byte through `offset`. Rebuilding and checking
+    /// it detects in-place rewrites that regrow past the cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prefix_hash: Option<String>,
 }
 
 enum DecodedFileCursor {
@@ -3933,10 +4125,25 @@ impl FileCursor {
     }
 
     fn same_generation(&self, other: &Self) -> bool {
-        self.generation.device == other.generation.device
-            && self.generation.inode == other.generation.inode
-            && self.generation.started_mtime_ns == other.generation.started_mtime_ns
-            && self.generation.started_size == other.generation.started_size
+        let same_identity = self.same_known_identity(other).unwrap_or({
+            self.generation.started_mtime_ns == other.generation.started_mtime_ns
+                && self.generation.started_size == other.generation.started_size
+        });
+        same_identity && self.generation.rewrite_epoch == other.generation.rewrite_epoch
+    }
+
+    fn same_known_identity(&self, other: &Self) -> Option<bool> {
+        match (
+            self.generation.device,
+            self.generation.inode,
+            other.generation.device,
+            other.generation.inode,
+        ) {
+            (Some(left_device), Some(left_inode), Some(right_device), Some(right_inode)) => {
+                Some((left_device, left_inode) == (right_device, right_inode))
+            }
+            _ => None,
+        }
     }
 
     fn generation_order(&self) -> (u64, u64, Option<u64>, Option<u64>, u64) {
@@ -3958,6 +4165,14 @@ impl FileCursor {
             };
             winner.observed_mtime_ns = winner.observed_mtime_ns.max(other.observed_mtime_ns);
             winner
+        } else if on_disk.same_known_identity(&ours) == Some(true)
+            && on_disk.generation.rewrite_epoch != ours.generation.rewrite_epoch
+        {
+            if ours.generation.rewrite_epoch > on_disk.generation.rewrite_epoch {
+                ours
+            } else {
+                on_disk
+            }
         } else if ours.generation_order() > on_disk.generation_order() {
             ours
         } else {
@@ -3994,9 +4209,16 @@ fn metadata_identity(_metadata: &fs::Metadata) -> (Option<u64>, Option<u64>) {
 }
 
 struct CompleteJsonlReader {
+    path: PathBuf,
     reader: BufReader<fs::File>,
     cursor: FileCursor,
     position: u64,
+    prefix_hasher: Sha256,
+    start_offset: u64,
+    start_prefix_hash: String,
+    validated_size: u64,
+    validated_mtime_ns: u64,
+    reset_cursor: Option<FileCursor>,
 }
 
 impl CompleteJsonlReader {
@@ -4008,13 +4230,23 @@ impl CompleteJsonlReader {
         let (device, inode) = metadata_identity(&metadata);
         let decoded = saved.and_then(FileCursor::decode);
 
-        let (offset, generation) = match decoded {
+        let (offset, generation, prefix_hasher) = match decoded {
             Some(DecodedFileCursor::Typed(saved)) => {
                 let identity_changed = saved.generation.device.is_some()
                     && device.is_some()
                     && (saved.generation.device, saved.generation.inode) != (device, inode);
-                let replaced =
-                    identity_changed || size < saved.offset || mtime_ns < saved.observed_mtime_ns;
+                let verified_prefix = (size >= saved.offset)
+                    .then(|| hash_file_prefix(path, saved.offset))
+                    .transpose()
+                    .ok()
+                    .flatten();
+                let prefix_changed = verified_prefix.as_ref().is_none_or(|(current, _)| {
+                    saved.prefix_hash.as_deref() != Some(current.as_str())
+                });
+                let replaced = identity_changed
+                    || size < saved.offset
+                    || mtime_ns < saved.observed_mtime_ns
+                    || prefix_changed;
                 if replaced {
                     (
                         0,
@@ -4024,21 +4256,34 @@ impl CompleteJsonlReader {
                             started_mtime_ns: mtime_ns,
                             started_size: size,
                             observed_at_ns: now_ns(),
+                            rewrite_epoch: saved.generation.rewrite_epoch.saturating_add(1),
                         },
+                        Sha256::new(),
                     )
                 } else {
-                    (saved.offset, saved.generation)
+                    (
+                        saved.offset,
+                        saved.generation,
+                        verified_prefix
+                            .expect("validated typed cursor has a prefix hash")
+                            .1,
+                    )
                 }
             }
-            Some(DecodedFileCursor::Legacy(saved)) if saved <= size => (
-                saved,
+            // A numeric cursor has no generation or prefix identity. Seeking
+            // to it could permanently skip the prefix of a replacement file,
+            // so upgrade safely by rescanning once; inserts are idempotent.
+            Some(DecodedFileCursor::Legacy(_)) => (
+                0,
                 FileGeneration {
                     device,
                     inode,
                     started_mtime_ns: mtime_ns,
                     started_size: size,
                     observed_at_ns: now_ns(),
+                    rewrite_epoch: 0,
                 },
+                Sha256::new(),
             ),
             _ => (
                 0,
@@ -4048,20 +4293,31 @@ impl CompleteJsonlReader {
                     started_mtime_ns: mtime_ns,
                     started_size: size,
                     observed_at_ns: now_ns(),
+                    rewrite_epoch: 0,
                 },
+                Sha256::new(),
             ),
         };
 
+        let prefix_hash = finish_prefix_hash(&prefix_hasher);
         let mut reader = BufReader::new(file);
         reader.seek(std::io::SeekFrom::Start(offset))?;
         Ok(Self {
+            path: path.to_path_buf(),
             reader,
             cursor: FileCursor {
                 offset,
                 generation,
                 observed_mtime_ns: mtime_ns,
+                prefix_hash: Some(prefix_hash.clone()),
             },
             position: offset,
+            prefix_hasher,
+            start_offset: offset,
+            start_prefix_hash: prefix_hash,
+            validated_size: size,
+            validated_mtime_ns: mtime_ns,
+            reset_cursor: None,
         })
     }
 
@@ -4069,20 +4325,90 @@ impl CompleteJsonlReader {
     /// uncommitted and will be read again after the writer completes it.
     fn next_line(&mut self, line: &mut String) -> Result<Option<u64>> {
         line.clear();
-        let read = self.reader.read_line(line)?;
-        if read == 0 || !line.ends_with('\n') {
+        let mut raw = Vec::new();
+        let read = self.reader.read_until(b'\n', &mut raw)?;
+        if read == 0 || raw.last() != Some(&b'\n') {
             return Ok(None);
         }
+        line.push_str(&String::from_utf8_lossy(&raw));
         self.position += read as u64;
+        self.prefix_hasher.update(&raw);
         Ok(Some(self.position))
     }
 
-    fn committed_cursor(&self, offset: u64) -> Result<FileCursor> {
+    fn committed_cursor(&mut self, offset: u64, force_validation: bool) -> Result<FileCursor> {
+        if let Some(cursor) = &self.reset_cursor {
+            return Ok(cursor.clone());
+        }
+        let current = fs::File::open(&self.path)?;
+        let metadata = current.metadata()?;
+        let mtime_ns = metadata_mtime_ns(&metadata);
+        let identity = metadata_identity(&metadata);
+        let expected_identity = (self.cursor.generation.device, self.cursor.generation.inode);
+        let identity_changed =
+            expected_identity.0.is_some() && identity.0.is_some() && identity != expected_identity;
+        let metadata_changed = metadata.len() != self.validated_size
+            || mtime_ns != self.validated_mtime_ns
+            || identity_changed;
+        let prefix_is_valid = (!force_validation && !metadata_changed)
+            || (!identity_changed
+                && metadata.len() >= self.start_offset
+                && hash_file_prefix(&self.path, self.start_offset)
+                    .is_ok_and(|(hash, _)| hash == self.start_prefix_hash));
+        if !prefix_is_valid {
+            let reset = FileCursor {
+                offset: 0,
+                generation: FileGeneration {
+                    device: identity.0,
+                    inode: identity.1,
+                    started_mtime_ns: mtime_ns,
+                    started_size: metadata.len(),
+                    observed_at_ns: now_ns(),
+                    rewrite_epoch: self.cursor.generation.rewrite_epoch.saturating_add(1),
+                },
+                observed_mtime_ns: mtime_ns,
+                prefix_hash: Some(empty_prefix_hash()),
+            };
+            self.reset_cursor = Some(reset.clone());
+            return Ok(reset);
+        }
+        self.validated_size = metadata.len();
+        self.validated_mtime_ns = mtime_ns;
         let mut cursor = self.cursor.clone();
         cursor.offset = offset;
-        cursor.observed_mtime_ns = metadata_mtime_ns(&self.reader.get_ref().metadata()?);
+        cursor.observed_mtime_ns = mtime_ns;
+        cursor.prefix_hash = Some(finish_prefix_hash(&self.prefix_hasher));
         Ok(cursor)
     }
+}
+
+fn empty_prefix_hash() -> String {
+    format!("{:x}", Sha256::digest([]))
+}
+
+fn finish_prefix_hash(hasher: &Sha256) -> String {
+    format!("{:x}", hasher.clone().finalize())
+}
+
+fn hash_file_prefix(path: &Path, offset: u64) -> Result<(String, Sha256)> {
+    let mut file = fs::File::open(path)?;
+    let mut remaining = offset;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut last = None;
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = file.read(&mut buffer[..wanted])?;
+        anyhow::ensure!(read > 0, "cursor offset extends past end of file");
+        hasher.update(&buffer[..read]);
+        last = Some(buffer[read - 1]);
+        remaining -= read as u64;
+    }
+    anyhow::ensure!(
+        offset == 0 || last == Some(b'\n'),
+        "cursor offset is not a complete-line boundary"
+    );
+    Ok((finish_prefix_hash(&hasher), hasher))
 }
 
 fn sync_jsonl_incremental(
@@ -4100,17 +4426,20 @@ fn sync_jsonl_incremental(
     let mut source = CompleteJsonlReader::open(path, state.get(name))?;
     let offset = source.position;
     let size = source.reader.get_ref().metadata()?.len();
-    let opened_cursor = source.committed_cursor(offset)?.to_value();
+    let opened_cursor = source.cursor.to_value();
     if offset >= size && state.get(name) == Some(&opened_cursor) {
         sync_note!("  [{name}] up to date");
         return Ok(0);
     }
-    sync_note!("  [{name}] syncing {} new bytes...", size - offset);
+    sync_note!(
+        "  [{name}] syncing {} new bytes...",
+        size.saturating_sub(offset)
+    );
     let mut inserted = 0;
     let mut errors = 0;
     // Byte position of the last line handed to the database, tracked as we read
-    // so a checkpoint records exactly what is committed. The file is append-only,
-    // so this offset stays valid across runs.
+    // so a checkpoint records exactly what is committed. Generation and prefix
+    // validation determine whether this offset remains valid across runs.
     let mut consumed = offset;
     let ingest = {
         let mut run = || -> Result<()> {
@@ -4134,7 +4463,7 @@ fn sync_jsonl_incremental(
                     conn.execute_batch("COMMIT")?;
                     state.insert(
                         name.to_string(),
-                        source.committed_cursor(consumed)?.to_value(),
+                        source.committed_cursor(consumed, false)?.to_value(),
                     );
                     checkpoint(state);
                     conn.execute_batch("BEGIN")?;
@@ -4144,7 +4473,7 @@ fn sync_jsonl_incremental(
             conn.execute_batch("COMMIT")?;
             state.insert(
                 name.to_string(),
-                source.committed_cursor(consumed)?.to_value(),
+                source.committed_cursor(consumed, true)?.to_value(),
             );
             Ok(())
         };
@@ -4167,16 +4496,15 @@ fn sync_jsonl_incremental(
 }
 
 fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) -> Result<usize> {
-    let (cwds, branches) = build_codex_session_maps(state, home)?;
+    let (cwds, branches, mut inserted) = sync_codex_rollouts(conn, state, home)?;
     let path = home.join(".codex/history.jsonl");
     if !path.exists() {
         sync_note!("  [codex] not found: {} (skipped)", path.display());
-        return Ok(0);
+        return Ok(inserted);
     }
     let mut source = CompleteJsonlReader::open(&path, state.get("codex"))?;
     let offset = source.position;
     let size = source.reader.get_ref().metadata()?.len();
-    let mut inserted = 0;
     let mut errors = 0;
     let mut consumed = offset;
     if offset < size {
@@ -4203,10 +4531,13 @@ fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) ->
     }
     // This also upgrades legacy numeric cursors at EOF. The actual committed
     // position may include complete lines appended after the initial stat.
-    state.insert(
-        "codex".to_string(),
-        source.committed_cursor(consumed)?.to_value(),
-    );
+    let opened_cursor = source.cursor.to_value();
+    if consumed != offset || state.get("codex") != Some(&opened_cursor) {
+        state.insert(
+            "codex".to_string(),
+            source.committed_cursor(consumed, true)?.to_value(),
+        );
+    }
     let backfilled = backfill_codex_metadata(conn, &cwds, &branches)?;
     if consumed == offset && backfilled == 0 {
         sync_note!("  [codex] up to date");
@@ -4226,34 +4557,36 @@ fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) ->
     Ok(inserted)
 }
 
-fn build_codex_session_maps(
+/// One pass over every Codex rollout file: session metadata (cwd/branch maps
+/// plus `sessions` rows), user prompts into `history`, and the full
+/// conversation into `session_events` / `tool_calls` / `file_edits`.
+///
+/// Replaces the earlier split walks (state keys `codex_rollouts` and
+/// `codex_rollout_user_messages_v2`) with one stamp map, `codex_rollouts_v3`,
+/// whose per-file record also carries the session id so a wiped database
+/// forces re-ingestion even when the file stamp is unchanged.
+/// (session cwds, session branches, prompts inserted).
+type CodexRolloutWalk = (HashMap<String, String>, HashMap<String, String>, usize);
+
+fn sync_codex_rollouts(
+    conn: &Connection,
     state: &mut Map<String, Value>,
     home: &Path,
-) -> Result<(HashMap<String, String>, HashMap<String, String>)> {
-    let mut cwds = state
-        .get("codex_session_cwds")
-        .and_then(Value::as_object)
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect::<HashMap<_, _>>()
-        })
-        .unwrap_or_default();
-    let mut branches = state
-        .get("codex_session_branches")
-        .and_then(Value::as_object)
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect::<HashMap<_, _>>()
-        })
-        .unwrap_or_default();
+) -> Result<CodexRolloutWalk> {
+    let mut cwds = load_state_string_map(state, "codex_session_cwds");
+    let mut branches = load_state_string_map(state, "codex_session_branches");
     let mut seen = state
-        .get("codex_rollouts")
+        .get("codex_rollouts_v3")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    // Superseded stamp maps from the split-walk era; keeping them would carry
+    // three path->stamp maps over the same 2K-file tree in .sync-state.json.
+    state.remove("codex_rollouts");
+    state.remove("codex_rollout_user_messages_v2");
+    let mut inserted = 0;
     let mut scanned = 0;
+    let mut events = 0usize;
     for root in [
         home.join(".codex/sessions"),
         home.join(".codex/archived_sessions"),
@@ -4263,25 +4596,76 @@ fn build_codex_session_maps(
         }
         for rollout in collect_matching_files(&root, "rollout-", "jsonl")? {
             let key = rollout.to_string_lossy().to_string();
-            let modified = file_stamp(&rollout)?;
-            if seen.get(&key).and_then(Value::as_str) == Some(modified.as_str()) {
-                continue;
-            }
-            seen.insert(key, json!(modified));
-            scanned += 1;
-            if let Some((session_id, cwd, branch)) = read_codex_session_meta(&rollout)? {
-                cwds.insert(session_id.clone(), cwd);
-                if let Some(branch) = branch {
-                    branches.insert(session_id, branch);
+            let stamp = file_stamp(&rollout)?;
+            let record = seen.get(&key).and_then(Value::as_object);
+            let stamp_unchanged = record
+                .map(|r| r.get("stamp").and_then(Value::as_str) == Some(stamp.as_str()))
+                .unwrap_or(false);
+            if stamp_unchanged {
+                match record
+                    .and_then(|r| r.get("session"))
+                    .and_then(Value::as_str)
+                {
+                    // No session id was recorded because the file had no
+                    // usable session_meta; there is nothing to re-ingest.
+                    None => continue,
+                    Some(id) if codex_session_events_exist(conn, id)? => continue,
+                    // Stamp matches but the events are gone (wiped or rebuilt
+                    // database): fall through and re-ingest.
+                    _ => {}
                 }
             }
+            let Some(meta) = read_codex_session_meta(&rollout)? else {
+                seen.insert(key, json!({ "stamp": stamp }));
+                continue;
+            };
+            scanned += 1;
+            if meta.is_subagent {
+                // Earlier syncs (before subagent detection) registered these
+                // threads: their map entries feed backfill_codex_metadata and
+                // their history rows feed session discovery, either of which
+                // would resurrect the session row this walk refuses to create.
+                cwds.remove(&meta.session_id);
+                branches.remove(&meta.session_id);
+                conn.execute(
+                    "DELETE FROM history WHERE source = 'codex' AND session_id = ?",
+                    [meta.session_id.as_str()],
+                )?;
+                conn.execute(
+                    "DELETE FROM sessions WHERE source = 'codex' AND session_id = ?",
+                    [meta.session_id.as_str()],
+                )?;
+            } else {
+                cwds.insert(meta.session_id.clone(), meta.cwd.clone());
+                if let Some(branch) = &meta.git_branch {
+                    branches.insert(meta.session_id.clone(), branch.clone());
+                }
+            }
+            let outcome = ingest_codex_rollout(conn, &rollout, &meta)?;
+            inserted += outcome.prompts;
+            events += outcome.events;
+            // Subagent threads (guardian/reviewer spawns) keep their events
+            // under their own thread id but stay out of the session list.
+            if !meta.is_subagent {
+                if let Some(first) = outcome.first_ts {
+                    upsert_session(
+                        conn,
+                        &meta.session_id,
+                        "codex",
+                        Some(&meta.cwd),
+                        meta.git_branch.as_deref(),
+                        first,
+                        outcome.last_ts.unwrap_or(first),
+                        outcome.last_assistant_text.as_deref(),
+                        Some(&rollout.to_string_lossy()),
+                    )?;
+                }
+            }
+            seen.insert(
+                key,
+                json!({ "stamp": stamp, "session": meta.session_id, "subagent": meta.is_subagent }),
+            );
         }
-    }
-    if scanned > 0 {
-        sync_note!(
-            "  [codex] scanned {scanned} new rollout files; {} sessions mapped",
-            cwds.len()
-        );
     }
     state.insert(
         "codex_session_cwds".to_string(),
@@ -4300,11 +4684,51 @@ fn build_codex_session_maps(
                 .collect::<Map<_, _>>(),
         ),
     );
-    state.insert("codex_rollouts".to_string(), Value::Object(seen));
-    Ok((cwds, branches))
+    state.insert("codex_rollouts_v3".to_string(), Value::Object(seen));
+    if scanned > 0 {
+        sync_note!(
+            "  [codex-rollouts] scanned {scanned} files; +{inserted} prompts, +{events} events"
+        );
+    }
+    Ok((cwds, branches, inserted))
 }
 
-fn read_codex_session_meta(path: &Path) -> Result<Option<(String, String, Option<String>)>> {
+fn load_state_string_map(state: &Map<String, Value>, key: &str) -> HashMap<String, String> {
+    state
+        .get(key)
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default()
+}
+
+fn codex_session_events_exist(conn: &Connection, session_id: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_events WHERE source = 'codex' AND session_id = ? LIMIT 1)",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+struct CodexSessionMeta {
+    session_id: String,
+    cwd: String,
+    git_branch: Option<String>,
+    is_subagent: bool,
+}
+
+/// Read the `session_meta` line that opens every rollout file.
+///
+/// Sessions key on `payload.id` — the per-thread id. Newer rollouts also
+/// carry `payload.session_id`, but that names the *parent* conversation for
+/// subagent threads; keying on it would collapse every subagent into its
+/// parent. Subagent threads are detected instead (`thread_source`, or the
+/// object form of `payload.source`) and excluded from session registration.
+fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
     let first = fs::read_to_string(path)
         .ok()
         .and_then(|text| text.lines().next().map(str::to_string))
@@ -4334,13 +4758,651 @@ fn read_codex_session_meta(path: &Path) -> Result<Option<(String, String, Option
     else {
         return Ok(None);
     };
-    let branch = payload
+    let git_branch = payload
         .and_then(|p| p.get("git"))
         .and_then(Value::as_object)
         .and_then(|g| g.get("branch"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    Ok(Some((session_id.to_string(), cwd.to_string(), branch)))
+    let is_subagent = payload
+        .and_then(|p| p.get("thread_source"))
+        .and_then(Value::as_str)
+        == Some("subagent")
+        || payload
+            .and_then(|p| p.get("source"))
+            .and_then(Value::as_object)
+            .is_some_and(|s| s.contains_key("subagent"));
+    Ok(Some(CodexSessionMeta {
+        session_id: session_id.to_string(),
+        cwd: cwd.to_string(),
+        git_branch,
+        is_subagent,
+    }))
+}
+
+#[derive(Default)]
+struct CodexIngestOutcome {
+    prompts: usize,
+    events: usize,
+    first_ts: Option<i64>,
+    last_ts: Option<i64>,
+    last_assistant_text: Option<String>,
+}
+
+/// Cumulative token totals from a Codex `token_count` event
+/// (`info.total_token_usage`). `input` is inclusive of `cached_input`.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct CodexTokenTotals {
+    input: i64,
+    cached_input: i64,
+    cache_write: i64,
+    output: i64,
+    reasoning_output: i64,
+    total: i64,
+}
+
+impl CodexTokenTotals {
+    fn from_usage(value: &Value) -> Option<Self> {
+        let obj = value.as_object()?;
+        let get = |key: &str| obj.get(key).and_then(Value::as_i64).unwrap_or(0);
+        Some(Self {
+            input: get("input_tokens"),
+            cached_input: get("cached_input_tokens"),
+            cache_write: get("cache_write_input_tokens"),
+            output: get("output_tokens"),
+            reasoning_output: get("reasoning_output_tokens"),
+            total: get("total_tokens"),
+        })
+    }
+
+    fn fields(&self) -> [i64; 6] {
+        [
+            self.input,
+            self.cached_input,
+            self.cache_write,
+            self.output,
+            self.reasoning_output,
+            self.total,
+        ]
+    }
+
+    /// Strictly-advancing snapshots mark a completed model request; identical
+    /// repeats (Codex re-emits them) and regressions are not deltas.
+    fn advanced_from(&self, prev: &Self) -> bool {
+        let (a, b) = (self.fields(), prev.fields());
+        a.iter().zip(b.iter()).all(|(x, y)| x >= y) && a != b
+    }
+
+    fn regressed_from(&self, prev: &Self) -> bool {
+        self.fields()
+            .iter()
+            .zip(prev.fields().iter())
+            .any(|(x, y)| x < y)
+    }
+
+    fn minus(&self, prev: &Self) -> Self {
+        Self {
+            input: (self.input - prev.input).max(0),
+            cached_input: (self.cached_input - prev.cached_input).max(0),
+            cache_write: (self.cache_write - prev.cache_write).max(0),
+            output: (self.output - prev.output).max(0),
+            reasoning_output: (self.reasoning_output - prev.reasoning_output).max(0),
+            total: (self.total - prev.total).max(0),
+        }
+    }
+
+    fn plus(&self, other: &Self) -> Self {
+        Self {
+            input: self.input + other.input,
+            cached_input: self.cached_input + other.cached_input,
+            cache_write: self.cache_write + other.cache_write,
+            output: self.output + other.output,
+            reasoning_output: self.reasoning_output + other.reasoning_output,
+            total: self.total + other.total,
+        }
+    }
+
+    fn to_token_json(self) -> String {
+        json!({
+            "input_tokens": self.input,
+            "cached_input_tokens": self.cached_input,
+            "cache_write_input_tokens": self.cache_write,
+            "output_tokens": self.output,
+            "reasoning_output_tokens": self.reasoning_output,
+            "total_tokens": self.total,
+        })
+        .to_string()
+    }
+}
+
+/// Ingest one rollout file's conversation into `session_events`,
+/// `tool_calls`, and `file_edits`, and its user prompts into `history`.
+///
+/// Format notes (verified against rollouts spanning cli 0.36 to 0.148):
+/// message text is taken from the `event_msg` stream only — the
+/// `response_item/message` rows duplicate it, and `response_item/reasoning`
+/// carries encrypted content while the readable stream is
+/// `event_msg/agent_reasoning`. Tool calls are `response_item` rows
+/// correlated by `call_id`. Token usage arrives as cumulative
+/// `token_count` snapshots; consecutive strictly-advancing snapshots are
+/// diffed into per-request deltas and attached to the nearest assistant
+/// event, so summing `token_json` over a session equals the session total.
+fn ingest_codex_rollout(
+    conn: &Connection,
+    path: &Path,
+    meta: &CodexSessionMeta,
+) -> Result<CodexIngestOutcome> {
+    let file = fs::File::open(path)?;
+    let session_id = meta.session_id.as_str();
+    let cwd = Some(meta.cwd.as_str());
+    let branch = meta.git_branch.as_deref();
+    let mut outcome = CodexIngestOutcome::default();
+    let mut model: Option<String> = None;
+    let mut prev_totals: Option<CodexTokenTotals> = None;
+    let mut pending_delta: Option<CodexTokenTotals> = None;
+    let mut untokened_assistant_uid: Option<String> = None;
+    let mut saw_model_output = false;
+    let mut reader = BufReader::new(file);
+    let mut raw = Vec::new();
+    let mut line_index = 0usize;
+    loop {
+        raw.clear();
+        if reader.read_until(b'\n', &mut raw)? == 0 {
+            break;
+        }
+        // A line without its newline is the half-written tail of a live
+        // session; the next sync re-reads the whole file.
+        if raw.last() != Some(&b'\n') {
+            break;
+        }
+        let index = line_index;
+        line_index += 1;
+        let Ok(text) = std::str::from_utf8(&raw) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
+            continue;
+        };
+        let Some(payload) = value.get("payload").and_then(Value::as_object) else {
+            continue;
+        };
+        let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let ts_ms = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_iso_ms)
+            .unwrap_or(0);
+        if ts_ms > 0 {
+            outcome.first_ts.get_or_insert(ts_ms);
+            outcome.last_ts = Some(outcome.last_ts.map_or(ts_ms, |last| last.max(ts_ms)));
+        }
+        let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        let payload_str = |key: &str| payload.get(key).and_then(Value::as_str);
+        match line_type {
+            "turn_context" => {
+                if let Some(m) = payload_str("model") {
+                    model = Some(m.to_string());
+                }
+            }
+            "event_msg" => match payload_type {
+                "user_message" => {
+                    for prompt in codex_rollout_user_prompts(&value) {
+                        if is_codex_control_context(&prompt) {
+                            continue;
+                        }
+                        let uid = format!("{index}:user_message");
+                        insert_codex_event(
+                            conn, session_id, cwd, branch, ts_ms, "user", "text", &prompt, &uid,
+                            &uid, None, None,
+                        )?;
+                        outcome.events += 1;
+                        // A subagent's "user" turns are the parent agent's
+                        // task prompts; only human threads feed the prompt
+                        // history that session discovery is built on.
+                        if meta.is_subagent {
+                            continue;
+                        }
+                        outcome.prompts += insert_history(
+                            conn,
+                            &HistoryEntry {
+                                id: 0,
+                                source: "codex".into(),
+                                session_id: Some(meta.session_id.clone()),
+                                project: Some(meta.cwd.clone()),
+                                prompt_hash: Some(prompt_hash(&prompt)),
+                                prompt,
+                                timestamp_ms: ts_ms,
+                            },
+                        )?;
+                    }
+                }
+                "agent_message" => {
+                    if let Some(message) = payload_str("message").filter(|m| !m.trim().is_empty()) {
+                        let uid = format!("{index}:agent_message");
+                        let token_json = pending_delta.take().map(CodexTokenTotals::to_token_json);
+                        insert_codex_event(
+                            conn,
+                            session_id,
+                            cwd,
+                            branch,
+                            ts_ms,
+                            "assistant",
+                            "text",
+                            message.trim(),
+                            &uid,
+                            &uid,
+                            model.as_deref(),
+                            token_json.as_deref(),
+                        )?;
+                        outcome.events += 1;
+                        untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
+                        outcome.last_assistant_text =
+                            Some(message.trim().chars().take(4096).collect());
+                        saw_model_output = true;
+                    }
+                }
+                "agent_reasoning" => {
+                    if let Some(reasoning) = payload_str("text").filter(|t| !t.trim().is_empty()) {
+                        let uid = format!("{index}:agent_reasoning");
+                        insert_codex_event(
+                            conn,
+                            session_id,
+                            cwd,
+                            branch,
+                            ts_ms,
+                            "assistant",
+                            "thinking",
+                            reasoning.trim(),
+                            &uid,
+                            &uid,
+                            model.as_deref(),
+                            None,
+                        )?;
+                        outcome.events += 1;
+                        untokened_assistant_uid = Some(uid);
+                        saw_model_output = true;
+                    }
+                }
+                "token_count" => {
+                    let Some(totals) = payload
+                        .get("info")
+                        .and_then(|info| info.get("total_token_usage"))
+                        .and_then(CodexTokenTotals::from_usage)
+                    else {
+                        continue;
+                    };
+                    match prev_totals {
+                        // The first snapshot before any model output is the
+                        // carried-over baseline of a resumed session (a fresh
+                        // session's opening snapshot has `info: null`).
+                        None if !saw_model_output => prev_totals = Some(totals),
+                        // A regressed snapshot is treated as a transient
+                        // glitch: keeping the prior baseline means the next
+                        // advancing snapshot's delta covers exactly the spend
+                        // since that baseline, so per-event sums still
+                        // reproduce the cumulative totals.
+                        Some(prev) if totals.regressed_from(&prev) => {}
+                        Some(prev) if !totals.advanced_from(&prev) => {}
+                        _ => {
+                            let baseline = prev_totals.unwrap_or_default();
+                            let mut delta = totals.minus(&baseline);
+                            prev_totals = Some(totals);
+                            if let Some(pending) = pending_delta.take() {
+                                delta = delta.plus(&pending);
+                            }
+                            if let Some(uid) = untokened_assistant_uid.take() {
+                                conn.execute(
+                                    "UPDATE session_events SET token_json = ? \
+                                     WHERE source = 'codex' AND session_id = ? AND event_uid = ?",
+                                    params![delta.to_token_json(), session_id, uid],
+                                )?;
+                            } else {
+                                pending_delta = Some(delta);
+                            }
+                        }
+                    }
+                }
+                "task_complete" => {
+                    if let Some(message) =
+                        payload_str("last_agent_message").filter(|m| !m.trim().is_empty())
+                    {
+                        outcome.last_assistant_text =
+                            Some(message.trim().chars().take(4096).collect());
+                    }
+                }
+                "thread_settings_applied" => {
+                    if let Some(m) = payload
+                        .get("thread_settings")
+                        .and_then(|s| s.get("model"))
+                        .and_then(Value::as_str)
+                    {
+                        model = Some(m.to_string());
+                    }
+                }
+                "mcp_tool_call_end" => {
+                    let Some(call_id) = payload_str("call_id").filter(|s| !s.is_empty()) else {
+                        continue;
+                    };
+                    let invocation = payload.get("invocation");
+                    let name = invocation
+                        .map(|inv| {
+                            format!(
+                                "{}.{}",
+                                inv.get("server").and_then(Value::as_str).unwrap_or("mcp"),
+                                inv.get("tool").and_then(Value::as_str).unwrap_or("tool"),
+                            )
+                        })
+                        .unwrap_or_else(|| "mcp.tool".to_string());
+                    let args_json = invocation
+                        .and_then(|inv| serde_json::to_string(inv).ok())
+                        .unwrap_or_else(|| "null".to_string());
+                    let is_error = payload
+                        .get("result")
+                        .and_then(Value::as_object)
+                        .map(|r| r.contains_key("Err"));
+                    insert_tool_call(
+                        conn,
+                        "codex",
+                        session_id,
+                        &format!("{index}:mcp_tool_call_end"),
+                        call_id,
+                        &name,
+                        None,
+                        &args_json,
+                        is_error,
+                        ts_ms,
+                    )?;
+                }
+                "web_search_end" => {
+                    let Some(call_id) = payload_str("call_id").filter(|s| !s.is_empty()) else {
+                        continue;
+                    };
+                    insert_tool_call(
+                        conn,
+                        "codex",
+                        session_id,
+                        &format!("{index}:web_search_end"),
+                        call_id,
+                        "web_search",
+                        payload_str("query"),
+                        "null",
+                        None,
+                        ts_ms,
+                    )?;
+                }
+                "patch_apply_end" => {
+                    let Some(call_id) = payload_str("call_id").filter(|s| !s.is_empty()) else {
+                        continue;
+                    };
+                    let success = payload.get("success").and_then(Value::as_bool);
+                    if let Some(success) = success {
+                        set_tool_call_error(conn, "codex", session_id, call_id, !success)?;
+                    }
+                    let Some(changes) = payload.get("changes").and_then(Value::as_object) else {
+                        continue;
+                    };
+                    for (file_path, change) in changes {
+                        // One patch can touch several files; file_edits keys
+                        // on tool_use_id, so scope the id per path.
+                        let edit_id = format!("{call_id}#{file_path}");
+                        upsert_file_edit_from_call(
+                            conn,
+                            "codex",
+                            session_id,
+                            &format!("{index}:patch_apply_end"),
+                            &edit_id,
+                            file_path,
+                            "apply_patch",
+                            ts_ms,
+                            branch,
+                            cwd,
+                        )?;
+                        let diff = change
+                            .get("unified_diff")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let (added, removed) = count_unified_diff_lines(diff);
+                        conn.execute(
+                            "UPDATE file_edits SET lines_added = ?, lines_removed = ?, structured_patch_json = ? \
+                             WHERE source = 'codex' AND session_id = ? AND tool_use_id = ?",
+                            params![
+                                added,
+                                removed,
+                                serde_json::to_string(change).ok(),
+                                session_id,
+                                edit_id,
+                            ],
+                        )?;
+                    }
+                }
+                "exec_command_end" => {
+                    if let Some(call_id) = payload_str("call_id").filter(|s| !s.is_empty()) {
+                        if let Some(exit_code) = payload.get("exit_code").and_then(Value::as_i64) {
+                            set_tool_call_error(
+                                conn,
+                                "codex",
+                                session_id,
+                                call_id,
+                                exit_code != 0,
+                            )?;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            "response_item" => match payload_type {
+                "function_call" | "custom_tool_call" => {
+                    let name = payload_str("name").unwrap_or("");
+                    let call_id = payload_str("call_id").unwrap_or("");
+                    let args = if payload_type == "function_call" {
+                        let raw_args = payload_str("arguments").unwrap_or("");
+                        serde_json::from_str::<Value>(raw_args)
+                            .unwrap_or_else(|_| json!({ "arguments": raw_args }))
+                    } else {
+                        json!({ "input": payload_str("input").unwrap_or("") })
+                    };
+                    let target = if name == "apply_patch" {
+                        codex_apply_patch_target(payload_str("input").unwrap_or(""))
+                    } else {
+                        codex_pick_tool_target(name, &args)
+                    };
+                    let uid = format!("{index}:{payload_type}");
+                    let message_id = payload_str("id").unwrap_or(uid.as_str()).to_string();
+                    let event_text = format_tool_event_text(name, target.as_deref(), &args);
+                    let token_json = pending_delta.take().map(CodexTokenTotals::to_token_json);
+                    insert_codex_event(
+                        conn,
+                        session_id,
+                        cwd,
+                        branch,
+                        ts_ms,
+                        "assistant",
+                        "tool_use",
+                        &event_text,
+                        &uid,
+                        &message_id,
+                        model.as_deref(),
+                        token_json.as_deref(),
+                    )?;
+                    outcome.events += 1;
+                    untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
+                    saw_model_output = true;
+                    if !call_id.is_empty() && !name.is_empty() {
+                        let args_json =
+                            serde_json::to_string(&args).unwrap_or_else(|_| "null".to_string());
+                        insert_tool_call(
+                            conn,
+                            "codex",
+                            session_id,
+                            &message_id,
+                            call_id,
+                            name,
+                            target.as_deref(),
+                            &args_json,
+                            None,
+                            ts_ms,
+                        )?;
+                    }
+                }
+                "function_call_output" | "custom_tool_call_output" => {
+                    if let Some(output_text) =
+                        materialize_codex_output_text(payload.get("output").unwrap_or(&Value::Null))
+                    {
+                        let uid = format!("{index}:{payload_type}");
+                        let message_id = payload_str("id").unwrap_or(uid.as_str()).to_string();
+                        insert_codex_event(
+                            conn,
+                            session_id,
+                            cwd,
+                            branch,
+                            ts_ms,
+                            "tool_result",
+                            "tool_result",
+                            &output_text,
+                            &uid,
+                            &message_id,
+                            None,
+                            None,
+                        )?;
+                        outcome.events += 1;
+                    }
+                }
+                // Readable reasoning arrives as event_msg/agent_reasoning;
+                // this row is encrypted, but it still marks model output.
+                "reasoning" => saw_model_output = true,
+                // `response_item` messages duplicate the event_msg text
+                // stream; ingesting both would double every message. An
+                // assistant one still marks model output for token baselines.
+                "message" if payload_str("role") == Some("assistant") => saw_model_output = true,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    Ok(outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_codex_event(
+    conn: &Connection,
+    session_id: &str,
+    cwd: Option<&str>,
+    branch: Option<&str>,
+    ts_ms: i64,
+    role: &str,
+    kind: &str,
+    text: &str,
+    uid: &str,
+    message_id: &str,
+    model: Option<&str>,
+    token_json: Option<&str>,
+) -> Result<()> {
+    insert_session_event(
+        conn,
+        "codex",
+        session_id,
+        cwd,
+        cwd,
+        branch,
+        message_id,
+        None,
+        ts_ms,
+        role,
+        kind,
+        Some(text),
+        model,
+        token_json,
+        uid,
+    )
+}
+
+fn codex_pick_tool_target(name: &str, args: &Value) -> Option<String> {
+    let obj = args.as_object()?;
+    let get = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| obj.get(*k).and_then(Value::as_str))
+            .map(str::to_string)
+    };
+    match name {
+        "exec_command" | "shell" | "exec" => get(&["cmd", "command"]),
+        "read_file" | "write_file" => get(&["path", "file_path"]),
+        _ => get(&["path", "file_path", "cmd", "command", "url", "query"]),
+    }
+}
+
+fn codex_apply_patch_target(input: &str) -> Option<String> {
+    input.lines().find_map(|line| {
+        let line = line.trim();
+        ["*** Update File: ", "*** Add File: ", "*** Delete File: "]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+            .map(str::to_string)
+    })
+}
+
+fn materialize_codex_output_text(output: &Value) -> Option<String> {
+    match output {
+        Value::String(s) => (!s.trim().is_empty()).then(|| s.clone()),
+        Value::Array(items) => {
+            let parts = items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        }
+        Value::Null => None,
+        other => serde_json::to_string(other).ok(),
+    }
+}
+
+fn count_unified_diff_lines(diff: &str) -> (i64, i64) {
+    let mut added = 0;
+    let mut removed = 0;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
+fn codex_rollout_user_prompts(value: &Value) -> Vec<String> {
+    let mut prompts = Vec::new();
+    let payload = value.get("payload").and_then(Value::as_object);
+    if value.get("type").and_then(Value::as_str) == Some("event_msg")
+        && payload.and_then(|p| p.get("type")).and_then(Value::as_str) == Some("user_message")
+    {
+        if let Some(message) = payload
+            .and_then(|p| p.get("message"))
+            .and_then(Value::as_str)
+        {
+            if !message.trim().is_empty() {
+                prompts.push(message.trim().to_string());
+            }
+        }
+    }
+    prompts
+}
+
+fn is_codex_control_context(prompt: &str) -> bool {
+    let value = prompt.trim_start();
+    [
+        "<environment_context",
+        "<permissions instructions",
+        "<app-context",
+        "<skills_instructions",
+        "<collaboration_mode",
+        "<INSTRUCTIONS>",
+        "<user_instructions",
+        "# AGENTS.md",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
 }
 
 fn backfill_codex_metadata(
@@ -4385,11 +5447,15 @@ fn sync_claude_session_metadata(
     if !root.exists() {
         return Ok(());
     }
+    // The v2 key forces one full re-scan on upgrade: transcripts whose
+    // stamps never change again still need the sidechain healing pass that
+    // removes previously ingested fake user turns.
     let mut session_state = state
-        .get("claude_sessions")
+        .get("claude_sessions_v2")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    state.remove("claude_sessions");
     let mut scanned = 0;
     let mut upserted = 0;
     for path in collect_matching_files(root, "", "jsonl")? {
@@ -4418,7 +5484,10 @@ fn sync_claude_session_metadata(
             upserted += 1;
         }
     }
-    state.insert("claude_sessions".to_string(), Value::Object(session_state));
+    state.insert(
+        "claude_sessions_v2".to_string(),
+        Value::Object(session_state),
+    );
     if scanned > 0 {
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
@@ -4481,7 +5550,9 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
             first_ts.get_or_insert(ts);
             last_ts = Some(ts);
         }
-        if value.get("type").and_then(Value::as_str) == Some("assistant") {
+        if value.get("type").and_then(Value::as_str) == Some("assistant")
+            && value.get("isSidechain").and_then(Value::as_bool) != Some(true)
+        {
             if let Some(content) = value.pointer("/message/content") {
                 if let Some(text) = content.as_str() {
                     last_assistant_text = Some(text.chars().take(4096).collect());
@@ -4525,6 +5596,33 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
             Some(s) if !s.is_empty() => s,
             _ => continue,
         };
+        // Subagent sidecar transcripts share the parent's sessionId with
+        // isSidechain rows. The subagent's assistant output is real session
+        // activity (text and token spend), but its user-role rows are the
+        // parent agent's own prompts and tool results — ingesting those
+        // manufactures fake human turns.
+        let sidechain = obj
+            .get("isSidechain")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if sidechain
+            && obj
+                .get("message")
+                .and_then(|m| m.get("role"))
+                .and_then(Value::as_str)
+                != Some("assistant")
+        {
+            // Heal databases that ingested these rows before this guard:
+            // the uid prefix is this row's uuid, so stale events (and any
+            // per-block siblings) can be removed as the file is re-read.
+            if let Some(uuid) = obj.get("uuid").and_then(Value::as_str) {
+                conn.execute(
+                    "DELETE FROM session_events WHERE source = 'claude' AND session_id = ? AND (event_uid = ? || ':0' OR event_uid LIKE ? || ':%')",
+                    params![session_id, uuid, uuid],
+                )?;
+            }
+            continue;
+        }
         let cwd = obj.get("cwd").and_then(Value::as_str);
         let project = cwd;
         let git_branch = obj.get("gitBranch").and_then(Value::as_str);
@@ -4567,6 +5665,7 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
                 };
                 insert_session_event(
                     conn,
+                    "claude",
                     session_id,
                     project,
                     cwd,
@@ -4601,6 +5700,7 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
                             };
                             insert_session_event(
                                 conn,
+                                "claude",
                                 session_id,
                                 project,
                                 cwd,
@@ -4626,6 +5726,7 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
                     if text.is_some_and(|s| !s.trim().is_empty()) {
                         insert_session_event(
                             conn,
+                            "claude",
                             session_id,
                             project,
                             cwd,
@@ -4650,6 +5751,7 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
                     let event_text = format_tool_event_text(name, target.as_deref(), args);
                     insert_session_event(
                         conn,
+                        "claude",
                         session_id,
                         project,
                         cwd,
@@ -4669,6 +5771,7 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
                             serde_json::to_string(args).unwrap_or_else(|_| "null".to_string());
                         insert_tool_call(
                             conn,
+                            "claude",
                             session_id,
                             message_uuid,
                             tool_use_id,
@@ -4682,6 +5785,7 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
                             if let Some(file_path) = target.as_deref() {
                                 upsert_file_edit_from_call(
                                     conn,
+                                    "claude",
                                     session_id,
                                     message_uuid,
                                     tool_use_id,
@@ -4705,6 +5809,7 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
                     let text = materialize_tool_result_text(content);
                     insert_session_event(
                         conn,
+                        "claude",
                         session_id,
                         project,
                         cwd,
@@ -4722,14 +5827,12 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
                     let is_error = block.get("is_error").and_then(Value::as_bool);
                     if !tool_use_id.is_empty() {
                         if let Some(err) = is_error {
-                            conn.execute(
-                                "UPDATE tool_calls SET is_error = ? WHERE source = 'claude' AND session_id = ? AND tool_use_id = ?",
-                                params![if err { 1 } else { 0 }, session_id, tool_use_id],
-                            )?;
+                            set_tool_call_error(conn, "claude", session_id, tool_use_id, err)?;
                         }
                         if let Some(result) = find_tool_use_result(block) {
                             update_file_edit_from_tool_result(
                                 conn,
+                                "claude",
                                 session_id,
                                 message_uuid,
                                 tool_use_id,
@@ -4751,6 +5854,7 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn insert_session_event(
     conn: &Connection,
+    source: &str,
     session_id: &str,
     project: Option<&str>,
     cwd: Option<&str>,
@@ -4768,12 +5872,13 @@ fn insert_session_event(
     conn.execute(
         "INSERT INTO session_events \
          (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
-         VALUES ('claude', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
          model=excluded.model, token_json=excluded.token_json",
         params![
+            source,
             session_id,
             project,
             cwd,
@@ -4795,6 +5900,7 @@ fn insert_session_event(
 #[allow(clippy::too_many_arguments)]
 fn insert_tool_call(
     conn: &Connection,
+    source: &str,
     session_id: &str,
     message_id: &str,
     tool_use_id: &str,
@@ -4807,11 +5913,12 @@ fn insert_tool_call(
     conn.execute(
         "INSERT INTO tool_calls \
          (source, session_id, message_id, tool_use_id, name, target, args_json, is_error, ts_ms) \
-         VALUES ('claude', ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
          message_id=excluded.message_id, name=excluded.name, target=excluded.target, args_json=excluded.args_json, \
          is_error=COALESCE(excluded.is_error, tool_calls.is_error), ts_ms=excluded.ts_ms",
         params![
+            source,
             session_id,
             message_id,
             tool_use_id,
@@ -4825,9 +5932,24 @@ fn insert_tool_call(
     Ok(())
 }
 
+fn set_tool_call_error(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    tool_use_id: &str,
+    is_error: bool,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE tool_calls SET is_error = ? WHERE source = ? AND session_id = ? AND tool_use_id = ?",
+        params![if is_error { 1 } else { 0 }, source, session_id, tool_use_id],
+    )?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upsert_file_edit_from_call(
     conn: &Connection,
+    source: &str,
     session_id: &str,
     message_id: &str,
     tool_use_id: &str,
@@ -4840,11 +5962,12 @@ fn upsert_file_edit_from_call(
     conn.execute(
         "INSERT INTO file_edits \
          (source, session_id, message_id, tool_use_id, file_path, tool_name, ts_ms, git_branch, cwd) \
-         VALUES ('claude', ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
          message_id=excluded.message_id, file_path=excluded.file_path, tool_name=excluded.tool_name, \
          ts_ms=excluded.ts_ms, git_branch=COALESCE(excluded.git_branch, file_edits.git_branch), cwd=COALESCE(excluded.cwd, file_edits.cwd)",
         params![
+            source,
             session_id,
             message_id,
             tool_use_id,
@@ -4861,6 +5984,7 @@ fn upsert_file_edit_from_call(
 #[allow(clippy::too_many_arguments)]
 fn update_file_edit_from_tool_result(
     conn: &Connection,
+    source: &str,
     session_id: &str,
     message_id: &str,
     tool_use_id: &str,
@@ -4890,7 +6014,7 @@ fn update_file_edit_from_tool_result(
          lines_added = ?, lines_removed = ?, structured_patch_json = COALESCE(?, structured_patch_json), \
          user_modified = COALESCE(?, user_modified), ts_ms = COALESCE(ts_ms, ?), \
          git_branch = COALESCE(?, git_branch), cwd = COALESCE(?, cwd) \
-         WHERE source = 'claude' AND session_id = ? AND tool_use_id = ?",
+         WHERE source = ? AND session_id = ? AND tool_use_id = ?",
         params![
             message_id,
             file_path,
@@ -4901,6 +6025,7 @@ fn update_file_edit_from_tool_result(
             ts_ms,
             git_branch,
             cwd,
+            source,
             session_id,
             tool_use_id,
         ],
@@ -5145,7 +6270,10 @@ fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -
                     }
                 }
             }
-            cursor_state.insert(key, source.committed_cursor(consumed)?.to_value());
+            let opened_cursor = source.cursor.to_value();
+            if consumed != offset || cursor_state.get(&key) != Some(&opened_cursor) {
+                cursor_state.insert(key, source.committed_cursor(consumed, true)?.to_value());
+            }
         }
     }
     state.insert("cursor".to_string(), Value::Object(cursor_state));
@@ -6008,14 +7136,15 @@ fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpoint_sync_state, cleanup_stale_sync_state_temps, cron_schedule, file_stamp,
-        git_commit_time_ms, git_stdout, ingest_claude_transcript, is_sqlite_contention,
-        link_git_commit, load_sync_state, parse_trajectory_file, paths_overlap,
-        prepare_sync_and_push_db, process_status_with_programs, save_sync_state, search_all,
-        service_command_args, shell_single_quote, source_database_path, strip_url_credentials,
-        sync_claude_session_metadata, sync_exclusive, sync_opencode_exclusive,
-        try_acquire_sync_lock, wal_contention_line, write_contention_diagnostic, xml_escape,
-        SearchRole, SyncSourceReport, PUSH_SERVICE, WAL_WARN_BYTES,
+        checkpoint_sync_state, cleanup_stale_sync_state_temps, codex_rollout_user_prompts,
+        cron_schedule, file_stamp, git_commit_time_ms, git_stdout, ingest_claude_transcript,
+        is_sqlite_contention, link_git_commit, load_sync_state, parse_trajectory_file,
+        paths_overlap, prepare_sync_and_push_db, process_status_with_programs, save_sync_state,
+        search_all, service_command_args, shell_single_quote, source_database_path,
+        strip_url_credentials, sync_claude_session_metadata, sync_exclusive,
+        sync_opencode_exclusive, try_acquire_sync_lock, wal_contention_line,
+        write_contention_diagnostic, xml_escape, SearchRole, SyncSourceReport, PUSH_SERVICE,
+        WAL_WARN_BYTES,
     };
     use ai_hist_core::{init_db, open_db, QueryFilter, SourceDatabaseError};
     use rusqlite::Connection;
@@ -6039,10 +7168,47 @@ mod tests {
                 started_mtime_ns: generation,
                 started_size: 100,
                 observed_at_ns: generation,
+                rewrite_epoch: 0,
             },
             observed_mtime_ns: generation,
+            prefix_hash: Some("test-prefix".to_string()),
         }
         .to_value()
+    }
+
+    fn decode_typed_cursor(value: Value) -> super::FileCursor {
+        match super::FileCursor::decode(&value).expect("valid typed cursor") {
+            super::DecodedFileCursor::Typed(cursor) => cursor,
+            super::DecodedFileCursor::Legacy(_) => panic!("expected typed cursor"),
+        }
+    }
+
+    #[test]
+    fn codex_rollout_prompts_normalize_desktop_user_turns() {
+        let event = json!({
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "  fix the importer  "}
+        });
+        assert_eq!(codex_rollout_user_prompts(&event), vec!["fix the importer"]);
+
+        let mirrored_response_item = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "summarize this task"},
+                    {"type": "image", "url": "ignored"}
+                ]
+            }
+        });
+        assert!(codex_rollout_user_prompts(&mirrored_response_item).is_empty());
+
+        let assistant = json!({
+            "type": "response_item",
+            "payload": {"type": "message", "role": "assistant", "content": "ignored"}
+        });
+        assert!(codex_rollout_user_prompts(&assistant).is_empty());
     }
 
     #[test]
@@ -6334,7 +7500,11 @@ mod tests {
 
         // Nor can a slow writer rewind the active generation.
         let mut slow_same_generation = Map::new();
-        slow_same_generation.insert("claude".into(), test_file_cursor(12, 10, 200));
+        let mut later_open = decode_typed_cursor(test_file_cursor(12, 10, 200));
+        later_open.generation.started_mtime_ns += 10;
+        later_open.generation.started_size += 50;
+        later_open.generation.observed_at_ns += 10;
+        slow_same_generation.insert("claude".into(), later_open.to_value());
         slow_same_generation.insert(
             "cursor".into(),
             json!({transcript: test_file_cursor(14, 10, 200)}),
@@ -6344,6 +7514,74 @@ mod tests {
         let saved = load_sync_state(&path).unwrap();
         assert_eq!(saved_cursor_offset(&saved["claude"]), 25);
         assert_eq!(saved_cursor_offset(&saved["cursor"][transcript]), 30);
+    }
+
+    #[test]
+    fn a_same_inode_rewrite_epoch_supersedes_the_old_larger_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sync-state.json");
+        let mut old = Map::new();
+        old.insert("claude".into(), test_file_cursor(900, 10, 100));
+        checkpoint_sync_state(&path, &old);
+
+        let mut reset = decode_typed_cursor(test_file_cursor(0, 10, 200));
+        reset.generation.rewrite_epoch = 1;
+        let mut rewritten = Map::new();
+        rewritten.insert("claude".into(), reset.to_value());
+        checkpoint_sync_state(&path, &rewritten);
+
+        let saved = load_sync_state(&path).unwrap();
+        assert_eq!(saved_cursor_offset(&saved["claude"]), 0);
+    }
+
+    #[test]
+    fn a_new_inode_wins_by_observation_time_even_with_a_lower_rewrite_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sync-state.json");
+        let mut old_cursor = decode_typed_cursor(test_file_cursor(900, 10, 100));
+        old_cursor.generation.rewrite_epoch = 10;
+        let mut old = Map::new();
+        old.insert("claude".into(), old_cursor.to_value());
+        checkpoint_sync_state(&path, &old);
+
+        let mut replacement = decode_typed_cursor(test_file_cursor(0, 11, 200));
+        replacement.generation.rewrite_epoch = 2;
+        let mut new = Map::new();
+        new.insert("claude".into(), replacement.to_value());
+        checkpoint_sync_state(&path, &new);
+
+        let saved = load_sync_state(&path).unwrap();
+        assert_eq!(saved_cursor_offset(&saved["claude"]), 0);
+        let saved = decode_typed_cursor(saved["claude"].clone());
+        assert_eq!(saved.generation.inode, Some(11));
+    }
+
+    #[test]
+    fn sync_state_merge_recurses_through_all_object_maps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sync-state.json");
+        let mut on_disk = Map::new();
+        on_disk.insert(
+            "claude_sessions_v2".into(),
+            json!({"first.jsonl": "old", "nested": {"left": 1}}),
+        );
+        save_sync_state(&path, &on_disk).unwrap();
+
+        let mut ours = Map::new();
+        ours.insert(
+            "claude_sessions_v2".into(),
+            json!({"second.jsonl": "new", "nested": {"right": 2}}),
+        );
+        checkpoint_sync_state(&path, &ours);
+
+        assert_eq!(
+            load_sync_state(&path).unwrap()["claude_sessions_v2"],
+            json!({
+                "first.jsonl": "old",
+                "second.jsonl": "new",
+                "nested": {"left": 1, "right": 2}
+            })
+        );
     }
 
     #[test]
@@ -6457,7 +7695,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        let mut checkpoints: Vec<u64> = Vec::new();
+        let mut checkpoints: Vec<Value> = Vec::new();
         let inserted = super::sync_jsonl_incremental(
             &conn,
             &mut state,
@@ -6465,7 +7703,7 @@ mod tests {
             &path,
             super::parse_claude_line,
             &mut |in_progress| {
-                checkpoints.push(saved_cursor_offset(&in_progress["claude"]));
+                checkpoints.push(in_progress["claude"].clone());
             },
         )
         .unwrap();
@@ -6474,8 +7712,9 @@ mod tests {
         // Progress was published while the source was still running, and each
         // checkpoint is a real byte position inside the file.
         assert_eq!(checkpoints.len(), lines / super::JSONL_CHUNK_LINES);
-        assert!(checkpoints.windows(2).all(|w| w[0] < w[1]));
-        assert!(checkpoints.iter().all(|&at| at < body.len() as u64));
+        let checkpoint_offsets: Vec<u64> = checkpoints.iter().map(saved_cursor_offset).collect();
+        assert!(checkpoint_offsets.windows(2).all(|w| w[0] < w[1]));
+        assert!(checkpoint_offsets.iter().all(|&at| at < body.len() as u64));
         assert_eq!(saved_cursor_offset(&state["claude"]), body.len() as u64);
 
         // Resuming from a mid-file checkpoint ingests only the remainder, and
@@ -6483,7 +7722,7 @@ mod tests {
         let resumed_conn = Connection::open_in_memory().unwrap();
         init_db(&resumed_conn).unwrap();
         let mut resumed = Map::new();
-        resumed.insert("claude".into(), json!(checkpoints[0]));
+        resumed.insert("claude".into(), checkpoints[0].clone());
         let after = super::sync_jsonl_incremental(
             &resumed_conn,
             &mut resumed,
@@ -6585,6 +7824,50 @@ mod tests {
     }
 
     #[test]
+    fn generic_jsonl_skips_complete_non_utf8_lines_permanently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        fs::write(&path, [0xff, b'\n']).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+
+        assert_eq!(
+            super::sync_jsonl_incremental(
+                &conn,
+                &mut state,
+                "claude",
+                &path,
+                super::parse_claude_line,
+                &mut |_| {},
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(saved_cursor_offset(&state["claude"]), 2);
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"display":"valid","timestamp":1,"sessionId":"s"}}"#
+        )
+        .unwrap();
+        drop(file);
+        assert_eq!(
+            super::sync_jsonl_incremental(
+                &conn,
+                &mut state,
+                "claude",
+                &path,
+                super::parse_claude_line,
+                &mut |_| {},
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn generic_jsonl_resets_after_truncation_and_atomic_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.jsonl");
@@ -6624,11 +7907,26 @@ mod tests {
         assert_eq!(sync(&mut state), 1, "same-inode truncation must reset");
         assert_eq!(sync(&mut state), 0);
 
+        fs::write(
+            &path,
+            concat!(
+                r#"{"display":"same inode regrown beyond the previous cursor","timestamp":3,"sessionId":"regrown"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            sync(&mut state),
+            1,
+            "same-inode truncate-and-regrow must reset"
+        );
+        assert_eq!(sync(&mut state), 0);
+
         let replacement = dir.path().join("replacement.jsonl");
         fs::write(
             &replacement,
             concat!(
-                r#"{"display":"replacement prompt longer than the prior cursor","timestamp":3,"sessionId":"replacement"}"#,
+                r#"{"display":"replacement prompt longer than the prior cursor","timestamp":4,"sessionId":"replacement"}"#,
                 "\n"
             ),
         )
@@ -6640,8 +7938,70 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
+    }
+
+    #[test]
+    fn generic_jsonl_detects_same_size_rewrites_with_an_unchanged_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let shared_tail = "x".repeat(256);
+        let original =
+            format!(r#"{{"display":"old-one-{shared_tail}","timestamp":1,"sessionId":"old"}}"#)
+                + "\n";
+        let replacement =
+            format!(r#"{{"display":"new-one-{shared_tail}","timestamp":2,"sessionId":"new"}}"#)
+                + "\n";
+        assert_eq!(original.len(), replacement.len());
+        fs::write(&path, original).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        let sync = |state: &mut Map<String, Value>| {
+            super::sync_jsonl_incremental(
+                &conn,
+                state,
+                "claude",
+                &path,
+                super::parse_claude_line,
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+
+        assert_eq!(sync(&mut state), 1);
+        fs::write(&path, replacement).unwrap();
+        assert_eq!(sync(&mut state), 1, "changed prefix must reset the cursor");
+        assert_eq!(sync(&mut state), 0);
+    }
+
+    #[test]
+    fn an_active_scan_revalidates_its_starting_prefix_before_checkpointing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let original = concat!(r#"{"display":"original","timestamp":1}"#, "\n");
+        fs::write(&path, original).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_jsonl_incremental(
+            &conn,
+            &mut state,
+            "claude",
+            &path,
+            super::parse_claude_line,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let starting_offset = saved_cursor_offset(&state["claude"]);
+        let mut reader = super::CompleteJsonlReader::open(&path, state.get("claude")).unwrap();
+        let replacement = concat!(r#"{"display":"replaced","timestamp":2}"#, "\n");
+        fs::write(&path, replacement).unwrap();
+        let cursor = reader.committed_cursor(starting_offset, true).unwrap();
+        assert_eq!(cursor.offset, 0);
+        assert_ne!(cursor.generation, reader.cursor.generation);
     }
 
     #[test]
@@ -6679,7 +8039,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_numeric_cursor_upgrades_after_a_successful_scan() {
+    fn legacy_numeric_cursor_rescans_safely_before_upgrading() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.jsonl");
         let first = concat!(r#"{"display":"already imported","timestamp":1}"#, "\n");
@@ -6700,7 +8060,7 @@ mod tests {
                 &mut |_| {},
             )
             .unwrap(),
-            1
+            2
         );
         assert!(matches!(
             super::FileCursor::decode(&state["claude"]),
@@ -6827,6 +8187,46 @@ mod tests {
         assert_eq!(leftover_tmp_files(&dir), Vec::<String>::new());
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_checkpoints_preserve_every_writers_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sync-state.json");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|writer| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut state = Map::new();
+                    state.insert(format!("writer-{writer}"), json!(writer));
+                    barrier.wait();
+                    checkpoint_sync_state(&path, &state);
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let published = load_sync_state(&path).unwrap();
+        for writer in 0..16 {
+            assert_eq!(
+                published.get(&format!("writer-{writer}")),
+                Some(&json!(writer))
+            );
+        }
+    }
+
+    #[test]
+    fn sync_state_lock_contention_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sync-state.json");
+        let _holder = super::SyncStateLock::acquire(&path).unwrap();
+        assert!(
+            super::SyncStateLock::acquire_with_timeout(&path, std::time::Duration::ZERO).is_err()
+        );
     }
 
     #[test]
@@ -7066,7 +8466,7 @@ mod tests {
         );
         let mut state = Map::new();
         state.insert(
-            "claude_sessions".to_string(),
+            "claude_sessions_v2".to_string(),
             Value::Object(claude_sessions),
         );
 
@@ -7174,5 +8574,382 @@ mod tests {
 {"type":"user","uuid":"r1","parentUuid":"a1","sessionId":"s-rich","cwd":"/tmp/proj","gitBranch":"feat/rich","timestamp":"2026-06-25T10:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok","toolUseResult":{"filePath":"/tmp/proj/auth.ts","structuredPatch":"--- a/auth.ts\n+++ b/auth.ts\n-old\n+new\n","userModified":true}}]}}"#,
         )
         .unwrap();
+    }
+
+    fn write_rich_codex_rollout(path: &std::path::Path) {
+        fs::write(
+            path,
+            concat!(
+                r#"{"timestamp":"2026-08-01T10:00:00.000Z","type":"session_meta","payload":{"id":"sess-top","cwd":"/tmp/proj","git":{"branch":"main"},"cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:00.150Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{}}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:00.200Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"fix the importer"}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:01.100Z","type":"event_msg","payload":{"type":"user_message","message":"<environment_context>injected</environment_context>"}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:02.000Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"I should check git status."}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:02.500Z","type":"response_item","payload":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:03.000Z","type":"response_item","payload":{"type":"function_call","id":"fc_1","name":"exec_command","arguments":"{\"cmd\":\"git status\"}","call_id":"call_1"}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:04.000Z","type":"response_item","payload":{"type":"function_call_output","id":"fco_1","call_id":"call_1","output":"clean tree"}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:04.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"cache_write_input_tokens":0,"output_tokens":120,"reasoning_output_tokens":30,"total_tokens":1120}}}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:04.600Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"cache_write_input_tokens":0,"output_tokens":120,"reasoning_output_tokens":30,"total_tokens":1120}}}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:05.000Z","type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_2","name":"apply_patch","input":"*** Begin Patch\n*** Update File: /tmp/proj/README.md\n@@\n+banner\n-old\n*** End Patch\n"}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:05.500Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call_2","turn_id":"t1","success":true,"changes":{"/tmp/proj/README.md":{"type":"update","unified_diff":"@@\n+banner\n-old"}}}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:06.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done. The importer is fixed.","phase":"final_answer"}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:06.200Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1600,"cached_input_tokens":900,"cache_write_input_tokens":50,"output_tokens":180,"reasoning_output_tokens":40,"total_tokens":1780}}}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:06.300Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"Done. The importer is fixed.","duration_ms":5000}}"#, "\n",
+            ),
+        )
+        .unwrap();
+    }
+
+    fn codex_meta(path: &std::path::Path) -> super::CodexSessionMeta {
+        super::read_codex_session_meta(path).unwrap().unwrap()
+    }
+
+    #[test]
+    fn ingests_codex_rollout_events_tools_edits_and_token_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-rich.jsonl");
+        write_rich_codex_rollout(&path);
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let meta = codex_meta(&path);
+        assert_eq!(meta.session_id, "sess-top");
+        assert_eq!(meta.cwd, "/tmp/proj");
+        assert_eq!(meta.git_branch.as_deref(), Some("main"));
+        assert!(!meta.is_subagent);
+
+        let outcome = super::ingest_codex_rollout(&conn, &path, &meta).unwrap();
+        assert_eq!(outcome.prompts, 1);
+        assert_eq!(outcome.events, 6);
+        assert_eq!(
+            outcome.last_assistant_text.as_deref(),
+            Some("Done. The importer is fixed.")
+        );
+        assert_eq!(outcome.first_ts, Some(1_785_578_400_000));
+
+        let kinds: Vec<(String, String, Option<String>)> = conn
+            .prepare("SELECT role, kind, model FROM session_events ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            kinds,
+            vec![
+                ("user".into(), "text".into(), None),
+                (
+                    "assistant".into(),
+                    "thinking".into(),
+                    Some("gpt-5.4".into())
+                ),
+                (
+                    "assistant".into(),
+                    "tool_use".into(),
+                    Some("gpt-5.4".into())
+                ),
+                ("tool_result".into(), "tool_result".into(), None),
+                (
+                    "assistant".into(),
+                    "tool_use".into(),
+                    Some("gpt-5.4".into())
+                ),
+                ("assistant".into(), "text".into(), Some("gpt-5.4".into())),
+            ]
+        );
+
+        // The boilerplate user message is filtered from both stores.
+        let prompt_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source='codex'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompt_count, 1);
+
+        // Request 1's cumulative snapshot lands on the tool_use event that
+        // closed it; the duplicate snapshot adds nothing; request 2's delta
+        // lands on the final assistant message.
+        let first: String = conn
+            .query_row(
+                "SELECT token_json FROM session_events WHERE event_uid = '8:function_call'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let first: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first["input_tokens"], 1000);
+        assert_eq!(first["cached_input_tokens"], 400);
+        assert_eq!(first["output_tokens"], 120);
+        assert_eq!(first["reasoning_output_tokens"], 30);
+        let second: String = conn
+            .query_row(
+                "SELECT token_json FROM session_events WHERE event_uid = '14:agent_message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let second: Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(second["input_tokens"], 600);
+        assert_eq!(second["cached_input_tokens"], 500);
+        assert_eq!(second["cache_write_input_tokens"], 50);
+        assert_eq!(second["output_tokens"], 60);
+        let token_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE token_json IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(token_rows, 2);
+        // Summing per-event deltas reproduces the session's final totals.
+        let output_sum: i64 = conn
+            .query_row(
+                "SELECT SUM(json_extract(token_json, '$.output_tokens')) FROM session_events",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(output_sum, 180);
+
+        let calls: Vec<(String, String, Option<String>, Option<i64>)> = conn
+            .prepare("SELECT tool_use_id, name, target, is_error FROM tool_calls ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "call_1".into(),
+                    "exec_command".into(),
+                    Some("git status".into()),
+                    None
+                ),
+                (
+                    "call_2".into(),
+                    "apply_patch".into(),
+                    Some("/tmp/proj/README.md".into()),
+                    Some(0),
+                ),
+            ]
+        );
+
+        let edit: (String, i64, i64, String) = conn
+            .query_row(
+                "SELECT file_path, lines_added, lines_removed, structured_patch_json FROM file_edits",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(edit.0, "/tmp/proj/README.md");
+        assert_eq!((edit.1, edit.2), (1, 1));
+        assert!(edit.3.contains("unified_diff"));
+    }
+
+    #[test]
+    fn codex_rollout_reingest_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-rich.jsonl");
+        write_rich_codex_rollout(&path);
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = codex_meta(&path);
+        super::ingest_codex_rollout(&conn, &path, &meta).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &meta).unwrap();
+        let counts: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM session_events), (SELECT COUNT(*) FROM tool_calls), \
+                 (SELECT COUNT(*) FROM file_edits), (SELECT COUNT(*) FROM history)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (6, 2, 1, 1));
+    }
+
+    #[test]
+    fn resumed_codex_rollout_treats_first_snapshot_as_carried_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-resumed.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":"2026-08-02T09:00:00.000Z","type":"session_meta","payload":{"id":"sess-resumed","cwd":"/tmp/proj"}}"#, "\n",
+                r#"{"timestamp":"2026-08-02T09:00:00.100Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":120,"reasoning_output_tokens":0,"total_tokens":1120}}}}"#, "\n",
+                r#"{"timestamp":"2026-08-02T09:00:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Picking the work back up."}}"#, "\n",
+                r#"{"timestamp":"2026-08-02T09:00:01.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":40,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":4,"reasoning_output_tokens":0,"total_tokens":44}}}}"#, "\n",
+                r#"{"timestamp":"2026-08-02T09:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1500,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":150,"reasoning_output_tokens":0,"total_tokens":1650}}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+        let token_json: String = conn
+            .query_row(
+                "SELECT token_json FROM session_events WHERE token_json IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let delta: Value = serde_json::from_str(&token_json).unwrap();
+        assert_eq!(delta["input_tokens"], 500);
+        assert_eq!(delta["output_tokens"], 30);
+    }
+
+    #[test]
+    fn codex_rollout_ignores_a_half_written_trailing_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-torn.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":"2026-08-02T09:00:00.000Z","type":"session_meta","payload":{"id":"sess-torn","cwd":"/tmp/proj"}}"#, "\n",
+                r#"{"timestamp":"2026-08-02T09:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"first"}}"#, "\n",
+                r#"{"timestamp":"2026-08-02T09:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"tor"#,
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let outcome = super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+        assert_eq!(outcome.events, 1);
+        let text: String = conn
+            .query_row("SELECT text FROM session_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(text, "first");
+    }
+
+    #[test]
+    fn subagent_rollouts_keep_events_but_stay_out_of_the_session_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/08/01");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-2026-08-01T10-00-00-top.jsonl"),
+            concat!(
+                r#"{"timestamp":"2026-08-01T10:00:00.000Z","type":"session_meta","payload":{"id":"sess-top","cwd":"/tmp/proj"}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"do the thing"}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Doing it."}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            day.join("rollout-2026-08-01T10-01-00-sub.jsonl"),
+            concat!(
+                r#"{"timestamp":"2026-08-01T10:01:00.000Z","type":"session_meta","payload":{"id":"sess-sub","session_id":"sess-top","parent_thread_id":"sess-top","thread_source":"subagent","source":{"subagent":{"other":"guardian"}},"cwd":"/tmp/proj"}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:01:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Reviewing."}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        // Stale keys from the split-walk era are dropped from state.
+        state.insert("codex_rollouts".into(), json!({"old": "1:1"}));
+        state.insert(
+            "codex_rollout_user_messages_v2".into(),
+            json!({"old": "1:1"}),
+        );
+        // A sync predating subagent detection left the thread registered:
+        // a cwd-map entry, a prompt row, and a session row.
+        state.insert(
+            "codex_session_cwds".into(),
+            json!({"sess-sub": "/tmp/proj"}),
+        );
+        conn.execute(
+            "INSERT INTO history (source, session_id, project, prompt, timestamp_ms) VALUES ('codex', 'sess-sub', '/tmp/proj', 'do a review', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) VALUES ('sess-sub', 'codex', '/tmp/proj')",
+            [],
+        )
+        .unwrap();
+        let (cwds, _, inserted) = super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(inserted, 1);
+        // Subagent threads never reach the maps, prompt history, or session
+        // registration — including rows left behind by earlier syncs.
+        assert_eq!(cwds.get("sess-sub"), None);
+        let sub_history: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE session_id = 'sess-sub'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sub_history, 0);
+        assert!(state.get("codex_rollouts").is_none());
+        assert!(state.get("codex_rollout_user_messages_v2").is_none());
+
+        let sessions: Vec<String> = conn
+            .prepare("SELECT session_id FROM sessions WHERE source='codex' ORDER BY session_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(sessions, vec!["sess-top".to_string()]);
+        let event_sessions: Vec<String> = conn
+            .prepare("SELECT DISTINCT session_id FROM session_events ORDER BY session_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            event_sessions,
+            vec!["sess-sub".to_string(), "sess-top".to_string()]
+        );
+
+        // A second walk with unchanged stamps ingests nothing new.
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0))
+            .unwrap();
+        let (_, _, inserted_again) = super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(inserted_again, 0);
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn sidechain_rows_keep_assistant_output_but_drop_fake_user_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-sub.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"su1","sessionId":"s-parent","isSidechain":true,"cwd":"/tmp/proj","timestamp":"2026-06-25T10:00:00.000Z","message":{"role":"user","content":"Research the repo thoroughly."}}"#, "\n",
+                r#"{"type":"assistant","uuid":"sa1","sessionId":"s-parent","isSidechain":true,"cwd":"/tmp/proj","timestamp":"2026-06-25T10:01:00.000Z","message":{"id":"msg_sub","role":"assistant","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":20},"content":[{"type":"text","text":"Here is the report."}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT role, text FROM session_events ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![("assistant".into(), "Here is the report.".into())]
+        );
     }
 }
