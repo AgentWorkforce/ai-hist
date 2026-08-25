@@ -157,4 +157,19 @@ preserve_output=$(
 grep -q 'left unrecognized file untouched' <<<"$preserve_output"
 test "$(cat "$BINARY_BIN/ai-hist-rust")" = "user-owned command"
 
+rm -f "$BINARY_BIN/ai-hist-rust"
+ln -s "$TMP/missing-legacy-target" "$BINARY_BIN/ai-hist-rust"
+symlink_output=$(
+  PATH="$FAKE_TOOLS:$PATH" \
+  HOME="$INSTALL_HOME" \
+  AI_HIST_INSTALL_METHOD=binary \
+  AI_HIST_BINARY_URL="file://$FAKE_BINARY" \
+  AI_HIST_BIN_DIR="$BINARY_BIN" \
+  AI_HIST_INSTALL_DIR="$BINARY_SHARE" \
+  AI_HIST_NO_AUTOSYNC=1 \
+    sh "$ROOT/install.sh" 2>&1
+)
+grep -q 'left symlink untouched' <<<"$symlink_output"
+test -L "$BINARY_BIN/ai-hist-rust"
+
 echo "Installer verification completed"

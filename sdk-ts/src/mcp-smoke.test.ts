@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { mkdtemp, mkdir, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -180,39 +180,57 @@ test('SDK fallback ingests compacted per-run trajectories from TRAJECTORY_ROOT',
 test('SDK fallback ingests OpenCode rows committed in WAL files', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ai-hist-opencode-wal-'));
   const dbPath = join(root, 'opencode.db');
-  const child = spawn('sqlite3', ['-bail', dbPath], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn('sqlite3', ['-bail', dbPath], { stdio: ['pipe', 'ignore', 'pipe'] });
   const stderr: Buffer[] = [];
   child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
   const fixtureReady = new Promise<string>((resolve, reject) => {
-    let stdout = '';
-    const timer = setTimeout(
-      () => reject(new Error(`timed out waiting for sqlite fixture: ${Buffer.concat(stderr).toString('utf8')}`)),
-      5_000,
-    );
+    const deadline = Date.now() + 5_000;
+    let settled = false;
+    let retryTimer: NodeJS.Timeout | undefined;
+    const finish = (error?: Error, output?: string) => {
+      if (settled) return;
+      settled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (error) reject(error);
+      else resolve(output ?? '');
+    };
+    const poll = () => {
+      execFile(
+        'sqlite3',
+        ['-readonly', dbPath, "PRAGMA journal_mode; SELECT count(*) FROM part;"],
+        (error, stdout) => {
+          if (!error && stdout === 'wal\n1\n') {
+            finish(undefined, stdout);
+            return;
+          }
+          if (Date.now() >= deadline) {
+            finish(
+              new Error(
+                `timed out waiting for sqlite fixture: ${Buffer.concat(stderr).toString('utf8')}; ` +
+                  `last probe: ${error ? String(error) : JSON.stringify(stdout)}`,
+              ),
+            );
+            return;
+          }
+          retryTimer = setTimeout(poll, 25);
+        },
+      );
+    };
     child.once('error', (err) => {
-      clearTimeout(timer);
-      reject(new Error(`could not start sqlite3: ${String(err)}`));
+      finish(new Error(`could not start sqlite3: ${String(err)}`));
     });
     child.stdin.once('error', (err) => {
-      clearTimeout(timer);
-      reject(new Error(`could not write sqlite fixture: ${String(err)}`));
-    });
-    child.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
-      if (stdout.includes('FIXTURE_READY\n')) {
-        clearTimeout(timer);
-        resolve(stdout);
-      }
+      finish(new Error(`could not write sqlite fixture: ${String(err)}`));
     });
     child.once('exit', (code, signal) => {
-      clearTimeout(timer);
-      reject(
+      finish(
         new Error(
           `sqlite3 exited before fixture readiness (code=${String(code)}, signal=${String(signal)}): ` +
             Buffer.concat(stderr).toString('utf8'),
         ),
       );
     });
+    poll();
   });
   child.stdin.write(`
 PRAGMA journal_mode=WAL;
@@ -223,8 +241,6 @@ CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_c
 INSERT INTO session VALUES ('oc-ts-wal', '/tmp/opencode-ts', 1700000000000);
 INSERT INTO message VALUES ('msg-ts-wal', 'oc-ts-wal', 1700000001000, '{"role":"user"}');
 INSERT INTO part VALUES ('part-ts-wal', 'msg-ts-wal', 'oc-ts-wal', 1700000002000, '{"type":"text","text":"ts wal opencode prompt"}');
-SELECT 'ROWCOUNT=' || count(*) FROM part;
-.print FIXTURE_READY
 `);
 
   const previousDb = process.env.AI_HIST_DB;
@@ -236,7 +252,7 @@ SELECT 'ROWCOUNT=' || count(*) FROM part;
   try {
     const fixtureOutput = await fixtureReady;
     assert.match(fixtureOutput, /^wal$/m, 'fixture database did not enter WAL mode');
-    assert.match(fixtureOutput, /^ROWCOUNT=1$/m, 'fixture row was not committed and readable');
+    assert.match(fixtureOutput, /^1$/m, 'fixture row was not committed and readable');
     const hist = await openAiHist({ dbPath: process.env.AI_HIST_DB });
     try {
       assert.deepEqual(

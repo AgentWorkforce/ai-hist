@@ -139,7 +139,11 @@ remove_if_legacy() {
   path="$1"
   max_bytes="$2"
   shift 2
-  if [ ! -f "$path" ] || [ -L "$path" ]; then
+  if [ -L "$path" ]; then
+    warn "left symlink untouched: $path"
+    return 0
+  fi
+  if [ ! -f "$path" ]; then
     return 0
   fi
   size=$(wc -c < "$path" | tr -d ' ')
