@@ -48,6 +48,10 @@ The installer installs the `ai-hist` launcher. For normal installs it downloads
 a prebuilt Rust binary from GitHub Releases, so users do not need a local Rust
 toolchain.
 
+Upgrading to the Rust-only release removes installer-managed `ai-hist-python`
+and `ai-hist-rust` compatibility launchers. Unrecognized files with those names
+are left untouched and reported by the installer.
+
 If no prebuilt binary is available for your platform, the installer falls back
 to building from source. That fallback requires `cargo`; install Rust from
 <https://rustup.rs/> if you intentionally use the source path.
@@ -361,8 +365,8 @@ launchctl unload ~/Library/LaunchAgents/com.ai-hist.sync.plist 2>/dev/null
 launchctl load ~/Library/LaunchAgents/com.ai-hist.sync.plist
 ```
 
-> Replace `$HOME/.local/bin/ai-hist` with the wrapper path you installed if
-> needed, then confirm the job is healthy with
+> Replace `$HOME/.local/bin/ai-hist` with the literal path to your installed
+> `ai-hist` launcher if needed, then confirm the job is healthy with
 > `launchctl list | grep ai-hist` (the middle "last exit status" column should
 > be `0`, not `1`).
 

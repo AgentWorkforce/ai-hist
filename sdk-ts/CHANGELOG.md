@@ -7,17 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- Make the repository and installer Rust-only. The source-checkout launcher is
-  now a small POSIX shell script, and CI no longer requires a Python runtime.
-
-### Removed
-
-- Remove the legacy Python CLI, its compatibility dispatcher, and the redundant
-  public `ai-hist-python` / `ai-hist-rust` launchers. The installer cleans up
-  those launchers when upgrading an existing installation.
-
 ## [0.5.0] - 2026-08-20
 
 ### Added

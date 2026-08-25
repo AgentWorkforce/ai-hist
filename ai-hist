@@ -3,7 +3,21 @@ set -eu
 
 # Development launcher. Installed releases execute the prebuilt Rust binary
 # directly; a source checkout uses Cargo unless a binary is supplied.
-ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -n "${AI_HIST_CLI:-}" ]; then
+  echo "ai-hist: AI_HIST_CLI is no longer supported; the Python CLI was removed." >&2
+  exit 2
+fi
+
+SCRIPT_PATH=$0
+while [ -L "$SCRIPT_PATH" ]; do
+  SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+  LINK_TARGET=$(readlink "$SCRIPT_PATH")
+  case "$LINK_TARGET" in
+    /*) SCRIPT_PATH=$LINK_TARGET ;;
+    *) SCRIPT_PATH=$SCRIPT_DIR/$LINK_TARGET ;;
+  esac
+done
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
 
 if [ -n "${AI_HIST_RUST_BIN:-}" ]; then
   exec "$AI_HIST_RUST_BIN" "$@"

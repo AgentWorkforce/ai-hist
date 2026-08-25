@@ -737,7 +737,7 @@ export class AiHist {
     return this._source.path;
   }
 
-  /** Which data path was used: `'sqlite'` (native CLI) or `'jsonl'` (fallback). */
+  /** Which data path was used: `'sqlite'` (on-disk SQLite database) or `'jsonl'` (fallback). */
   get sourceKind(): 'sqlite' | 'jsonl' {
     return this._source.kind;
   }

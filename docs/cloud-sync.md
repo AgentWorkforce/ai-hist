@@ -39,9 +39,12 @@ The cloud commands (`login` / `admin-mint` / `push`) are included in the standar
 `ai-hist` binary. Install the latest release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AgentWorkforce/relayhistory/main/install.sh | sh
-ai-hist --help                    # lists login, admin-mint, and push
+curl -fsSL https://raw.githubusercontent.com/AgentWorkforce/relayhistory/main/install.sh | AI_HIST_NO_AUTOSYNC=1 sh
+"$HOME/.local/bin/ai-hist" --help  # lists login, admin-mint, and push
 ```
+
+`AI_HIST_NO_AUTOSYNC=1` avoids installing a separate sync service because the
+automation example below configures its own combined sync-and-push schedule.
 
 Existing captured history in `~/.local/share/ai-hist/ai-history.db` is what `push`
 sends. If you have nothing captured yet, run `ai-hist sync` first. (If `push` ever

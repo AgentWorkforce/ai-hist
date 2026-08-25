@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -180,10 +180,40 @@ test('SDK fallback ingests compacted per-run trajectories from TRAJECTORY_ROOT',
 test('SDK fallback ingests OpenCode rows committed in WAL files', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ai-hist-opencode-wal-'));
   const dbPath = join(root, 'opencode.db');
-  const readyPath = join(root, 'ready');
-  const child = spawn('sqlite3', [dbPath], { stdio: ['pipe', 'ignore', 'pipe'] });
+  const child = spawn('sqlite3', ['-bail', dbPath], { stdio: ['pipe', 'pipe', 'pipe'] });
   const stderr: Buffer[] = [];
   child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+  const fixtureReady = new Promise<string>((resolve, reject) => {
+    let stdout = '';
+    const timer = setTimeout(
+      () => reject(new Error(`timed out waiting for sqlite fixture: ${Buffer.concat(stderr).toString('utf8')}`)),
+      5_000,
+    );
+    child.once('error', (err) => {
+      clearTimeout(timer);
+      reject(new Error(`could not start sqlite3: ${String(err)}`));
+    });
+    child.stdin.once('error', (err) => {
+      clearTimeout(timer);
+      reject(new Error(`could not write sqlite fixture: ${String(err)}`));
+    });
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString('utf8');
+      if (stdout.includes('FIXTURE_READY\n')) {
+        clearTimeout(timer);
+        resolve(stdout);
+      }
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      reject(
+        new Error(
+          `sqlite3 exited before fixture readiness (code=${String(code)}, signal=${String(signal)}): ` +
+            Buffer.concat(stderr).toString('utf8'),
+        ),
+      );
+    });
+  });
   child.stdin.write(`
 PRAGMA journal_mode=WAL;
 PRAGMA wal_autocheckpoint=0;
@@ -193,7 +223,8 @@ CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_c
 INSERT INTO session VALUES ('oc-ts-wal', '/tmp/opencode-ts', 1700000000000);
 INSERT INTO message VALUES ('msg-ts-wal', 'oc-ts-wal', 1700000001000, '{"role":"user"}');
 INSERT INTO part VALUES ('part-ts-wal', 'msg-ts-wal', 'oc-ts-wal', 1700000002000, '{"type":"text","text":"ts wal opencode prompt"}');
-.shell touch ${readyPath}
+SELECT 'ROWCOUNT=' || count(*) FROM part;
+.print FIXTURE_READY
 `);
 
   const previousDb = process.env.AI_HIST_DB;
@@ -203,7 +234,9 @@ INSERT INTO part VALUES ('part-ts-wal', 'msg-ts-wal', 'oc-ts-wal', 1700000002000
   process.env.OPENCODE_DB = dbPath;
   process.env.TRAJECTORY_ROOT = join(root, 'missing-trajectories');
   try {
-    await waitForFile(readyPath, () => Buffer.concat(stderr).toString('utf8'));
+    const fixtureOutput = await fixtureReady;
+    assert.match(fixtureOutput, /^wal$/m, 'fixture database did not enter WAL mode');
+    assert.match(fixtureOutput, /^ROWCOUNT=1$/m, 'fixture row was not committed and readable');
     const hist = await openAiHist({ dbPath: process.env.AI_HIST_DB });
     try {
       assert.deepEqual(
@@ -344,19 +377,6 @@ test('MCP server exposes history and trajectory tools over stdio', async () => {
 
 function writeJsonRpc(stdin: NodeJS.WritableStream, payload: unknown): void {
   stdin.write(`${JSON.stringify(payload)}\n`);
-}
-
-async function waitForFile(path: string, getError: () => string): Promise<void> {
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    try {
-      await stat(path);
-      return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  }
-  throw new Error(`timed out waiting for ${path}: ${getError()}`);
 }
 
 async function writeScopeFixtureDb(dbPath: string): Promise<void> {

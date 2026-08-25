@@ -5,6 +5,26 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+command -v sqlite3 >/dev/null || { echo "verify-e2e: sqlite3 is required" >&2; exit 1; }
+command -v npm >/dev/null || { echo "verify-e2e: npm is required" >&2; exit 1; }
+unset AI_HIST_CLI
+
+assert_eq() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "FAIL $label: got '$actual', want '$expected'" >&2
+    exit 1
+  fi
+}
+
+assert_contains() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" != *"$expected"* ]]; then
+    echo "FAIL $label: '$actual' does not contain '$expected'" >&2
+    exit 1
+  fi
+}
+
 export AI_HIST_DB="$TMP/ai-history.db"
 export TRAJECTORY_ROOT="$TMP/trajectories"
 export OPENCODE_DB="$TMP/opencode.db"
@@ -12,14 +32,6 @@ export HOME="$TMP/home"
 mkdir -p "$HOME/.claude/projects/e2e-project" "$HOME/.codex/sessions/2026/06/20" "$TRAJECTORY_ROOT/planner/compacted"
 mkdir -p "$HOME/.grok/sessions/%2Ftmp%2Fe2e%2Fgrok/grok-e2e"
 mkdir -p "$HOME/.cursor/projects/tmp-e2e-cursor/agent-transcripts/cursor-e2e"
-
-rust_ai_hist() {
-  if [[ -n "${AI_HIST_RUST_BIN:-}" ]]; then
-    "$AI_HIST_RUST_BIN" "$@"
-  else
-    cargo run -q -p ai-hist-cli --manifest-path "$ROOT/Cargo.toml" -- "$@"
-  fi
-}
 
 cat > "$HOME/.claude/history.jsonl" <<'JSONL'
 {"display":"e2e claude release tagging prompt","timestamp":1700000000000,"project":"/tmp/e2e/project","sessionId":"claude-e2e"}
@@ -80,7 +92,7 @@ cat > "$TRAJECTORY_ROOT/planner/compacted/trajectory-e2e.json" <<'JSON'
 }
 JSON
 
-sqlite3 "$OPENCODE_DB" <<'SQL'
+sqlite3 -bail "$OPENCODE_DB" <<'SQL'
 CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER);
 CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
 CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
@@ -104,24 +116,32 @@ SQL
 "$ROOT/ai-hist" stats --json >/dev/null
 "$ROOT/ai-hist" tags --sessions --json >/dev/null
 
-sources=$(sqlite3 "$AI_HIST_DB" "SELECT group_concat(source, ',') FROM (SELECT DISTINCT source FROM history ORDER BY source)")
-test "$sources" = "claude,codex,cursor,grok,opencode,trajectory"
+sources=$(sqlite3 "$AI_HIST_DB" "SELECT DISTINCT source FROM history" | sort)
+for expected_source in claude codex cursor grok opencode trajectory; do
+  if ! grep -Fxq "$expected_source" <<<"$sources"; then
+    echo "FAIL sources: missing '$expected_source'; got: $(tr '\n' ',' <<<"$sources")" >&2
+    exit 1
+  fi
+done
 
 codex_project=$(sqlite3 "$AI_HIST_DB" "SELECT project FROM history WHERE source='codex' AND session_id='codex-e2e'")
-test "$codex_project" = "/tmp/e2e/codex"
+assert_eq "codex project" "$codex_project" "/tmp/e2e/codex"
 
-claude_session=$(sqlite3 "$AI_HIST_DB" "SELECT cwd || '|' || git_branch || '|' || last_assistant_text FROM sessions WHERE source='claude' AND session_id='claude-e2e'")
-test "$claude_session" = "/tmp/e2e/project|main|assistant summary"
+claude_session=$(sqlite3 -separator '|' "$AI_HIST_DB" "SELECT coalesce(cwd, '<NULL>'), coalesce(git_branch, '<NULL>'), coalesce(last_assistant_text, '<NULL>') FROM sessions WHERE source='claude' AND session_id='claude-e2e'")
+assert_contains "claude session metadata" "$claude_session" "/tmp/e2e/project|main|assistant summary"
 
-grok_session=$(sqlite3 "$AI_HIST_DB" "SELECT cwd || '|' || git_branch || '|' || last_assistant_text FROM sessions WHERE source='grok' AND session_id='grok-e2e'")
-test "$grok_session" = "/tmp/e2e/grok|main|grok assistant summary"
+grok_session=$(sqlite3 -separator '|' "$AI_HIST_DB" "SELECT coalesce(cwd, '<NULL>'), coalesce(git_branch, '<NULL>'), coalesce(last_assistant_text, '<NULL>') FROM sessions WHERE source='grok' AND session_id='grok-e2e'")
+assert_contains "grok session metadata" "$grok_session" "/tmp/e2e/grok|main|grok assistant summary"
 
 synthetic=$(sqlite3 "$AI_HIST_DB" "SELECT COUNT(*) FROM history WHERE source='grok' AND prompt LIKE '%synthetic prompt%'")
-test "$synthetic" = "0"
+assert_eq "grok synthetic prompt count" "$synthetic" "0"
 
-rust_ai_hist --db "$AI_HIST_DB" tag codex-e2e release-e2e --source codex
-rust_ai_hist --db "$AI_HIST_DB" search release --tag release-e2e --json
+"$ROOT/ai-hist" --db "$AI_HIST_DB" tag codex-e2e release-e2e --source codex
+"$ROOT/ai-hist" --db "$AI_HIST_DB" search release --tag release-e2e --json
 
+if [[ ! -x "$ROOT/sdk-ts/node_modules/.bin/tsc" ]]; then
+  (cd "$ROOT/sdk-ts" && npm ci)
+fi
 (cd "$ROOT/sdk-ts" && npm test)
 
 echo "E2E verification completed with temp DB: $AI_HIST_DB"

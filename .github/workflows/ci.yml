@@ -21,6 +21,11 @@ jobs:
           cache: npm
           cache-dependency-path: sdk-ts/package-lock.json
 
+      - name: Install SQLite CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
       - name: Rust formatting
         run: cargo fmt --all -- --check
 

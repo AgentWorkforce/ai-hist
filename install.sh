@@ -125,18 +125,49 @@ install_binary_launchers() {
 
   cat > "$BIN_DIR/ai-hist" <<EOF
 #!/usr/bin/env sh
+if [ -n "\${AI_HIST_CLI:-}" ]; then
+  echo "ai-hist: AI_HIST_CLI is no longer supported; the Python CLI was removed." >&2
+  exit 2
+fi
 exec "\${AI_HIST_RUST_BIN:-$rust_bin}" "\$@"
 EOF
 
   chmod 755 "$BIN_DIR/ai-hist"
 }
 
+remove_if_legacy() {
+  path="$1"
+  max_bytes="$2"
+  shift 2
+  if [ ! -f "$path" ] || [ -L "$path" ]; then
+    return 0
+  fi
+  size=$(wc -c < "$path" | tr -d ' ')
+  if [ "$size" -gt "$max_bytes" ]; then
+    warn "left unrecognized file untouched: $path"
+    return 0
+  fi
+  for marker in "$@"; do
+    if grep -Fq "$marker" "$path" 2>/dev/null; then
+      rm -f "$path"
+      info "removed legacy launcher: $path"
+      return 0
+    fi
+  done
+  warn "left unrecognized file untouched: $path"
+}
+
 remove_legacy_launchers() {
-  rm -f \
-    "$BIN_DIR/ai-hist-python" \
-    "$BIN_DIR/ai-hist-rust" \
-    "$INSTALL_DIR/ai-hist-python" \
-    "$INSTALL_DIR/ai-hist-wrapper"
+  remove_if_legacy "$BIN_DIR/ai-hist-python" 4096 "exec python3" "ai-hist-python was not installed"
+  remove_if_legacy "$BIN_DIR/ai-hist-rust" 4096 "AI_HIST_RUST_BIN" "ai-hist-rust-bin"
+  remove_if_legacy "$INSTALL_DIR/ai-hist-python" 262144 "Zero dependencies — Python standard library only."
+  remove_if_legacy "$INSTALL_DIR/ai-hist-wrapper" 32768 "Rust-first ai-hist dispatcher."
+
+  default_bin="$HOME/.local/bin"
+  if [ "$BIN_DIR" != "$default_bin" ] && \
+     { [ -e "$default_bin/ai-hist-python" ] || [ -e "$default_bin/ai-hist-rust" ]; }; then
+    warn "legacy launchers remain under $default_bin; inspect and remove them manually"
+  fi
 }
 
 install_prebuilt() {
@@ -179,7 +210,7 @@ resolve_source_dir() {
     return 0
   fi
 
-  if [ -f "$(script_dir)/Cargo.toml" ] && [ -f "$(script_dir)/ai-hist" ]; then
+  if [ -f "$(script_dir)/Cargo.toml" ] && [ -f "$(script_dir)/crates/ai-hist/Cargo.toml" ]; then
     echo "$(script_dir)"
     return 0
   fi
@@ -223,7 +254,7 @@ if [ "$INSTALL_METHOD" = "binary" ]; then
   install_prebuilt || exit 1
 elif [ "$INSTALL_METHOD" = "source" ]; then
   install_from_source
-elif [ -z "${AI_HIST_SOURCE_DIR:-}" ] && ! { [ -f "$(script_dir)/Cargo.toml" ] && [ -f "$(script_dir)/ai-hist" ]; }; then
+elif [ -z "${AI_HIST_SOURCE_DIR:-}" ] && ! { [ -f "$(script_dir)/Cargo.toml" ] && [ -f "$(script_dir)/crates/ai-hist/Cargo.toml" ]; }; then
   install_prebuilt || install_from_source
 else
   install_from_source
