@@ -27,15 +27,26 @@ write_legacy_files() {
 if [ "${AI_HIST_CLI:-auto}" = "python" ]; then exit 99; fi
 SH
   cat > "$bin_dir/ai-hist-python" <<'SH'
-#!/bin/sh
+#!/usr/bin/env sh
 exec python3 "/legacy/ai-hist-python" "$@"
 SH
   cat > "$bin_dir/ai-hist-rust" <<'SH'
-#!/bin/sh
+#!/usr/bin/env sh
 exec "${AI_HIST_RUST_BIN:-/legacy/ai-hist-rust-bin}" "$@"
 SH
-  printf '%s\n' 'Zero dependencies — Python standard library only.' > "$share_dir/ai-hist-python"
-  printf '%s\n' '"""Rust-first ai-hist dispatcher."""' > "$share_dir/ai-hist-wrapper"
+  cat > "$share_dir/ai-hist-python" <<'PY'
+#!/usr/bin/env python3
+"""
+ai-hist: Sync and search AI CLI conversation history in SQLite.
+Zero dependencies — Python standard library only.
+"""
+PY
+  cat > "$share_dir/ai-hist-wrapper" <<'PY'
+#!/usr/bin/env python3
+"""Rust-first ai-hist dispatcher."""
+PYTHON_CLI = ROOT / "ai-hist-python"
+RUST_MANIFEST = ROOT / "Cargo.toml"
+PY
 }
 
 assert_legacy_removed() {
@@ -143,7 +154,14 @@ test "$("$BINARY_BIN/ai-hist" --version)" = "ai-hist 9.9.9"
 test "$("$BINARY_BIN/ai-hist" recent)" = "[]"
 assert_legacy_removed "$BINARY_BIN" "$BINARY_SHARE"
 
-printf '%s\n' 'user-owned command' > "$BINARY_BIN/ai-hist-rust"
+cat > "$BINARY_BIN/ai-hist-rust" <<'SH'
+#!/bin/sh
+echo "custom launcher using ${AI_HIST_RUST_BIN:-custom-ai-hist}"
+SH
+cat > "$BINARY_BIN/ai-hist-python" <<'SH'
+#!/bin/sh
+exec python3 "/opt/custom/history-tool.py" "$@"
+SH
 preserve_output=$(
   PATH="$FAKE_TOOLS:$PATH" \
   HOME="$INSTALL_HOME" \
@@ -155,7 +173,8 @@ preserve_output=$(
     sh "$ROOT/install.sh" 2>&1
 )
 grep -q 'left unrecognized file untouched' <<<"$preserve_output"
-test "$(cat "$BINARY_BIN/ai-hist-rust")" = "user-owned command"
+grep -q 'custom launcher using' "$BINARY_BIN/ai-hist-rust"
+grep -q '/opt/custom/history-tool.py' "$BINARY_BIN/ai-hist-python"
 
 rm -f "$BINARY_BIN/ai-hist-rust"
 ln -s "$TMP/missing-legacy-target" "$BINARY_BIN/ai-hist-rust"
@@ -171,5 +190,6 @@ symlink_output=$(
 )
 grep -q 'left symlink untouched' <<<"$symlink_output"
 test -L "$BINARY_BIN/ai-hist-rust"
+test "$(readlink "$BINARY_BIN/ai-hist-rust")" = "$TMP/missing-legacy-target"
 
 echo "Installer verification completed"

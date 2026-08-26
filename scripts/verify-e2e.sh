@@ -23,6 +23,7 @@ export TRAJECTORY_ROOT="$TMP/trajectories"
 export OPENCODE_DB="$TMP/opencode.db"
 export HOME="$TMP/home"
 export NPM_CONFIG_CACHE="$VERIFY_E2E_NPM_CACHE"
+unset RELAYCAST_API_KEY RELAYCAST_WORKSPACE_ID RELAYCAST_BASE_URL
 mkdir -p "$HOME/.claude/projects/e2e-project" "$HOME/.codex/sessions/2026/06/20" "$TRAJECTORY_ROOT/planner/compacted"
 mkdir -p "$HOME/.grok/sessions/%2Ftmp%2Fe2e%2Fgrok/grok-e2e"
 mkdir -p "$HOME/.cursor/projects/tmp-e2e-cursor/agent-transcripts/cursor-e2e"

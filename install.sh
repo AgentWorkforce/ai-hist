@@ -151,21 +151,30 @@ remove_if_legacy() {
     warn "left unrecognized file untouched: $path"
     return 0
   fi
-  for marker in "$@"; do
-    if grep -Fq "$marker" "$path" 2>/dev/null; then
-      rm -f "$path"
-      info "removed legacy launcher: $path"
+  for required_marker in "$@"; do
+    if ! grep -Fq "$required_marker" "$path" 2>/dev/null; then
+      warn "left unrecognized file untouched: $path"
       return 0
     fi
   done
-  warn "left unrecognized file untouched: $path"
+  rm -f "$path"
+  info "removed legacy launcher: $path"
 }
 
 remove_legacy_launchers() {
-  remove_if_legacy "$BIN_DIR/ai-hist-python" 4096 "exec python3" "ai-hist-python was not installed"
-  remove_if_legacy "$BIN_DIR/ai-hist-rust" 4096 "AI_HIST_RUST_BIN" "ai-hist-rust-bin"
-  remove_if_legacy "$INSTALL_DIR/ai-hist-python" 262144 "Zero dependencies — Python standard library only."
-  remove_if_legacy "$INSTALL_DIR/ai-hist-wrapper" 32768 "Rust-first ai-hist dispatcher."
+  remove_if_legacy "$BIN_DIR/ai-hist-python" 4096 \
+    "#!/usr/bin/env sh" "exec python3" '/ai-hist-python" "$@"'
+  remove_if_legacy "$BIN_DIR/ai-hist-rust" 4096 \
+    "#!/usr/bin/env sh" "ai-hist-rust-bin" '"$@"'
+  remove_if_legacy "$INSTALL_DIR/ai-hist-python" 262144 \
+    "#!/usr/bin/env python3" \
+    "ai-hist: Sync and search AI CLI conversation history in SQLite." \
+    "Zero dependencies — Python standard library only."
+  remove_if_legacy "$INSTALL_DIR/ai-hist-wrapper" 32768 \
+    "#!/usr/bin/env python3" \
+    '"""Rust-first ai-hist dispatcher."""' \
+    'PYTHON_CLI = ROOT / "ai-hist-python"' \
+    'RUST_MANIFEST = ROOT / "Cargo.toml"'
 
   default_bin="$HOME/.local/bin"
   if [ "$BIN_DIR" != "$default_bin" ] && \
