@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { execFile, spawn } from 'node:child_process';
+import { mkdtemp, mkdir, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -180,36 +180,68 @@ test('SDK fallback ingests compacted per-run trajectories from TRAJECTORY_ROOT',
 test('SDK fallback ingests OpenCode rows committed in WAL files', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ai-hist-opencode-wal-'));
   const dbPath = join(root, 'opencode.db');
-  const readyPath = join(root, 'ready');
-  const child = spawn(
-    'python3',
-    [
-      '-c',
-      `
-import json, pathlib, sqlite3, time
-db = pathlib.Path(${JSON.stringify(dbPath)})
-ready = pathlib.Path(${JSON.stringify(readyPath)})
-conn = sqlite3.connect(db)
-conn.execute("PRAGMA journal_mode=WAL")
-conn.execute("PRAGMA wal_autocheckpoint=0")
-conn.execute("CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER)")
-conn.execute("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)")
-conn.execute("CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT)")
-conn.execute("INSERT INTO session VALUES ('oc-ts-wal', '/tmp/opencode-ts', 1700000000000)")
-conn.execute("INSERT INTO message VALUES ('msg-ts-wal', 'oc-ts-wal', 1700000001000, ?)", (json.dumps({"role":"user"}),))
-conn.execute("INSERT INTO part VALUES ('part-ts-wal', 'msg-ts-wal', 'oc-ts-wal', 1700000002000, ?)", (json.dumps({"type":"text","text":"ts wal opencode prompt"}),))
-conn.commit()
-live = sqlite3.connect(db)
-assert live.execute("SELECT COUNT(*) FROM part").fetchone()[0] == 1
-live.close()
-ready.write_text("ready")
-time.sleep(60)
-`,
-    ],
-    { stdio: ['ignore', 'ignore', 'pipe'] },
-  );
+  const child = spawn('sqlite3', ['-bail', dbPath], { stdio: ['pipe', 'ignore', 'pipe'] });
   const stderr: Buffer[] = [];
   child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+  const fixtureReady = new Promise<string>((resolve, reject) => {
+    const deadline = Date.now() + 5_000;
+    let settled = false;
+    let retryTimer: NodeJS.Timeout | undefined;
+    const finish = (error?: Error, output?: string) => {
+      if (settled) return;
+      settled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (error) reject(error);
+      else resolve(output ?? '');
+    };
+    const poll = () => {
+      execFile(
+        'sqlite3',
+        ['-readonly', dbPath, "PRAGMA journal_mode; SELECT count(*) FROM part;"],
+        (error, stdout) => {
+          if (!error && stdout === 'wal\n1\n') {
+            finish(undefined, stdout);
+            return;
+          }
+          if (Date.now() >= deadline) {
+            finish(
+              new Error(
+                `timed out waiting for sqlite fixture: ${Buffer.concat(stderr).toString('utf8')}; ` +
+                  `last probe: ${error ? String(error) : JSON.stringify(stdout)}`,
+              ),
+            );
+            return;
+          }
+          retryTimer = setTimeout(poll, 25);
+        },
+      );
+    };
+    child.once('error', (err) => {
+      finish(new Error(`could not start sqlite3: ${String(err)}`));
+    });
+    child.stdin.once('error', (err) => {
+      finish(new Error(`could not write sqlite fixture: ${String(err)}`));
+    });
+    child.once('exit', (code, signal) => {
+      finish(
+        new Error(
+          `sqlite3 exited before fixture readiness (code=${String(code)}, signal=${String(signal)}): ` +
+            Buffer.concat(stderr).toString('utf8'),
+        ),
+      );
+    });
+    poll();
+  });
+  child.stdin.write(`
+PRAGMA journal_mode=WAL;
+PRAGMA wal_autocheckpoint=0;
+CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER);
+CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+INSERT INTO session VALUES ('oc-ts-wal', '/tmp/opencode-ts', 1700000000000);
+INSERT INTO message VALUES ('msg-ts-wal', 'oc-ts-wal', 1700000001000, '{"role":"user"}');
+INSERT INTO part VALUES ('part-ts-wal', 'msg-ts-wal', 'oc-ts-wal', 1700000002000, '{"type":"text","text":"ts wal opencode prompt"}');
+`);
 
   const previousDb = process.env.AI_HIST_DB;
   const previousOpenCode = process.env.OPENCODE_DB;
@@ -218,7 +250,9 @@ time.sleep(60)
   process.env.OPENCODE_DB = dbPath;
   process.env.TRAJECTORY_ROOT = join(root, 'missing-trajectories');
   try {
-    await waitForFile(readyPath, () => Buffer.concat(stderr).toString('utf8'));
+    const fixtureOutput = await fixtureReady;
+    assert.match(fixtureOutput, /^wal$/m, 'fixture database did not enter WAL mode');
+    assert.match(fixtureOutput, /^1$/m, 'fixture row was not committed and readable');
     const hist = await openAiHist({ dbPath: process.env.AI_HIST_DB });
     try {
       assert.deepEqual(
@@ -359,19 +393,6 @@ test('MCP server exposes history and trajectory tools over stdio', async () => {
 
 function writeJsonRpc(stdin: NodeJS.WritableStream, payload: unknown): void {
   stdin.write(`${JSON.stringify(payload)}\n`);
-}
-
-async function waitForFile(path: string, getError: () => string): Promise<void> {
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    try {
-      await stat(path);
-      return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  }
-  throw new Error(`timed out waiting for ${path}: ${getError()}`);
 }
 
 async function writeScopeFixtureDb(dbPath: string): Promise<void> {

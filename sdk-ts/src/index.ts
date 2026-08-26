@@ -292,8 +292,8 @@ export interface OpenOptions {
   /**
    * What to do when the SQLite DB is missing:
    *   - `'jsonl'` (default): scan local Claude/Codex/Cursor/Grok history files
-   *     directly into an in-memory SQLite — works without the Python
-   *     `ai-hist sync` tool installed.
+   *     directly into an in-memory SQLite — works without the native
+   *     `ai-hist` CLI installed.
    *   - `'error'`: throw with an install hint (legacy 0.1.x behavior).
    */
   fallback?: 'jsonl' | 'error';
@@ -329,7 +329,7 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
     ensureSessionsSchema(db);
     // Add git_branch to history if missing (pre-handoff DBs lack this column).
     try { db.run('ALTER TABLE history ADD COLUMN git_branch TEXT'); } catch { /* already exists */ }
-    // The Python CLI's schema doesn't create `idx_history_session` or
+    // Older database schemas don't contain `idx_history_session` or
     // `idx_history_timestamp`. Without them, listSessions degrades to
     // an O(sessions × rows) full table scan and freezes the WASM
     // single-threaded JS engine for tens of seconds on real-sized DBs.
@@ -350,8 +350,8 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
   }
 
   // Fallback: scan local source files (Claude/Codex/Cursor/Grok) directly.
-  // No Python dependency; uses the same parsers documented in the Python
-  // CLI's source. Yields control to the event loop between sources so a
+  // Uses TypeScript implementations of the source parsers. Yields control to
+  // the event loop between sources so a
   // large local history doesn't freeze the host.
   const db = new SQL.Database();
   db.run(`CREATE TABLE history (
@@ -737,7 +737,7 @@ export class AiHist {
     return this._source.path;
   }
 
-  /** Which data path was used: `'sqlite'` (Python tool) or `'jsonl'` (fallback). */
+  /** Which data path was used: `'sqlite'` (on-disk SQLite database) or `'jsonl'` (fallback). */
   get sourceKind(): 'sqlite' | 'jsonl' {
     return this._source.kind;
   }
@@ -960,8 +960,8 @@ export class AiHist {
    * 35K-row DB. Switched to `ROW_NUMBER() OVER (PARTITION BY session_id
    * ORDER BY timestamp_ms)` so first-prompt picking is a single pass
    * over the table (~300ms on the same DB). Plus the index ensure step
-   * in `openAiHist` keeps it fast even when the DB was written by the
-   * older Python CLI that didn't create `idx_history_session`.
+   * in `openAiHist` keeps it fast even when the DB was written by an
+   * older CLI that didn't create `idx_history_session`.
    */
   listSessions(opts: ListOptions = {}): SessionSummary[] {
     const limit = opts.limit ?? 50;
@@ -1162,7 +1162,7 @@ export class AiHist {
 
   /**
    * Substring search across prompt + project, case-insensitive, recent
-   * matches first. The Python CLI uses FTS5; this SDK uses LIKE because
+   * matches first. The native CLI uses FTS5; this SDK uses LIKE because
    * sql.js's default WASM build doesn't ship the FTS5 module. Plenty fast
    * for the ai-hist scale (~tens of thousands of rows); revisit if a
    * future consumer needs phrase/boolean queries.

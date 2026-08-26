@@ -1312,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn fts_query_matches_python_semantics() {
+    fn fts_query_preserves_established_semantics() {
         assert_eq!(
             build_fts_query(&["deploy".into(), "-relay".into()], false),
             "\"deploy\" NOT \"relay\""

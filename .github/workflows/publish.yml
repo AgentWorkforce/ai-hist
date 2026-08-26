@@ -2,8 +2,8 @@ name: Publish ai-hist packages
 
 # Publishes `ai-hist` from `sdk-ts/` and the thin `ai-hist-mcp`
 # npx wrapper from `mcp-package/` to npm via OIDC trusted-publisher
-# flow (no NPM_TOKEN). The Python `ai-hist` script in the repo root is
-# independent and not published here.
+# flow (no NPM_TOKEN). The native Rust CLI is distributed separately through
+# GitHub Release assets and the shell installer.
 
 on:
   workflow_dispatch:

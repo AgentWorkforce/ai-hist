@@ -1,14 +1,12 @@
 /**
  * Direct JSONL parsers for Claude / Codex / Cursor history files.
  *
- * Used as a fallback when the SQLite database the Python `ai-hist sync`
- * tool maintains isn't present — lets `npm install ai-hist` work
+ * Used as a fallback when the SQLite database the native `ai-hist sync`
+ * command maintains isn't present — lets `npm install ai-hist` work
  * standalone for users who have any of these CLIs locally.
  *
- * Ports the parser logic from the canonical Python `ai-hist` script
- * (see https://github.com/AgentWorkforce/ai-hist/blob/main/ai-hist).
- * Format drift in those upstream CLIs is the main risk; the Python
- * source is the canonical reference.
+ * Mirrors the canonical parser behavior in the Rust CLI. Format drift in
+ * those upstream CLIs is the main maintenance risk.
  */
 
 import { readFile, readdir, stat } from 'node:fs/promises';
@@ -98,11 +96,11 @@ function parseCodexLine(line: string): RawRow | null {
   const ts = asNumber(obj.ts) ?? 0;
   return {
     source: 'codex',
-    // Python uses obj.session_id (snake_case).
+    // Codex historically uses obj.session_id (snake_case).
     sessionId: asString(obj.session_id ?? obj.sessionId),
     project: null,
     prompt: text,
-    // Python stores Codex's seconds-since-epoch as ms.
+    // Convert Codex's seconds-since-epoch value to milliseconds.
     timestampMs: Math.trunc(ts * 1000),
     gitBranch: null,
   };
@@ -110,7 +108,7 @@ function parseCodexLine(line: string): RawRow | null {
 
 /**
  * Cursor lines carry `{role, message: {content: [{type, text}, ...]}}` and
- * NO per-line timestamp. The Python tool falls back to the file mtime;
+ * NO per-line timestamp. The native CLI falls back to the file mtime;
  * we do the same. User prompts are wrapped in `<user_query>...</user_query>`.
  */
 function parseCursorLine(line: string): string | null {
@@ -144,9 +142,8 @@ function parseCursorLine(line: string): string | null {
 }
 
 // `~/.cursor/projects/<encoded-path>/...` — encoded path is the absolute
-// project path with `/` replaced by `-`. Python's `_decode_cursor_project`
-// just rejoins on `-` → `/`. We do the same; it's lossy for any real `-` in
-// a path segment, but matches the Python tool's behavior for parity.
+// project path with `/` replaced by `-`. Rejoining on `-` → `/` is lossy for
+// any real `-` in a path segment, but preserves the established behavior.
 function decodeCursorProject(encoded: string): string {
   return `/${encoded.replace(/-/g, '/')}`;
 }

@@ -1,8 +1,7 @@
 //! WS-9 cloud-sync: map the local recall store onto the WS-1 convergence envelope.
 //!
 //! This is the schema-coupled surface of the relayhistory cloud-sync lens (Agent Relay
-//! Loop). It is **additive** to the parity-gated Phase-1 core — it ports no existing
-//! behavior, so it does not block the Python→Rust cutover.
+//! Loop). It is **additive** to the local history and query core.
 //!
 //! Contract source of truth: `relayhistory-cloud/docs/decisions/2026-06-21-normalized-agent-event-schema.md`
 //! (WS-1, human-ratified 2026-06-21). The CLI emits these envelopes in the heterogeneous
