@@ -1447,6 +1447,254 @@ mod tests {
     }
 
     #[test]
+    fn cursor_rows_unwrap_the_user_query_envelope_around_the_real_prompt() {
+        // Cursor writes the prompt inside a <user_query> envelope; the stored
+        // prompt is the text, not the markup.
+        assert_eq!(
+            parse_cursor_text(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\n tag the release \n</user_query>"}]}}"#
+            )
+            .unwrap(),
+            Some("tag the release".to_string())
+        );
+        // Older rows carry the prompt with no envelope at all.
+        assert_eq!(
+            parse_cursor_text(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"  tag the release  "}]}}"#
+            )
+            .unwrap(),
+            Some("tag the release".to_string())
+        );
+        // Content is sometimes a bare string rather than a parts array.
+        assert_eq!(
+            parse_cursor_text(r#"{"role":"user","message":{"content":"tag the release"}}"#)
+                .unwrap(),
+            Some("tag the release".to_string())
+        );
+    }
+
+    #[test]
+    fn cursor_rows_without_a_user_prompt_are_skipped() {
+        // Only user turns are history; the assistant's reply is not a prompt.
+        assert_eq!(
+            parse_cursor_text(
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}"#
+            )
+            .unwrap(),
+            None
+        );
+        // Whitespace-only text carries no prompt.
+        assert_eq!(
+            parse_cursor_text(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"   \n  "}]}}"#
+            )
+            .unwrap(),
+            None
+        );
+        // An envelope with nothing inside it is not a prompt either.
+        assert_eq!(
+            parse_cursor_text(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query></user_query>"}]}}"#
+            )
+            .unwrap(),
+            None
+        );
+        // Non-text parts (images, tool payloads) contribute no prompt text.
+        assert_eq!(
+            parse_cursor_text(
+                r#"{"role":"user","message":{"content":[{"type":"image","url":"file:///shot.png"}]}}"#
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    fn resume_entry(source: &str, session_id: Option<&str>, project: Option<&str>) -> HistoryEntry {
+        HistoryEntry {
+            id: 0,
+            source: source.into(),
+            session_id: session_id.map(str::to_string),
+            project: project.map(str::to_string),
+            prompt: "tag the release".into(),
+            prompt_hash: None,
+            timestamp_ms: 1,
+        }
+    }
+
+    #[test]
+    fn resume_commands_use_each_agents_own_cli_and_cd_into_the_project() {
+        assert_eq!(
+            resume_command(&resume_entry("claude", Some("s1"), Some("/tmp/p"))),
+            Some("cd /tmp/p && claude --resume s1".to_string())
+        );
+        // Codex resumes by session id alone; it has no project argument.
+        assert_eq!(
+            resume_command(&resume_entry("codex", Some("s1"), Some("/tmp/p"))),
+            Some("codex resume s1".to_string())
+        );
+        assert_eq!(
+            resume_command(&resume_entry("cursor", Some("s1"), Some("/tmp/p"))),
+            Some("cd /tmp/p && cursor-agent --resume=s1".to_string())
+        );
+        assert_eq!(
+            resume_command(&resume_entry("grok", Some("s1"), Some("/tmp/p"))),
+            Some("cd /tmp/p && grok resume s1".to_string())
+        );
+        // A project with shell metacharacters is quoted, not interpolated raw.
+        assert_eq!(
+            resume_command(&resume_entry("claude", Some("s1"), Some("/tmp/my proj"))),
+            Some("cd '/tmp/my proj' && claude --resume s1".to_string())
+        );
+    }
+
+    #[test]
+    fn resume_drops_the_cd_without_a_project_and_is_absent_without_a_session() {
+        assert_eq!(
+            resume_command(&resume_entry("claude", Some("s1"), None)),
+            Some("claude --resume s1".to_string())
+        );
+        assert_eq!(
+            resume_command(&resume_entry("cursor", Some("s1"), None)),
+            Some("cursor-agent --resume=s1".to_string())
+        );
+        // No session id means there is nothing to resume.
+        assert_eq!(
+            resume_command(&resume_entry("claude", None, Some("/tmp/p"))),
+            None
+        );
+        // Sources with no resumable CLI (opencode, trajectory) offer nothing.
+        assert_eq!(
+            resume_command(&resume_entry("opencode", Some("s1"), Some("/tmp/p"))),
+            None
+        );
+        assert_eq!(
+            resume_command(&resume_entry("trajectory", Some("s1"), Some("/tmp/p"))),
+            None
+        );
+    }
+
+    fn add_event(
+        conn: &Connection,
+        source: &str,
+        session_id: &str,
+        ts_ms: i64,
+        role: &str,
+        text: &str,
+        token_json: Option<&str>,
+        event_uid: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, project, cwd, git_branch, message_id, \
+             parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
+             VALUES (?, ?, '/tmp/p', '/tmp/p', 'main', NULL, NULL, ?, ?, 'text', ?, 'claude-opus-5', ?, ?)",
+            rusqlite::params![source, session_id, ts_ms, role, text, token_json, event_uid],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn session_events_read_back_oldest_first_and_scoped_to_one_source() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // Inserted out of order, and with a tie the ordering must break by
+        // insertion order rather than at random.
+        add_event(&conn, "claude", "s1", 300, "assistant", "third", None, "e3");
+        add_event(&conn, "claude", "s1", 100, "user", "first", None, "e1");
+        add_event(
+            &conn,
+            "claude",
+            "s1",
+            300,
+            "user",
+            "fourth",
+            Some(r#"{"input_tokens":10,"output_tokens":20}"#),
+            "e4",
+        );
+        add_event(&conn, "claude", "s1", 200, "user", "second", None, "e2");
+        // A different agent reusing the same session id must not bleed in.
+        add_event(&conn, "codex", "s1", 150, "user", "other agent", None, "e5");
+
+        let all = session_events(&conn, "s1", None).unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|e| e.text.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["first", "other agent", "second", "third", "fourth"]
+        );
+
+        let claude_only = session_events(&conn, "s1", Some("claude")).unwrap();
+        assert_eq!(
+            claude_only
+                .iter()
+                .map(|e| e.text.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third", "fourth"]
+        );
+        assert_eq!(claude_only[0].role, "user");
+        assert_eq!(claude_only[0].project.as_deref(), Some("/tmp/p"));
+        assert_eq!(claude_only[0].git_branch.as_deref(), Some("main"));
+        assert_eq!(claude_only[0].model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(claude_only[0].event_uid, "e1");
+
+        // Token usage round-trips as parseable JSON, not an opaque blob.
+        let usage: serde_json::Value =
+            serde_json::from_str(claude_only[3].token_json.as_deref().unwrap()).unwrap();
+        assert_eq!(usage["input_tokens"], 10);
+        assert_eq!(usage["output_tokens"], 20);
+
+        // An unknown session reads back empty rather than erroring.
+        assert!(session_events(&conn, "nope", None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_calls_and_file_edits_read_back_oldest_first_and_scoped_to_one_source() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            r#"
+            INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name, target, args_json, is_error, ts_ms)
+            VALUES ('claude', 's1', 'm2', 'tu2', 'Bash', 'cargo test', '{"command":"cargo test"}', 1, 200),
+                   ('claude', 's1', 'm1', 'tu1', 'Read', '/tmp/p/lib.rs', '{"file_path":"/tmp/p/lib.rs"}', 0, 100),
+                   ('codex', 's1', 'm9', 'tu9', 'Shell', 'ls', '{}', 0, 150);
+            INSERT INTO file_edits (source, session_id, message_id, tool_use_id, file_path, tool_name, lines_added, lines_removed, user_modified, ts_ms)
+            VALUES ('claude', 's1', 'm3', 'tu3', '/tmp/p/b.rs', 'Edit', 2, 1, 0, 300),
+                   ('claude', 's1', 'm1', 'tu1', '/tmp/p/a.rs', 'Write', 10, 0, 1, 100),
+                   ('codex', 's1', 'm9', 'tu9', '/tmp/p/z.rs', 'apply_patch', 1, 1, 0, 150);
+            "#,
+        )
+        .unwrap();
+
+        let calls = session_tool_calls(&conn, "s1", Some("claude")).unwrap();
+        assert_eq!(
+            calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["Read", "Bash"]
+        );
+        assert_eq!(calls[0].tool_use_id, "tu1");
+        assert_eq!(calls[0].target.as_deref(), Some("/tmp/p/lib.rs"));
+        assert_eq!(calls[0].is_error, Some(0));
+        assert_eq!(calls[1].is_error, Some(1));
+        let args: serde_json::Value =
+            serde_json::from_str(calls[1].args_json.as_deref().unwrap()).unwrap();
+        assert_eq!(args["command"], "cargo test");
+        assert_eq!(session_tool_calls(&conn, "s1", None).unwrap().len(), 3);
+
+        let edits = session_file_edits(&conn, "s1", Some("claude")).unwrap();
+        assert_eq!(
+            edits
+                .iter()
+                .map(|e| e.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/tmp/p/a.rs", "/tmp/p/b.rs"]
+        );
+        assert_eq!(edits[0].tool_name.as_deref(), Some("Write"));
+        assert_eq!(edits[0].lines_added, Some(10));
+        assert_eq!(edits[0].lines_removed, Some(0));
+        assert_eq!(edits[0].user_modified, Some(1));
+        assert_eq!(session_file_edits(&conn, "s1", None).unwrap().len(), 3);
+        assert!(session_file_edits(&conn, "nope", None).unwrap().is_empty());
+    }
+
+    #[test]
     fn init_db_uses_wal_and_legacy_session_schema() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("fresh.db");

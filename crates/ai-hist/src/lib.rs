@@ -2183,7 +2183,18 @@ const WAL_WARN_BYTES: u64 = 64 * 1024 * 1024;
 /// how the `.sync-state.json` corruption started.
 const FREE_SPACE_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
 
-fn doctor(db_path: &Path, json: bool) -> Result<()> {
+/// Everything `doctor` measured about one database, before it is rendered as
+/// text or JSON. Split out from the printing so the report can be asserted on.
+struct DoctorReport {
+    db_bytes: u64,
+    wal_bytes: u64,
+    free: Option<u64>,
+    lock: std::result::Result<(), String>,
+    holders: Vec<DbHolder>,
+    problems: Vec<String>,
+}
+
+fn doctor_report(db_path: &Path) -> DoctorReport {
     let db_bytes = fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
     let wal_bytes = fs::metadata(wal_path(db_path))
         .map(|m| m.len())
@@ -2226,30 +2237,56 @@ fn doctor(db_path: &Path, json: bool) -> Result<()> {
         ));
     }
 
+    DoctorReport {
+        db_bytes,
+        wal_bytes,
+        free,
+        lock,
+        holders,
+        problems,
+    }
+}
+
+impl DoctorReport {
+    fn to_json(&self, db_path: &Path) -> Value {
+        json!({
+            "db_path": db_path.display().to_string(),
+            "db_bytes": self.db_bytes,
+            "wal_bytes": self.wal_bytes,
+            "free_bytes": self.free,
+            "write_lock": match &self.lock {
+                Ok(()) => json!("available"),
+                Err(err) => json!({"blocked": err}),
+            },
+            "write_capable": self.lock.is_ok(),
+            "holders": self.holders.iter().map(|h| json!({
+                "pid": h.pid,
+                "state": h.state,
+                "command": h.command,
+                "wedged": h.is_wedged(),
+            })).collect::<Vec<_>>(),
+            "problems": self.problems,
+        })
+    }
+}
+
+fn doctor(db_path: &Path, json: bool) -> Result<()> {
+    let report = doctor_report(db_path);
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "db_path": db_path.display().to_string(),
-                "db_bytes": db_bytes,
-                "wal_bytes": wal_bytes,
-                "free_bytes": free,
-                "write_lock": match &lock {
-                    Ok(()) => json!("available"),
-                    Err(err) => json!({"blocked": err}),
-                },
-                "write_capable": lock.is_ok(),
-                "holders": holders.iter().map(|h| json!({
-                    "pid": h.pid,
-                    "state": h.state,
-                    "command": h.command,
-                    "wedged": h.is_wedged(),
-                })).collect::<Vec<_>>(),
-                "problems": problems,
-            }))?
+            serde_json::to_string_pretty(&report.to_json(db_path))?
         );
         return Ok(());
     }
+    let DoctorReport {
+        db_bytes,
+        wal_bytes,
+        free,
+        lock,
+        holders,
+        problems,
+    } = report;
 
     println!("database: {}", db_path.display());
     println!("  size:  {}", human_bytes(db_bytes));
@@ -7136,20 +7173,24 @@ fn home_dir() -> PathBuf {
 mod tests {
     use super::{
         checkpoint_sync_state, cleanup_stale_sync_state_temps, codex_rollout_user_prompts,
-        cron_schedule, file_stamp, git_commit_time_ms, git_stdout, ingest_claude_transcript,
-        is_sqlite_contention, link_git_commit, load_sync_state, parse_trajectory_file,
-        paths_overlap, prepare_sync_and_push_db, process_status_with_programs, save_sync_state,
-        search_all, service_command_args, shell_single_quote, source_database_path,
-        strip_url_credentials, sync_claude_session_metadata, sync_exclusive,
-        sync_opencode_exclusive, try_acquire_sync_lock, wal_contention_line,
-        write_contention_diagnostic, xml_escape, SearchRole, SyncSourceReport, PUSH_SERVICE,
-        WAL_WARN_BYTES,
+        cron_schedule, doctor_report, export_history, file_stamp, git_commit_time_ms, git_stdout,
+        import_history, ingest_claude_transcript, is_sqlite_contention, link_git_commit,
+        load_sync_state, parse_trajectory_file, paths_overlap, prepare_sync_and_push_db,
+        process_status_with_programs, save_sync_state, search_all, service_command_args,
+        shell_single_quote, source_database_path, strip_url_credentials,
+        sync_claude_session_metadata, sync_exclusive, sync_opencode_exclusive, sync_relaycast,
+        try_acquire_sync_lock, wal_contention_line, write_contention_diagnostic, xml_escape,
+        SearchRole, SyncSourceReport, PUSH_SERVICE, WAL_WARN_BYTES,
     };
-    use ai_hist_core::{init_db, open_db, QueryFilter, SourceDatabaseError};
+    use ai_hist_core::{
+        init_db, insert_history, open_db, prompt_hash, HistoryEntry, QueryFilter,
+        SourceDatabaseError,
+    };
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::fs;
     use std::io::Write as _;
+    use std::time::Duration;
 
     fn saved_cursor_offset(value: &Value) -> u64 {
         match super::FileCursor::decode(value).expect("valid file cursor") {
@@ -8950,5 +8991,504 @@ mod tests {
             rows,
             vec![("assistant".into(), "Here is the report.".into())]
         );
+    }
+
+    // AI_HIST_DB and the RELAYCAST_* credentials are process-global; serialize
+    // the tests that set them so cargo's parallel runner can't clobber them.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn seed_exportable_history(conn: &Connection) {
+        for (source, session, project, prompt, ts) in [
+            (
+                "claude",
+                "s1",
+                Some("/tmp/p"),
+                "tag the release",
+                1_700_000_000_000i64,
+            ),
+            (
+                "codex",
+                "s2",
+                Some("/tmp/q"),
+                "fix the importer",
+                1_700_000_001_000,
+            ),
+            // A row with no project at all: the JSON round-trip has to keep the
+            // null rather than inventing a directory.
+            (
+                "cursor",
+                "s3",
+                None,
+                "write the changelog",
+                1_700_000_002_000,
+            ),
+        ] {
+            insert_history(
+                conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: source.into(),
+                    session_id: Some(session.into()),
+                    project: project.map(str::to_string),
+                    prompt: prompt.into(),
+                    prompt_hash: Some(prompt_hash(prompt)),
+                    timestamp_ms: ts,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    type ExportedRow = (String, Option<String>, Option<String>, String, i64);
+
+    fn history_rows(conn: &Connection) -> Vec<ExportedRow> {
+        conn.prepare(
+            "SELECT source, session_id, project, prompt, timestamp_ms FROM history \
+             ORDER BY timestamp_ms",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    fn history_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn fresh_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_jsonl_export_round_trips_every_row_into_a_fresh_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let exported_from = fresh_db();
+        seed_exportable_history(&exported_from);
+        let path = dir.path().join("history.jsonl");
+
+        export_history(&exported_from, Some(&path), "jsonl", None, None, None).unwrap();
+
+        // One self-describing JSON object per row, oldest first.
+        let body = fs::read_to_string(&path).unwrap();
+        let lines: Vec<Value> = body
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["source"], "claude");
+        assert_eq!(lines[0]["prompt"], "tag the release");
+        assert_eq!(lines[0]["prompt_hash"], prompt_hash("tag the release"));
+        assert_eq!(lines[2]["project"], Value::Null);
+
+        let restored = fresh_db();
+        import_history(&restored, &path, false).unwrap();
+        assert_eq!(history_rows(&restored), history_rows(&exported_from));
+    }
+
+    #[test]
+    fn a_gzipped_export_round_trips_every_row_into_a_fresh_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let exported_from = fresh_db();
+        seed_exportable_history(&exported_from);
+        let path = dir.path().join("history.jsonl.gz");
+
+        export_history(&exported_from, Some(&path), "jsonl", None, None, None).unwrap();
+
+        // Really gzip, not JSONL that happens to be named .gz.
+        assert_eq!(&fs::read(&path).unwrap()[..2], &[0x1f, 0x8b]);
+
+        let restored = fresh_db();
+        import_history(&restored, &path, false).unwrap();
+        assert_eq!(history_rows(&restored), history_rows(&exported_from));
+    }
+
+    #[test]
+    fn a_sqlite_export_is_a_readable_searchable_database_of_the_same_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let exported_from = fresh_db();
+        seed_exportable_history(&exported_from);
+        let dest = dir.path().join("history-export.db");
+
+        export_history(&exported_from, Some(&dest), "sqlite", None, None, None).unwrap();
+
+        let exported = Connection::open(&dest).unwrap();
+        assert_eq!(history_rows(&exported), history_rows(&exported_from));
+        // The export carries the full schema, so search still works on it.
+        let hits: i64 = exported
+            .query_row(
+                "SELECT COUNT(*) FROM history_fts WHERE history_fts MATCH 'release'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1);
+
+        // And it imports back like any other export.
+        let restored = fresh_db();
+        import_history(&restored, &dest, false).unwrap();
+        assert_eq!(history_rows(&restored), history_rows(&exported_from));
+    }
+
+    #[test]
+    fn a_sqlite_export_refuses_to_overwrite_the_active_database() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("ai-history.db");
+        let _db_env = EnvVarGuard::set("AI_HIST_DB", &active);
+        let conn = open_db(&active).unwrap();
+        seed_exportable_history(&conn);
+
+        let error = export_history(&conn, Some(&active), "sqlite", None, None, None)
+            .expect_err("exporting over the live database must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("Refusing to export SQLite over the active AI_HIST_DB"),
+            "unexpected error: {error}"
+        );
+
+        // The refusal happens before the destination is truncated, so the live
+        // history is still there.
+        assert_eq!(history_count(&conn), 3);
+    }
+
+    #[test]
+    fn reimporting_the_same_export_adds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let exported_from = fresh_db();
+        seed_exportable_history(&exported_from);
+        let path = dir.path().join("history.jsonl");
+        export_history(&exported_from, Some(&path), "jsonl", None, None, None).unwrap();
+
+        let restored = fresh_db();
+        import_history(&restored, &path, false).unwrap();
+        assert_eq!(history_count(&restored), 3);
+        import_history(&restored, &path, false).unwrap();
+        assert_eq!(history_count(&restored), 3);
+        assert_eq!(history_rows(&restored), history_rows(&exported_from));
+    }
+
+    #[test]
+    fn a_dry_run_import_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let exported_from = fresh_db();
+        seed_exportable_history(&exported_from);
+        let path = dir.path().join("history.jsonl");
+        export_history(&exported_from, Some(&path), "jsonl", None, None, None).unwrap();
+
+        let restored = fresh_db();
+        import_history(&restored, &path, true).unwrap();
+        assert_eq!(history_count(&restored), 0);
+
+        // The same file without --dry-run does write.
+        import_history(&restored, &path, false).unwrap();
+        assert_eq!(history_count(&restored), 3);
+    }
+
+    #[test]
+    fn imported_rows_missing_a_prompt_hash_get_one_backfilled() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A hand-written or pre-hash JSONL export.
+        let jsonl = dir.path().join("legacy.jsonl");
+        fs::write(
+            &jsonl,
+            "{\"source\":\"claude\",\"session_id\":\"s1\",\"project\":\"/tmp/p\",\
+             \"prompt\":\"tag the release\",\"timestamp_ms\":1700000000000}\n",
+        )
+        .unwrap();
+        let from_jsonl = fresh_db();
+        import_history(&from_jsonl, &jsonl, false).unwrap();
+        let hash: Option<String> = from_jsonl
+            .query_row("SELECT prompt_hash FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            hash.as_deref(),
+            Some(prompt_hash("tag the release").as_str())
+        );
+
+        // A SQLite export taken before the prompt_hash column existed.
+        let legacy_db = dir.path().join("legacy.db");
+        let legacy = Connection::open(&legacy_db).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE history (id INTEGER PRIMARY KEY, source TEXT, session_id TEXT, \
+                 project TEXT, prompt TEXT, timestamp_ms INTEGER); \
+                 INSERT INTO history VALUES (1, 'codex', 's2', '/tmp/q', 'fix the importer', 1700000001000);",
+            )
+            .unwrap();
+        drop(legacy);
+        let from_sqlite = fresh_db();
+        import_history(&from_sqlite, &legacy_db, false).unwrap();
+        let hash: Option<String> = from_sqlite
+            .query_row("SELECT prompt_hash FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            hash.as_deref(),
+            Some(prompt_hash("fix the importer").as_str())
+        );
+    }
+
+    #[test]
+    fn doctor_reports_a_healthy_database_with_every_field_it_promises() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ai-history.db");
+        let conn = open_db(&db_path).unwrap();
+        seed_exportable_history(&conn);
+        drop(conn);
+
+        let report = doctor_report(&db_path).to_json(&db_path);
+        assert_eq!(report["db_path"], db_path.display().to_string());
+        assert!(report["db_bytes"].as_u64().unwrap() > 0, "{report}");
+        assert!(report["wal_bytes"].as_u64().is_some(), "{report}");
+        assert!(
+            report["free_bytes"].is_u64() || report["free_bytes"].is_null(),
+            "{report}"
+        );
+        assert_eq!(report["write_lock"], json!("available"));
+        assert_eq!(report["write_capable"], json!(true));
+        assert!(report["holders"].is_array(), "{report}");
+        // Nothing is holding the write lock, so nothing is reported as blocking it.
+        let problems = report["problems"].as_array().expect("problems array");
+        assert!(
+            !problems
+                .iter()
+                .any(|problem| problem.as_str().unwrap_or("").contains("write lock")),
+            "{problems:?}"
+        );
+    }
+
+    /// Reads one request line from `stream` and drains its headers so the
+    /// client sees a complete exchange.
+    fn read_request_line(stream: &mut std::net::TcpStream) -> String {
+        use std::io::{BufRead, BufReader};
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut first_line = String::new();
+        reader.read_line(&mut first_line).unwrap();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 || line.trim_end().is_empty() {
+                break;
+            }
+        }
+        first_line.trim_end().to_string()
+    }
+
+    /// Answers exactly `count` HTTP requests off `listener` with `respond`, and
+    /// hands back the request lines it saw.
+    fn serve_http(
+        listener: std::net::TcpListener,
+        count: usize,
+        respond: impl Fn(&str) -> (&'static str, String) + Send + 'static,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut seen = Vec::new();
+            while seen.len() < count && started.elapsed() < Duration::from_secs(20) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                };
+                let line = read_request_line(&mut stream);
+                let (status, body) = respond(&line);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                seen.push(line);
+            }
+            assert_eq!(seen.len(), count, "served {seen:?}");
+            seen
+        })
+    }
+
+    /// A Relaycast messages page holding ids `m{first}`..`m{first + count - 1}`.
+    fn relay_message_page(first: usize, count: usize) -> String {
+        let messages: Vec<Value> = (first..first + count)
+            .map(|n| json!({"id": format!("m{n:03}"), "from_name": "ana", "text": format!("relay message {n:03}")}))
+            .collect();
+        serde_json::to_string(&json!({ "data": messages })).unwrap()
+    }
+
+    fn relaycast_env(base: &str) -> (EnvVarGuard, EnvVarGuard, EnvVarGuard) {
+        (
+            EnvVarGuard::set("RELAYCAST_API_KEY", "rc_test_key"),
+            EnvVarGuard::set("RELAYCAST_WORKSPACE_ID", "ws-e2e"),
+            EnvVarGuard::set("RELAYCAST_BASE_URL", base),
+        )
+    }
+
+    #[test]
+    fn relaycast_sync_pages_through_a_channel_and_saves_the_high_water_mark() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // channels, messages page 1, messages page 2, dm listing.
+        let server = serve_http(listener, 4, |line| {
+            if line.starts_with("GET /v1/channels ") {
+                ("200 OK", r#"{"data":[{"name":"general"}]}"#.to_string())
+            } else if line.starts_with("GET /v1/channels/general/messages?limit=100&after=m099 ") {
+                ("200 OK", relay_message_page(100, 2))
+            } else if line.starts_with("GET /v1/channels/general/messages?limit=100 ") {
+                // A full page is the signal that another page may follow.
+                ("200 OK", relay_message_page(0, 100))
+            } else if line.starts_with("GET /v1/dm/conversations/all ") {
+                ("200 OK", r#"{"data":[]}"#.to_string())
+            } else {
+                panic!("unexpected request: {line}");
+            }
+        });
+
+        let conn = fresh_db();
+        let mut state = Map::new();
+        let _env = relaycast_env(&format!("http://{addr}"));
+        let inserted = sync_relaycast(&conn, &mut state).unwrap();
+        let requests = server.join().unwrap();
+
+        assert_eq!(inserted, 102);
+        assert_eq!(history_count(&conn), 102);
+        assert!(
+            requests[2].contains("after=m099"),
+            "the second page must continue from the last id of the first: {requests:?}"
+        );
+
+        // Messages are attributed to their sender and the workspace.
+        let (prompt, project, session_id): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT prompt, project, session_id FROM history WHERE prompt LIKE '%message 000'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(prompt, "[ana] relay message 000");
+        assert_eq!(project.as_deref(), Some("ws-e2e"));
+        // The channel name is the session; "ch:general" is only the state key.
+        assert_eq!(session_id.as_deref(), Some("#general"));
+
+        // The cursor saved is the highest id seen across both pages.
+        assert_eq!(state["relay"]["ch:general"], json!("m101"));
+    }
+
+    #[test]
+    fn relaycast_sync_resumes_from_the_saved_after_cursor() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_http(listener, 3, |line| {
+            if line.starts_with("GET /v1/channels ") {
+                ("200 OK", r#"{"data":[{"name":"general"}]}"#.to_string())
+            } else if line.starts_with("GET /v1/channels/general/messages?limit=100&after=m050 ") {
+                ("200 OK", relay_message_page(51, 1))
+            } else if line.starts_with("GET /v1/dm/conversations/all ") {
+                ("200 OK", r#"{"data":[]}"#.to_string())
+            } else {
+                panic!("unexpected request: {line}");
+            }
+        });
+
+        let conn = fresh_db();
+        let mut state = Map::new();
+        state.insert("relay".into(), json!({"ch:general": "m050"}));
+        let _env = relaycast_env(&format!("http://{addr}"));
+        let inserted = sync_relaycast(&conn, &mut state).unwrap();
+        let requests = server.join().unwrap();
+
+        // Only the one message after the cursor is asked for, and stored.
+        assert_eq!(inserted, 1);
+        assert_eq!(history_count(&conn), 1);
+        assert!(requests[1].contains("after=m050"), "{requests:?}");
+        assert_eq!(state["relay"]["ch:general"], json!("m051"));
+    }
+
+    #[test]
+    fn relaycast_sync_keeps_channel_rows_when_the_dm_listing_is_forbidden() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_http(listener, 3, |line| {
+            if line.starts_with("GET /v1/channels ") {
+                ("200 OK", r#"{"data":[{"name":"general"}]}"#.to_string())
+            } else if line.starts_with("GET /v1/channels/general/messages?limit=100 ") {
+                ("200 OK", relay_message_page(0, 1))
+            } else if line.starts_with("GET /v1/dm/conversations/all ") {
+                // Plenty of API keys have channel scope but no DM scope.
+                ("403 Forbidden", r#"{"error":"forbidden"}"#.to_string())
+            } else {
+                panic!("unexpected request: {line}");
+            }
+        });
+
+        let conn = fresh_db();
+        let mut state = Map::new();
+        let _env = relaycast_env(&format!("http://{addr}"));
+        let inserted = sync_relaycast(&conn, &mut state).unwrap();
+        server.join().unwrap();
+
+        // The DM refusal is tolerated: the channel rows still land.
+        assert_eq!(inserted, 1);
+        assert_eq!(history_count(&conn), 1);
+        assert_eq!(state["relay"]["ch:general"], json!("m000"));
+    }
+
+    #[test]
+    fn relaycast_sync_is_a_no_op_without_credentials() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let conn = fresh_db();
+        let mut state = Map::new();
+        // An unreachable base url proves no request is attempted at all.
+        let _env = (
+            EnvVarGuard::set("RELAYCAST_API_KEY", ""),
+            EnvVarGuard::set("RELAYCAST_WORKSPACE_ID", "ws-e2e"),
+            EnvVarGuard::set("RELAYCAST_BASE_URL", "http://127.0.0.1:1"),
+        );
+        assert_eq!(sync_relaycast(&conn, &mut state).unwrap(), 0);
+        assert_eq!(history_count(&conn), 0);
+        assert!(state.is_empty());
     }
 }
