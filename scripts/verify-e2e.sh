@@ -6,9 +6,8 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 command -v sqlite3 >/dev/null || { echo "verify-e2e: sqlite3 is required" >&2; exit 1; }
-command -v npm >/dev/null || { echo "verify-e2e: npm is required" >&2; exit 1; }
+command -v node >/dev/null || { echo "verify-e2e: node is required" >&2; exit 1; }
 unset AI_HIST_CLI
-VERIFY_E2E_NPM_CACHE="${NPM_CONFIG_CACHE:-$HOME/.npm}"
 
 assert_eq() {
   local label="$1" actual="$2" expected="$3"
@@ -18,11 +17,20 @@ assert_eq() {
   fi
 }
 
+# Print one field of a --json payload piped on stdin. The argument is a JS
+# expression over `d`, the parsed document -- enough to name a single field
+# without pulling a JSON query tool into the script's dependencies.
+json_field() {
+  node -e '
+    const d = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+    process.stdout.write(String(eval(process.argv[1])));
+  ' "$1"
+}
+
 export AI_HIST_DB="$TMP/ai-history.db"
 export TRAJECTORY_ROOT="$TMP/trajectories"
 export OPENCODE_DB="$TMP/opencode.db"
 export HOME="$TMP/home"
-export NPM_CONFIG_CACHE="$VERIFY_E2E_NPM_CACHE"
 unset RELAYCAST_API_KEY RELAYCAST_WORKSPACE_ID RELAYCAST_BASE_URL
 mkdir -p "$HOME/.claude/projects/e2e-project" "$HOME/.codex/sessions/2026/06/20" "$TRAJECTORY_ROOT/planner/compacted"
 mkdir -p "$HOME/.grok/sessions/%2Ftmp%2Fe2e%2Fgrok/grok-e2e"
@@ -104,12 +112,25 @@ SQL
 "$ROOT/ai-hist" tag trajectory-e2e release-e2e --source trajectory
 "$ROOT/ai-hist" search release --tag release-e2e --json
 "$ROOT/ai-hist" search --tag release-e2e >/dev/null
-"$ROOT/ai-hist" session claude-e2e --full >/dev/null
-"$ROOT/ai-hist" show 1 --json >/dev/null
-"$ROOT/ai-hist" context 1 >/dev/null
-"$ROOT/ai-hist" pack release --json >/dev/null
-"$ROOT/ai-hist" stats --json >/dev/null
-"$ROOT/ai-hist" tags --sessions --json >/dev/null
+session_prompt=$("$ROOT/ai-hist" session claude-e2e --full --json | json_field 'd.map((e) => e.prompt).join("|")')
+assert_eq "session prompts" "$session_prompt" "e2e claude release tagging prompt"
+
+show_resume=$("$ROOT/ai-hist" show 1 --json | json_field 'd.resume_cmd')
+assert_eq "show resume command" "$show_resume" "cd /tmp/e2e/project && claude --resume claude-e2e"
+
+# `context` has no --json; assert it marks exactly the requested entry.
+context_out=$("$ROOT/ai-hist" context 1)
+context_focus=$(printf '%s\n' "$context_out" | grep -c '>>>' || true)
+assert_eq "context focus rows" "$context_focus" "1"
+
+pack_sources=$("$ROOT/ai-hist" pack release --json | json_field 'd.entries.map((e) => e.source).sort().join(",")')
+assert_eq "pack sources" "$pack_sources" "claude,codex,cursor,grok,opencode,trajectory"
+
+stats_total=$("$ROOT/ai-hist" stats --json | json_field 'd.total')
+assert_eq "stats total" "$stats_total" "6"
+
+tagged_sessions=$("$ROOT/ai-hist" tags --sessions --json | json_field 'd.find((t) => t.name === "release-e2e").session_count')
+assert_eq "tagged session count" "$tagged_sessions" "5"
 
 sources=$(sqlite3 "$AI_HIST_DB" "SELECT DISTINCT source FROM history" | sort)
 expected_sources=$(printf '%s\n' claude codex cursor grok opencode trajectory)
@@ -129,7 +150,5 @@ assert_eq "grok synthetic prompt count" "$synthetic" "0"
 
 "$ROOT/ai-hist" --db "$AI_HIST_DB" tag codex-e2e release-e2e --source codex
 "$ROOT/ai-hist" --db "$AI_HIST_DB" search release --tag release-e2e --json
-
-(cd "$ROOT/sdk-ts" && npm ci && npm test)
 
 echo "E2E verification completed with temp DB: $AI_HIST_DB"
