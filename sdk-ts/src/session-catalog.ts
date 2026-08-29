@@ -86,14 +86,47 @@ export interface CatalogSession {
   parserVersion?: number;
 }
 
+/**
+ * A precise continuation point in the catalog's total order,
+ * `(lastActivityMs DESC, source ASC, sessionId ASC)`.
+ *
+ * Recency alone is not a key — one discovery pass can stamp many sessions with
+ * the same mtime-derived millisecond, and a cursor carrying only a timestamp
+ * silently drops every row tied with the page boundary — so the identity
+ * columns make the cursor total. `lastActivityMs` is null/absent for the tail
+ * of rows whose recency is unknown; those sort after every dated row.
+ */
+export interface CatalogCursor {
+  lastActivityMs?: number | null;
+  source: string;
+  sessionId: string;
+}
+
 /** Filters for the cache-only catalog listing. */
 export interface ListCatalogOptions {
   /** Restrict to these sources. Omit for every discoverable source. */
   sources?: Iterable<Source | string>;
   /** Row cap. Default 50, mirroring the native `DEFAULT_CATALOG_LIMIT`. */
   limit?: number;
-  /** Keyset pagination: only sessions strictly older than this epoch-ms cutoff. */
+  /**
+   * Coarse cutoff: only sessions strictly older than this epoch-ms. Convenient
+   * for "anything before last Tuesday", but it cannot separate rows that share
+   * a millisecond — use `after` to walk pages. Ignored when `after` is set.
+   */
   beforeMs?: number;
+  /** Precise continuation from the previous page's `nextCursor`. */
+  after?: CatalogCursor;
+}
+
+/** One page of the catalog plus the cursor that continues it. */
+export interface SessionCatalogPage {
+  /** The rows, newest first. */
+  sessions: CatalogSession[];
+  /**
+   * Pass as {@link ListCatalogOptions.after} for the next page. `null` when
+   * the page did not fill its limit, i.e. the catalog is exhausted.
+   */
+  nextCursor: CatalogCursor | null;
 }
 
 /** A non-fatal failure during discovery: one provider, or one bad session. */
@@ -149,8 +182,41 @@ export interface DiscoverResult {
   sessions: CatalogSession[];
   /** Non-fatal per-provider / per-session failures. Never throws on these. */
   diagnostics: DiscoveryDiagnostic[];
-  /** `null` only when the binary produced no summary line (unexpected). */
-  summary: DiscoverySummary | null;
+  /** The closing summary. Always present: a run without one is rejected. */
+  summary: DiscoverySummary;
+}
+
+/**
+ * A discovery run that could not be completed or trusted.
+ *
+ * The native command emits its diagnostics and the summary trailer even when
+ * every provider fails, so a failed run still carries everything it managed to
+ * learn: `diagnostics` says which sources broke and why, and `summary` (when
+ * the trailer arrived) says what the run actually did. `stderr` and `exitCode`
+ * carry the process-level detail.
+ */
+export class DiscoveryError extends Error {
+  readonly exitCode: number | null;
+  readonly stderr: string;
+  readonly diagnostics: DiscoveryDiagnostic[];
+  readonly summary: DiscoverySummary | null;
+
+  constructor(
+    message: string,
+    details: {
+      exitCode?: number | null;
+      stderr?: string;
+      diagnostics?: DiscoveryDiagnostic[];
+      summary?: DiscoverySummary | null;
+    } = {},
+  ) {
+    super(message);
+    this.name = 'DiscoveryError';
+    this.exitCode = details.exitCode ?? null;
+    this.stderr = details.stderr ?? '';
+    this.diagnostics = details.diagnostics ?? [];
+    this.summary = details.summary ?? null;
+  }
 }
 
 export interface DiscoverSessionsOptions {
@@ -303,11 +369,24 @@ function summaryFromJson(raw: Record<string, unknown>): DiscoverySummary {
  * `openAiHist` again) before `listSessionCatalog()` to see them.
  *
  * Failure behavior mirrors the CLI's: a provider that blows up contributes a
- * diagnostic and the run still resolves (exit 0). This rejects only when the
- * binary cannot be run at all, when every selected provider failed (non-zero
- * exit), or when the process errors for some other reason. Individual
- * unparseable lines are skipped rather than failing the run — a future binary
- * may add line types this SDK does not know.
+ * diagnostic and the run still resolves (exit 0). Individual unparseable or
+ * unrecognized lines are skipped rather than failing the run, so a newer
+ * binary's extra line types stay forward-compatible. The promise rejects with
+ * a {@link DiscoveryError} when:
+ *
+ *   - the binary cannot be run at all (the message names `AI_HIST_RUST_BIN`);
+ *   - the run exits non-zero — every selected provider failed. The native
+ *     command still writes its diagnostics and the summary trailer before
+ *     exiting, so the error carries both alongside `stderr` and `exitCode`;
+ *   - no summary line arrived, or its `contractVersion` is not the one this
+ *     SDK understands. The trailer is mandatory in the native contract, so a
+ *     run without one (or with a version this SDK cannot read) means the rows
+ *     are not safe to interpret — better to say so than to hand back a
+ *     half-understood catalog.
+ *
+ * An exception thrown by `onSession` or `onDiagnostic` aborts the run: the
+ * child is killed and the promise rejects with that exception, rather than
+ * escaping the stream handler as an uncaught error in the host process.
  */
 export function discoverSessions(opts: DiscoverSessionsOptions = {}): Promise<DiscoverResult> {
   const spawnFn = opts.spawnFn ?? spawn;
@@ -328,7 +407,34 @@ export function discoverSessions(opts: DiscoverSessionsOptions = {}): Promise<Di
     let summary: DiscoverySummary | null = null;
     let stderr = '';
     let pending = '';
+    let settled = false;
     const decoder = new StringDecoder('utf8');
+
+    const child = spawnFn(bin, args, spawnOpts);
+
+    const succeed = (result: DiscoverResult): void => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    const fail = (err: unknown): void => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+    /**
+     * A host callback that throws must not take the process down with it, and
+     * must not leave the child running: stop consuming, end the run, surface
+     * the caller's own error.
+     */
+    const abort = (err: unknown): void => {
+      try {
+        child.kill?.();
+      } catch {
+        /* already gone */
+      }
+      fail(err);
+    };
 
     const handleLine = (line: string): void => {
       const trimmed = line.trim();
@@ -345,13 +451,25 @@ export function discoverSessions(opts: DiscoverSessionsOptions = {}): Promise<Di
         case 'session': {
           const session = catalogSessionFromJson(obj);
           sessions.push(session);
-          opts.onSession?.(session);
+          if (opts.onSession) {
+            try {
+              opts.onSession(session);
+            } catch (err) {
+              abort(err);
+            }
+          }
           break;
         }
         case 'diagnostic': {
           const diagnostic = diagnosticFromJson(obj);
           diagnostics.push(diagnostic);
-          opts.onDiagnostic?.(diagnostic);
+          if (opts.onDiagnostic) {
+            try {
+              opts.onDiagnostic(diagnostic);
+            } catch (err) {
+              abort(err);
+            }
+          }
           break;
         }
         case 'summary':
@@ -362,12 +480,11 @@ export function discoverSessions(opts: DiscoverSessionsOptions = {}): Promise<Di
       }
     };
 
-    const child = spawnFn(bin, args, spawnOpts);
-
     child.stdout?.on('data', (chunk: Buffer | string) => {
+      if (settled) return;
       pending += typeof chunk === 'string' ? chunk : decoder.write(chunk);
       let newline = pending.indexOf('\n');
-      while (newline !== -1) {
+      while (newline !== -1 && !settled) {
         handleLine(pending.slice(0, newline));
         pending = pending.slice(newline + 1);
         newline = pending.indexOf('\n');
@@ -379,27 +496,57 @@ export function discoverSessions(opts: DiscoverSessionsOptions = {}): Promise<Di
 
     child.on('error', (err: NodeJS.ErrnoException) => {
       if (MISSING_BINARY_CODES.has(err.code ?? '')) {
-        reject(
-          new Error(
+        fail(
+          new DiscoveryError(
             `could not run the ai-hist binary (${bin}): ${err.code}. Install ai-hist, ` +
               `or set ${AI_HIST_RUST_BIN_ENV} to its path.`,
           ),
         );
         return;
       }
-      reject(err);
+      fail(err);
     });
 
     child.on('close', (code) => {
+      if (settled) return;
       handleLine(pending + decoder.end());
       pending = '';
+      if (settled) return; // A callback threw on the final line.
+      const trailer = summary as DiscoverySummary | null;
       if (code !== 0) {
-        reject(
-          new Error(`ai-hist sessions discover failed (exit ${code}): ${stderr.trim().slice(0, 300)}`),
+        // The native command emits its diagnostics and the summary trailer
+        // before exiting non-zero, so the failure carries what the run learned.
+        fail(
+          new DiscoveryError(
+            `ai-hist sessions discover failed (exit ${code}): ${stderr.trim().slice(0, 300)}`,
+            { exitCode: code, stderr, diagnostics, summary: trailer },
+          ),
         );
         return;
       }
-      resolve({ sessions, diagnostics, summary });
+      if (!trailer) {
+        fail(
+          new DiscoveryError(
+            'ai-hist sessions discover produced no summary line — the closing summary is ' +
+              'part of the output contract, so the stream was truncated or the binary is too old.',
+            { exitCode: code, stderr, diagnostics, summary: null },
+          ),
+        );
+        return;
+      }
+      if (trailer.contractVersion !== SESSION_CATALOG_CONTRACT_VERSION) {
+        fail(
+          new DiscoveryError(
+            `unsupported session-catalog contract version ${trailer.contractVersion} ` +
+              `(this SDK understands ${SESSION_CATALOG_CONTRACT_VERSION}) — upgrade the ai-hist ` +
+              'package or the ai-hist binary so the two agree. A version of 0 means the summary ' +
+              'carried no contract_version at all.',
+            { exitCode: code, stderr, diagnostics, summary: trailer },
+          ),
+        );
+        return;
+      }
+      succeed({ sessions, diagnostics, summary: trailer });
     });
   });
 }

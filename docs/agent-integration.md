@@ -115,7 +115,7 @@ ai-hist sessions list --json                  # cached read: one indexed query, 
 
 Both emit a versioned contract (`contract_version: 1`) — parse it and fail loudly on a version you don't know. `discover --json` is JSONL: session rows in global recency order, then per-provider `diagnostic` lines, then a closing `summary` carrying operation counters (`files_opened`, `bytes_read`, …) so you can verify the run stayed cheap. Rows are identity only — `session_id`, `cwd`, branch, first prompt, models, provenance. Events, tool calls, token usage and full transcripts still require `ai-hist sync`; `discovery_state` on each row tells you which you have.
 
-The same operations are available in-process through the napi binding (`listSessions` / `discoverSessions`) and as an MCP tool, so an agent can enumerate recent work without shelling out.
+Both operations are available in-process through the napi binding (`listSessions` / `discoverSessions`) and the TypeScript SDK (`listSessionCatalog` / `listSessionCatalogPage` and the top-level `discoverSessions`); over MCP, only the cached listing is exposed, as the read-only `list_sessions` tool. So an agent can enumerate recent work without shelling out, and refresh the catalog wherever it has more than the MCP surface.
 
 > Full contract, per-provider capability matrix, and ordering/limit semantics: [`session-catalog.md`](session-catalog.md).
 

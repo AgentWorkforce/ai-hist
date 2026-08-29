@@ -11,9 +11,11 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { z } from "zod";
 import {
+  defaultDbPath,
   openAiHist,
   resumeCommand,
   SESSION_CATALOG_CONTRACT_VERSION,
@@ -65,6 +67,21 @@ function getHist(): Promise<AiHist> {
     });
   }
   return _histPromise;
+}
+
+/**
+ * The reader for a catalog read, or `null` when there is nothing to read.
+ *
+ * The session catalog lives only in the SQLite database: the JSONL fallback
+ * scan builds prompt history and never writes a catalog row. So when no
+ * database exists, opening the reader would walk every local provider file —
+ * seconds of I/O — only to answer with an empty catalog. Short-circuit instead,
+ * unless another tool has already paid for the reader, in which case reuse it.
+ */
+async function getCatalogHist(): Promise<AiHist | null> {
+  if (_histPromise) return getHist();
+  if (!existsSync(defaultDbPath())) return null;
+  return getHist();
 }
 
 function fmtEntry(
@@ -490,15 +507,60 @@ server.tool(
       .int()
       .optional()
       .describe(
-        "Keyset pagination cursor: only sessions whose last activity is strictly older than " +
-          "this epoch-ms value. Pass the last_activity_ms of the final row of the previous page.",
+        "Coarse cutoff: only sessions whose last activity is strictly older than this epoch-ms " +
+          "value. It cannot separate sessions that share a millisecond, so use `after` to page. " +
+          "Ignored when `after` is given.",
+      ),
+    after: z
+      .object({
+        lastActivityMs: z
+          .number()
+          .int()
+          .nullable()
+          .optional()
+          .describe("Null or omitted to continue through sessions whose recency is unknown."),
+        source: z.string(),
+        sessionId: z.string(),
+      })
+      .optional()
+      .describe(
+        "Precise pagination cursor: pass back the `nextCursor` object from the previous call. " +
+          "Keep calling until nextCursor is null to walk the whole catalog with no skipped or " +
+          "repeated sessions, even when many share one timestamp.",
       ),
   },
   READ_ONLY,
-  async ({ sources, limit, before_ms }) => {
+  async ({ sources, limit, before_ms, after }) => {
     try {
-      const hist = await getHist();
-      const sessions = hist.listSessionCatalog({ sources, limit, beforeMs: before_ms });
+      const hist = await getCatalogHist();
+      // No database yet: the catalog lives only in SQLite, so this is an empty
+      // answer rather than a reason to scan every provider file.
+      if (!hist) {
+        const dbPath = defaultDbPath();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  contractVersion: SESSION_CATALOG_CONTRACT_VERSION,
+                  sessions: [],
+                  nextCursor: null,
+                  sourceKind: "none",
+                  dbPath,
+                  note:
+                    `No ai-hist database at ${dbPath}. The session catalog is empty until ` +
+                    "`ai-hist sessions discover` (or `ai-hist sync`) writes one — the JSONL " +
+                    "fallback scan only builds prompt history, so other tools still work.",
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+      const page = hist.listSessionCatalogPage({ sources, limit, beforeMs: before_ms, after });
       return {
         content: [
           {
@@ -506,7 +568,8 @@ server.tool(
             text: JSON.stringify(
               {
                 contractVersion: SESSION_CATALOG_CONTRACT_VERSION,
-                sessions,
+                sessions: page.sessions,
+                nextCursor: page.nextCursor,
                 sourceKind: hist.sourceKind,
                 dbPath: hist.dbPath,
                 projectScope: hist.projectScope,

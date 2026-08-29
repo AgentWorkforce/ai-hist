@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `listSessionCatalog({ sources?, limit?, beforeMs? })` — the materialized
+- `listSessionCatalog({ sources?, limit?, beforeMs?, after? })` — the materialized
   session catalog, newest first, as one indexed query over the `sessions` table.
   No provider transcript is opened and neither `history` nor `session_events` is
   scanned, so it stays fast on first paint with thousands of sessions. Rows come
@@ -20,11 +20,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalog and reads as `'full'`). `source = 'trajectory'` rows are excluded
   defensively — trajectories are derived records, not sessions. Ordering is
   `last_activity_ms DESC` with null timestamps last, then `source` and
-  `session_id` so `beforeMs` keyset pagination is stable. A configured
-  `projectScope` constrains rows by `cwd`, as `getHandoff` does, so sources with
-  no working directory (relay) drop out of a scoped listing. Returns `[]` in
-  JSONL fallback mode: the fallback scan builds `history` only, and just the
-  native discovery engine writes the catalog.
+  `session_id` — the catalog's total order. Recency alone is not a key: one
+  discovery pass can stamp many sessions with the same mtime-derived
+  millisecond, so a cursor that carries only a timestamp drops every row tied
+  with a page boundary. A configured `projectScope` constrains rows by `cwd`, as
+  `getHandoff` does, so sources with no working directory (relay) drop out of a
+  scoped listing. A negative `limit` throws a `RangeError` — SQLite reads a
+  negative `LIMIT` as "unlimited", so it would otherwise dump the whole catalog.
+  Returns `[]` in JSONL fallback mode: the fallback scan builds `history` only,
+  and just the native discovery engine writes the catalog.
+- `listSessionCatalogPage(options)` → `{ sessions, nextCursor }` — the same
+  listing plus the cursor that continues it, mirroring the native
+  `list_session_catalog_page` and the CLI's `next_cursor`. `nextCursor` is
+  a `CatalogCursor` (`{ lastActivityMs, source, sessionId }`) and is non-null
+  only when the page filled its limit, so following it until `null` walks the
+  whole catalog with no skipped and no repeated rows — even across a page
+  boundary that lands inside a group of tied timestamps, and through the tail of
+  rows whose recency is unknown, which stays reachable from a dated cursor.
+  `ListCatalogOptions` gains `after` for that cursor; `beforeMs` survives as a
+  coarse cutoff and is ignored when `after` is set.
 - **In-memory catalog migration** — the catalog columns (`first_prompt`,
   `models_json`, `originator`, `agent_version`, `repo_url`, `initial_commit`,
   `workspace_roots_json`, `source_stamp`, `discovery_state`) landed after 0.5.0,
@@ -32,8 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ALTER TABLE ... ADD COLUMN` against the in-memory copy sql.js holds — the same
   trick already used for `history.git_branch`. Without it every catalog read on
   a pre-0.6 file would fail with `no such column`; with it the missing values
-  simply read as `NULL`. The file on disk is never modified. The two new indexes
-  (`idx_sessions_source_last`, `idx_sessions_raw_path`) are created on the copy too.
+  simply read as `NULL`. The file on disk is never modified. The catalog
+  indexes are created on the copy too — `idx_sessions_source_last`,
+  `idx_sessions_raw_path`, and the two composite indexes that carry the whole
+  total order (`idx_sessions_recency`, `idx_sessions_source_recency`) — so a
+  query here plans the way it does natively. The `discovery_skips` table
+  (`source`, `locator`, `stamp`, …), which native discovery uses to remember
+  that a file is not a session, is created for shape parity; the SDK never
+  reads it.
 - `discoverSessions({ sources?, limit?, onSession?, onDiagnostic?, binPath?, env? })`
   — a top-level async function (not an `AiHist` method) that drives
   `ai-hist sessions discover --json` and parses its JSONL stream into
@@ -43,27 +63,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot see the rows it just wrote, so re-open before listing. The limit is
   global across providers and applied by recency, matching the native engine.
   Binary discovery reuses `resolveAiHistBinary` from the cloud-push path
-  (`$AI_HIST_RUST_BIN` → the install.sh location → `ai-hist` on `PATH`). Failure
-  behavior mirrors the CLI: a provider that fails contributes a diagnostic and
-  the run still resolves; the promise rejects only when the binary cannot be run
-  (with an error naming `AI_HIST_RUST_BIN`) or on a non-zero exit, whose stderr
-  is included. Unparseable or unknown JSONL lines are skipped rather than
-  failing the run, so a newer binary's extra line types are forward-compatible.
+  (`$AI_HIST_RUST_BIN` → the install.sh location → `ai-hist` on `PATH`).
+  Unparseable or unknown JSONL lines are skipped rather than failing the run, so
+  a newer binary's extra line types are forward-compatible.
+- **`DiscoveryError`, with the run's own evidence attached.** A provider that
+  fails still only contributes a diagnostic and the run resolves; the promise
+  rejects when the binary cannot be run (the message names `AI_HIST_RUST_BIN`),
+  when the run exits non-zero because every provider failed, or when the closing
+  summary is missing or announces a contract version this SDK does not
+  implement. The native command writes its diagnostics and the summary trailer
+  even on an all-provider failure, so the error carries `diagnostics`,
+  `summary`, `stderr`, and `exitCode` rather than an opaque exit status.
+  Checking `contractVersion` is no longer left to the caller: a mismatch (or an
+  absent trailer, which the contract makes mandatory) means the rows cannot be
+  interpreted safely, so it is refused instead of half-parsed. `DiscoverResult.summary`
+  is therefore non-optional.
+- **Callback exceptions no longer escape the stream.** An error thrown by
+  `onSession` or `onDiagnostic` used to surface as an unhandled exception inside
+  the stdout handler, which can take a host process down. It now aborts the run:
+  the child is killed and the promise rejects with the caller's own error.
 - `SESSION_CATALOG_CONTRACT_VERSION` (currently `1`), mirroring the native
   constant, plus the `CatalogSession`, `ListCatalogOptions`,
   `DiscoverSessionsOptions`, `DiscoverResult`, `DiscoverySummary`,
   `DiscoveryDiagnostic`, `DiscoveryCounters`, `ProviderDiscoverySummary`, and
   `SourceExemption` types.
 - **MCP tool `list_sessions`** (read-only) — `sources?`, `limit` (default 20,
-  max 200), `before_ms`; returns the catalog rows as JSON alongside
+  max 200), `before_ms`, and `after` (the previous reply's `nextCursor` object);
+  returns the catalog rows plus `nextCursor` as JSON alongside
   `contractVersion`, `sourceKind`, `dbPath`, and `projectScope`. Its `sources`
-  enum omits `trajectory`, which the catalog never contains.
+  enum omits `trajectory`, which the catalog never contains. With no SQLite
+  database present the tool answers `{ sessions: [], nextCursor: null,
+  sourceKind: "none", note }` **without** opening the reader: the catalog only
+  ever lives in SQLite, so building the JSONL fallback there would walk every
+  local provider file — seconds of I/O — to produce a guaranteed-empty catalog.
+  Every other tool keeps the fallback behavior it had.
 
 ### Changed
 
 - `listSessions` is unchanged and still derives sessions from `history`; its doc
   comment now points at `listSessionCatalog` as the fast and complete path
   (the catalog also holds sessions that only shallow discovery has seen).
+- A cursor missing `source` or `sessionId` throws a `TypeError`. A timestamp
+  alone cannot separate rows that share a millisecond, and quietly ignoring the
+  half-cursor would restart the walk at page one — the same half-cursor the
+  native CLI refuses.
 
 ## [0.5.0] - 2026-08-20
 

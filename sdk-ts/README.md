@@ -67,7 +67,7 @@ Contract tools:
 - `stats()`
 - `search_trajectories(query, limit?)`
 - `why_for_task(query)`
-- `list_sessions(sources?, limit?, before_ms?)`
+- `list_sessions(sources?, limit?, before_ms?, after?)`
 
 ## Session catalog
 
@@ -79,19 +79,26 @@ Reading it is one indexed query over a single table — no provider transcript i
 import { openAiHist, discoverSessions, SESSION_CATALOG_CONTRACT_VERSION } from 'ai-hist';
 
 const hist = await openAiHist();
-const sessions = hist.listSessionCatalog({ limit: 20 });
-for (const s of sessions) {
+for (const s of hist.listSessionCatalog({ limit: 20 })) {
   console.log(s.lastActivityMs, s.source, s.sessionId, s.cwd, s.firstPrompt);
 }
-
-// Paginate with a keyset cursor.
-const older = hist.listSessionCatalog({
-  limit: 20,
-  beforeMs: sessions.at(-1)!.lastActivityMs!,
-});
 ```
 
-Ordering is `lastActivityMs` descending, rows with no timestamp last, then `source` and `sessionId` so pages are stable. `trajectory` rows are excluded — trajectories are derived records, not sessions. A configured `projectScope` constrains rows by `cwd`, so sources with no working directory (relay) drop out of a scoped listing. In JSONL fallback mode (no SQLite database) the catalog is empty and the method returns `[]`; only the native discovery engine writes it.
+The catalog's total order is `(lastActivityMs DESC, source ASC, sessionId ASC)`, with rows of unknown recency last. Recency alone is not a key: one discovery pass can stamp many sessions with the same mtime-derived millisecond, so paginate with `listSessionCatalogPage` and follow its cursor, which carries all three columns:
+
+```ts
+let after;
+for (;;) {
+  const page = hist.listSessionCatalogPage({ limit: 20, after });
+  render(page.sessions);
+  if (!page.nextCursor) break;   // null once the catalog is exhausted
+  after = page.nextCursor;       // { lastActivityMs, source, sessionId }
+}
+```
+
+`nextCursor` is non-null only when the page filled its limit, so the loop terminates on an empty catalog and on a null-timestamp tail alike — both cases where a `beforeMs`-only walk either spins forever or silently drops the rows tied with a page boundary. `beforeMs` survives as a *coarse* cutoff ("anything before last Tuesday") and is ignored when `after` is set. The same contract is available from the CLI as the `next_cursor` field of `sessions list --json`, fed back as `--after-source` + `--after-session-id` (both required together, and `--after-ms` alone is refused — a timestamp is not a cursor). Omit `--after-ms` to continue through the undated tail.
+
+`trajectory` rows are excluded — trajectories are derived records, not sessions. A configured `projectScope` constrains rows by `cwd`, so sources with no working directory (relay) drop out of a scoped listing. A negative `limit` throws (SQLite would read it as "unlimited"). In JSONL fallback mode (no SQLite database) the catalog is empty and the methods return no rows; only the native discovery engine writes it.
 
 To populate or refresh the catalog, run shallow discovery. It scans the known provider locations with bounded reads, orders candidates globally by recency before applying the limit, and skips sources whose bytes have not changed since the last run:
 
@@ -102,13 +109,15 @@ const { sessions, diagnostics, summary } = await discoverSessions({
   onSession: (s) => render(s),    // streams as rows arrive
 });
 
-console.log(summary?.discovered, summary?.skippedUnchanged, summary?.counters.bytesRead);
+console.log(summary.discovered, summary.skippedUnchanged, summary.counters.bytesRead);
 for (const d of diagnostics) console.warn(`[${d.source}] ${d.locator ?? ''}: ${d.error}`);
 ```
 
 `discoverSessions` is a top-level function, not an `AiHist` method: it drives `ai-hist sessions discover --json` (binary discovery is `$AI_HIST_RUST_BIN` → the install.sh location → `ai-hist` on `PATH`, the same as `pushToCloud`), and that writes the on-disk database. An `AiHist` instance is an in-memory snapshot taken at open time, so re-open it before listing to see freshly discovered rows.
 
-Failure behavior matches the CLI's: one provider blowing up yields a diagnostic and the run still resolves; the promise rejects only when the binary cannot be run at all (the error names `AI_HIST_RUST_BIN`) or when every selected provider failed. Unparseable JSONL lines are skipped rather than failing the run. `summary.contractVersion` is the native output-contract version; compare it against the exported `SESSION_CATALOG_CONTRACT_VERSION` (currently `1`) when a mismatch matters to you.
+Failure behavior matches the CLI's: one provider blowing up yields a diagnostic and the run still resolves. The promise rejects with a `DiscoveryError` when the binary cannot be run at all (the message names `AI_HIST_RUST_BIN`), when the run exits non-zero because every selected provider failed, or when the closing summary is missing or announces a contract version this SDK does not implement — the version is checked for you against `SESSION_CATALOG_CONTRACT_VERSION` rather than left as a field to remember. The native command writes its diagnostics and summary trailer even on an all-provider failure, so a `DiscoveryError` carries `diagnostics`, `summary`, `stderr`, and `exitCode`. Unparseable or unrecognized JSONL lines are skipped rather than failing the run.
+
+An exception thrown by `onSession` or `onDiagnostic` aborts the run: the child process is killed and the promise rejects with your error, instead of escaping the stream handler as an uncaught exception in the host.
 
 ## API
 
@@ -126,7 +135,8 @@ hist.projectScope: string | undefined
 
 hist.recent(opts?): HistoryEntry[]            // newest prompts first
 hist.listSessions(opts?): SessionSummary[]    // grouped from history by session_id, last activity DESC
-hist.listSessionCatalog(opts?): CatalogSession[] // the sessions catalog: cache-only, one indexed query
+hist.listSessionCatalog(opts?): CatalogSession[]      // the sessions catalog: cache-only, one indexed query
+hist.listSessionCatalogPage(opts?): SessionCatalogPage // the same page plus its nextCursor
 hist.getSession(sessionId): HistoryEntry[]    // all prompts in a session, oldest first
 hist.getSessionEvents(sessionId): SessionEvent[] // full transcript: text, thinking, tool calls/results, token usage
 hist.getToolCalls(sessionId): SessionToolCall[]  // the session's tool invocations
@@ -140,13 +150,14 @@ hist.stats(): Stats                           // counts + date range
 
 All list-style methods accept `{ source?, project?, limit?, beforeMs? }`. `beforeMs` is the cursor for paginating older results.
 
-`listSessionCatalog` takes `{ sources?, limit?, beforeMs? }` instead — it filters on the catalog's own `source` column, not on project.
+The catalog methods take `{ sources?, limit?, beforeMs?, after? }` instead — they filter on the catalog's own `source` column, not on project, and `after` is the cursor for paging.
 
 ```ts
 resumeCommand(entry): string | null           // shell command per source; null for relay
 defaultDbPath(): string                       // resolve env / OS default
 discoverSessions(opts?): Promise<DiscoverResult>  // drives `ai-hist sessions discover --json`
 SESSION_CATALOG_CONTRACT_VERSION: number      // native session-catalog output contract (1)
+DiscoveryError                                // thrown by discoverSessions; carries diagnostics + summary
 ```
 
 ## Trajectories
@@ -232,8 +243,19 @@ CREATE TABLE sessions (
   PRIMARY KEY (session_id, source)
 );
 
+CREATE INDEX idx_sessions_recency ON sessions(last_activity_ms DESC, source, session_id);
+CREATE INDEX idx_sessions_source_recency ON sessions(source, last_activity_ms DESC, session_id);
 CREATE INDEX idx_sessions_source_last ON sessions(source, last_activity_ms DESC);
 CREATE INDEX idx_sessions_raw_path ON sessions(source, raw_path);
+
+CREATE TABLE discovery_skips (
+  source TEXT NOT NULL,
+  locator TEXT NOT NULL,
+  stamp TEXT NOT NULL,
+  reason TEXT,
+  updated_ms INTEGER,
+  PRIMARY KEY (source, locator)
+);
 ```
 
 `models_json` and `workspace_roots_json` hold JSON string arrays or `NULL` (never `[]`); the SDK parses both into arrays. The catalog columns were added after 0.5.0, so when the SDK opens an older database file it backfills the missing columns on its in-memory copy with `ALTER TABLE` — the file on disk is not touched, and the absent values read as `NULL`.

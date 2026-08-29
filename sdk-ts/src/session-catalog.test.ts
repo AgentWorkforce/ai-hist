@@ -1,16 +1,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import initSqlJs from 'sql.js';
 import {
   SESSION_CATALOG_CONTRACT_VERSION,
+  DiscoveryError,
   discoverSessions,
   openAiHist,
+  type CatalogCursor,
   type CatalogSession,
 } from './index.js';
+
+const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -124,8 +130,44 @@ async function writeCatalogDb(dbPath: string): Promise<void> {
   });
 }
 
+/**
+ * A catalog where one discovery pass stamped many sessions with the same
+ * millisecond, plus an undated tail — the shape a recency-only cursor drops
+ * rows from.
+ */
+async function writeTiedCatalogDb(dbPath: string): Promise<void> {
+  await writeDb(dbPath, (db) => {
+    db.run(NEW_SHAPE_DDL);
+    const insert = db.prepare(
+      `INSERT INTO sessions (session_id, source, last_activity_ms, discovery_state)
+       VALUES (?, ?, ?, 'shallow')`,
+    );
+    try {
+      const rows: Array<[string, string, number | null]> = [
+        ['tie-a', 'claude', 2_000],
+        ['tie-b', 'claude', 2_000],
+        ['tie-c', 'codex', 2_000],
+        ['tie-d', 'codex', 2_000],
+        ['old-a', 'claude', 1_000],
+        ['old-b', 'cursor', 1_000],
+        ['undated-a', 'claude', null],
+        ['undated-b', 'codex', null],
+        ['undated-c', 'codex', null],
+      ];
+      for (const row of rows) insert.run(row);
+    } finally {
+      insert.free();
+    }
+  });
+}
+
 function ids(sessions: CatalogSession[]): string[] {
   return sessions.map((session) => session.sessionId);
+}
+
+/** Identity of a row in the catalog's total order. */
+function keys(sessions: CatalogSession[]): string[] {
+  return sessions.map((session) => `${session.source}:${session.sessionId}`);
 }
 
 async function withCatalog(
@@ -224,6 +266,146 @@ test('listSessionCatalog filters by source and limit, and paginates with beforeM
   });
 });
 
+test('listSessionCatalogPage walks tied and undated rows exactly once', async () => {
+  await withCatalog('ai-hist-catalog-page-', writeTiedCatalogDb, async (dbPath) => {
+    const hist = await openAiHist({ dbPath });
+    try {
+      const everything = hist.listSessionCatalog({ limit: 100 });
+      assert.equal(everything.length, 9);
+      // Total order: recency first, then source, then session id; undated last.
+      assert.deepEqual(ids(everything), [
+        'tie-a',
+        'tie-b',
+        'tie-c',
+        'tie-d',
+        'old-a',
+        'old-b',
+        'undated-a',
+        'undated-b',
+        'undated-c',
+      ]);
+
+      // A walk in pages of two must reproduce that list exactly: a page
+      // boundary lands inside a group of tied rows, which is where a
+      // recency-only cursor loses (or repeats) rows.
+      const walked: string[] = [];
+      let after: CatalogCursor | undefined;
+      let pages = 0;
+      for (;;) {
+        const page = hist.listSessionCatalogPage({ limit: 2, after });
+        walked.push(...keys(page.sessions));
+        pages += 1;
+        assert.ok(pages < 20, 'pagination did not terminate');
+        if (!page.nextCursor) break;
+        after = page.nextCursor;
+      }
+      assert.deepEqual(walked, keys(everything));
+      assert.equal(new Set(walked).size, walked.length, 'a row was returned twice');
+      assert.equal(pages, 5); // 2+2+2+2+1
+    } finally {
+      hist.close();
+    }
+  });
+});
+
+test('a dated cursor still reaches the undated tail', async () => {
+  await withCatalog('ai-hist-catalog-tail-', writeTiedCatalogDb, async (dbPath) => {
+    const hist = await openAiHist({ dbPath });
+    try {
+      const fromLastDated = hist.listSessionCatalog({
+        after: { lastActivityMs: 1_000, source: 'cursor', sessionId: 'old-b' },
+      });
+      assert.deepEqual(ids(fromLastDated), ['undated-a', 'undated-b', 'undated-c']);
+
+      // And an undated cursor continues within the tail, by identity alone.
+      const withinTail = hist.listSessionCatalog({
+        after: { lastActivityMs: null, source: 'claude', sessionId: 'undated-a' },
+      });
+      assert.deepEqual(ids(withinTail), ['undated-b', 'undated-c']);
+
+      // A cursor sitting on a tie returns the rest of the tie, not the next
+      // timestamp — the failure mode `before_ms` alone cannot avoid.
+      const midTie = hist.listSessionCatalog({
+        limit: 2,
+        after: { lastActivityMs: 2_000, source: 'claude', sessionId: 'tie-b' },
+      });
+      assert.deepEqual(ids(midTie), ['tie-c', 'tie-d']);
+    } finally {
+      hist.close();
+    }
+  });
+});
+
+test('nextCursor is set only when a page fills its limit', async () => {
+  await withCatalog('ai-hist-catalog-cursor-', writeTiedCatalogDb, async (dbPath) => {
+    const hist = await openAiHist({ dbPath });
+    try {
+      // Short page: the catalog is exhausted, so there is nothing to continue.
+      const short = hist.listSessionCatalogPage({ limit: 50 });
+      assert.equal(short.sessions.length, 9);
+      assert.equal(short.nextCursor, null);
+
+      // Exactly-full page: the cursor is handed out even though the next page
+      // turns out to be empty — the same fill rule the native page uses.
+      const exact = hist.listSessionCatalogPage({ limit: 9 });
+      assert.deepEqual(exact.nextCursor, {
+        lastActivityMs: null,
+        source: 'codex',
+        sessionId: 'undated-c',
+      });
+      const beyond = hist.listSessionCatalogPage({ limit: 9, after: exact.nextCursor! });
+      assert.deepEqual(beyond.sessions, []);
+      assert.equal(beyond.nextCursor, null);
+
+      // The cursor carries the last row of the page, ties included.
+      const first = hist.listSessionCatalogPage({ limit: 2 });
+      assert.deepEqual(first.nextCursor, {
+        lastActivityMs: 2_000,
+        source: 'claude',
+        sessionId: 'tie-b',
+      });
+    } finally {
+      hist.close();
+    }
+  });
+});
+
+test('a negative limit is rejected rather than dumping the catalog', async () => {
+  await withCatalog('ai-hist-catalog-limit-', writeTiedCatalogDb, async (dbPath) => {
+    const hist = await openAiHist({ dbPath });
+    try {
+      assert.throws(() => hist.listSessionCatalog({ limit: -1 }), RangeError);
+      assert.throws(() => hist.listSessionCatalogPage({ limit: -1 }), RangeError);
+    } finally {
+      hist.close();
+    }
+  });
+});
+
+test('a half-built cursor is rejected rather than silently restarting the walk', async () => {
+  await withCatalog('ai-hist-catalog-halfcursor-', writeTiedCatalogDb, async (dbPath) => {
+    const hist = await openAiHist({ dbPath });
+    try {
+      // A timestamp on its own cannot separate tied rows; dropping it would
+      // hand back page one forever.
+      assert.throws(
+        () => hist.listSessionCatalog({ after: { lastActivityMs: 2_000 } as never }),
+        TypeError,
+      );
+      assert.throws(
+        () => hist.listSessionCatalog({ after: { lastActivityMs: 2_000, source: 'claude' } as never }),
+        TypeError,
+      );
+      assert.throws(
+        () => hist.listSessionCatalog({ after: { source: '', sessionId: 'tie-a' } }),
+        TypeError,
+      );
+    } finally {
+      hist.close();
+    }
+  });
+});
+
 test('listSessionCatalog reads a pre-catalog database through the in-memory migration', async () => {
   const writeOld = (dbPath: string) =>
     writeDb(dbPath, (db) => {
@@ -273,28 +455,39 @@ test('a project scope constrains the catalog listing by cwd', async () => {
 });
 
 test('the catalog is empty in JSONL fallback mode', async () => {
+  // The fallback scanner resolves ~/.claude, ~/.codex, ~/.cursor and ~/.grok
+  // from os.homedir() at module load, so overriding HOME inside this process
+  // would come too late and the scan would read the developer's real history.
+  // Run it in a child with an empty HOME instead: fully isolated, and it also
+  // proves the fallback path builds no catalog rather than merely finding none.
   const dir = await mkdtemp(join(tmpdir(), 'ai-hist-catalog-fallback-'));
-  const previousDb = process.env.AI_HIST_DB;
-  const previousTrajectory = process.env.TRAJECTORY_ROOT;
-  const previousOpenCode = process.env.OPENCODE_DB;
-  process.env.AI_HIST_DB = join(dir, 'missing.db');
-  process.env.TRAJECTORY_ROOT = join(dir, 'missing-trajectories');
-  process.env.OPENCODE_DB = join(dir, 'missing-opencode.db');
+  const home = join(dir, 'home');
+  await mkdir(home, { recursive: true });
+  const probe = join(dir, 'probe.mjs');
+  const indexUrl = new URL('./index.js', import.meta.url).href;
+  await writeFile(
+    probe,
+    `import { openAiHist } from ${JSON.stringify(indexUrl)};\n` +
+      `const hist = await openAiHist({ dbPath: process.env.AI_HIST_DB });\n` +
+      `console.log(JSON.stringify({ kind: hist.sourceKind, catalog: hist.listSessionCatalog() }));\n` +
+      `hist.close();\n`,
+  );
   try {
-    const hist = await openAiHist({ dbPath: join(dir, 'missing.db') });
-    try {
-      assert.equal(hist.sourceKind, 'jsonl');
-      assert.deepEqual(hist.listSessionCatalog(), []);
-    } finally {
-      hist.close();
-    }
+    const { stdout } = await execFileAsync(process.execPath, [probe], {
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        AI_HIST_DB: join(dir, 'missing.db'),
+        TRAJECTORY_ROOT: join(dir, 'missing-trajectories'),
+        OPENCODE_DB: join(dir, 'missing-opencode.db'),
+      },
+      timeout: 30_000,
+    });
+    const result = JSON.parse(stdout) as { kind: string; catalog: unknown[] };
+    assert.equal(result.kind, 'jsonl');
+    assert.deepEqual(result.catalog, []);
   } finally {
-    if (previousDb === undefined) delete process.env.AI_HIST_DB;
-    else process.env.AI_HIST_DB = previousDb;
-    if (previousTrajectory === undefined) delete process.env.TRAJECTORY_ROOT;
-    else process.env.TRAJECTORY_ROOT = previousTrajectory;
-    if (previousOpenCode === undefined) delete process.env.OPENCODE_DB;
-    else process.env.OPENCODE_DB = previousOpenCode;
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -491,17 +684,91 @@ test('discoverSessions rejects with a clear install hint when the binary is miss
   );
 });
 
-test('discoverSessions rejects on a non-zero exit and surfaces stderr', async () => {
-  const { spawnFn } = fakeSpawn({ code: 2, stderr: 'every provider failed' });
+test('discoverSessions rejects on a non-zero exit, carrying the diagnostics and summary', async () => {
+  // Every provider failed: the CLI still writes its diagnostics and the summary
+  // trailer before exiting non-zero, so the error must keep them.
+  const { spawnFn } = fakeSpawn({
+    chunks: [`${DISCOVER_DIAGNOSTIC_LINE}\n${DISCOVER_SUMMARY_LINE}\n`],
+    code: 2,
+    stderr: 'every provider failed',
+  });
   await assert.rejects(
     discoverSessions({ binPath: '/bin/echo', spawnFn }),
-    /ai-hist sessions discover failed \(exit 2\).*every provider failed/,
+    (err: unknown) => {
+      assert.ok(err instanceof DiscoveryError);
+      assert.match(err.message, /ai-hist sessions discover failed \(exit 2\).*every provider failed/);
+      assert.equal(err.exitCode, 2);
+      assert.deepEqual(err.diagnostics.map((d) => d.source), ['grok']);
+      assert.equal(err.summary?.providers.grok?.failed, true);
+      return true;
+    },
   );
 });
 
-test('discoverSessions returns a null summary when the binary emits none', async () => {
+test('discoverSessions rejects when the run produces no summary trailer', async () => {
   const { spawnFn } = fakeSpawn({ chunks: [`${DISCOVER_SESSION_LINE}\n`] });
-  const result = await discoverSessions({ binPath: '/bin/echo', spawnFn });
-  assert.equal(result.summary, null);
-  assert.equal(result.sessions.length, 1);
+  await assert.rejects(
+    discoverSessions({ binPath: '/bin/echo', spawnFn }),
+    /produced no summary line/,
+  );
+});
+
+test('discoverSessions rejects a summary from an unsupported contract version', async () => {
+  const future = JSON.stringify({
+    ...(JSON.parse(DISCOVER_SUMMARY_LINE) as Record<string, unknown>),
+    contract_version: 2,
+  });
+  const { spawnFn } = fakeSpawn({ chunks: [`${DISCOVER_SESSION_LINE}\n${future}\n`] });
+  await assert.rejects(
+    discoverSessions({ binPath: '/bin/echo', spawnFn }),
+    (err: unknown) => {
+      assert.ok(err instanceof DiscoveryError);
+      assert.match(err.message, /unsupported session-catalog contract version 2/);
+      // The rows the run did emit are still on the error's summary.
+      assert.equal(err.summary?.discovered, 1);
+      return true;
+    },
+  );
+
+  // A summary with no contract_version at all is equally unusable.
+  const versionless = JSON.stringify({ type: 'summary', discovered: 0 });
+  const { spawnFn: spawnVersionless } = fakeSpawn({ chunks: [`${versionless}\n`] });
+  await assert.rejects(
+    discoverSessions({ binPath: '/bin/echo', spawnFn: spawnVersionless }),
+    /unsupported session-catalog contract version 0/,
+  );
+});
+
+test('an exception from onSession aborts the run instead of escaping the stream', async () => {
+  const { spawnFn } = fakeSpawn({
+    chunks: [`${DISCOVER_SESSION_LINE}\n${DISCOVER_SUMMARY_LINE}\n`],
+  });
+  const boom = new Error('host render failed');
+  await assert.rejects(
+    discoverSessions({
+      binPath: '/bin/echo',
+      spawnFn,
+      onSession: () => {
+        throw boom;
+      },
+    }),
+    (err: unknown) => err === boom,
+  );
+});
+
+test('an exception from onDiagnostic aborts the run too', async () => {
+  const { spawnFn } = fakeSpawn({
+    chunks: [`${DISCOVER_DIAGNOSTIC_LINE}\n${DISCOVER_SUMMARY_LINE}\n`],
+  });
+  const boom = new Error('host logger failed');
+  await assert.rejects(
+    discoverSessions({
+      binPath: '/bin/echo',
+      spawnFn,
+      onDiagnostic: () => {
+        throw boom;
+      },
+    }),
+    (err: unknown) => err === boom,
+  );
 });

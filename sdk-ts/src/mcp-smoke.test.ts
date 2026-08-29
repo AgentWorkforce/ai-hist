@@ -416,6 +416,100 @@ test('MCP server exposes history and trajectory tools over stdio', async () => {
   }
 });
 
+test('list_sessions answers without a database instead of scanning provider files', async () => {
+  // No SQLite database exists, and the catalog only ever lives in one. Opening
+  // the reader here would walk every local provider file to build the JSONL
+  // fallback — seconds of I/O for a guaranteed-empty catalog. The tool must
+  // short-circuit, which shows up as sourceKind "none" rather than "jsonl".
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'ai-hist-mcp-nodb-')));
+  const home = join(root, 'home');
+  await mkdir(home, { recursive: true });
+  const child = spawn(process.execPath, [new URL('./mcp-server.js', import.meta.url).pathname], {
+    cwd: root,
+    env: {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      AI_HIST_DB: join(root, 'missing.db'),
+      TRAJECTORY_ROOT: join(root, 'missing-trajectories'),
+      OPENCODE_DB: join(root, 'missing-opencode.db'),
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const stderr: Buffer[] = [];
+  child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+
+  try {
+    const payload = await new Promise<{ sourceKind?: string; sessions?: unknown[]; nextCursor?: unknown; note?: string }>(
+      (resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('timed out waiting for list_sessions')), 10_000);
+        let buffer = '';
+        child.stdout.on('data', (chunk: Buffer) => {
+          buffer += chunk.toString('utf8');
+          while (true) {
+            const marker = buffer.indexOf('\n');
+            if (marker === -1) return;
+            const body = buffer.slice(0, marker).trim();
+            buffer = buffer.slice(marker + 1);
+            if (!body) continue;
+            const message = JSON.parse(body) as {
+              id?: number;
+              result?: { content?: Array<{ type: string; text?: string }> };
+              error?: unknown;
+            };
+            if (message.error) {
+              clearTimeout(timer);
+              reject(new Error(`MCP error: ${JSON.stringify(message.error)}`));
+              return;
+            }
+            if (message.id === 2) {
+              clearTimeout(timer);
+              const text = message.result?.content?.find((item) => item.type === 'text')?.text ?? '{}';
+              resolve(JSON.parse(text));
+              return;
+            }
+          }
+        });
+        child.on('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        child.on('exit', (code) => {
+          if (code !== null && code !== 0) {
+            clearTimeout(timer);
+            reject(new Error(`MCP server exited ${code}: ${Buffer.concat(stderr).toString('utf8')}`));
+          }
+        });
+
+        writeJsonRpc(child.stdin, {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2025-06-18',
+            capabilities: {},
+            clientInfo: { name: 'ai-hist-smoke', version: '0.0.0' },
+          },
+        });
+        writeJsonRpc(child.stdin, { jsonrpc: '2.0', method: 'notifications/initialized', params: {} });
+        writeJsonRpc(child.stdin, {
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'tools/call',
+          params: { name: 'list_sessions', arguments: {} },
+        });
+      },
+    );
+
+    assert.equal(payload.sourceKind, 'none');
+    assert.deepEqual(payload.sessions, []);
+    assert.equal(payload.nextCursor, null);
+    assert.match(payload.note ?? '', /sessions discover/);
+  } finally {
+    child.kill();
+  }
+});
+
 function writeJsonRpc(stdin: NodeJS.WritableStream, payload: unknown): void {
   stdin.write(`${JSON.stringify(payload)}\n`);
 }
