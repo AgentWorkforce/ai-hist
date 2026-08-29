@@ -87,13 +87,22 @@ One object, never a bare array, so the version travels with the payload:
       "discovery_state": "shallow",
       "from_cache": true
     }
-  ]
+  ],
+  "next_cursor": {
+    "last_activity_ms": 1782039603000,
+    "source": "codex",
+    "session_id": "0198c2ad-codex"
+  }
 }
 ```
 
 Keys are `snake_case`. `models` and `workspace_roots` are always arrays
 (possibly empty); every other absent value is `null`, never an invented
 placeholder or an empty string.
+
+`next_cursor` is the continuation for the next page, or `null` once the catalog
+is exhausted (the page came back short of its limit). See
+[Pagination](#pagination).
 
 ### `sessions discover --json`
 
@@ -107,7 +116,8 @@ command's precedent). Three line types, in this order:
 // 0..n non-fatal failures — one provider or one malformed session
 {"type": "diagnostic", "source": "grok", "locator": "/Users/you/.grok/sessions/…/chat_history.jsonl", "error": "…"}
 
-// exactly one closing summary
+// exactly one closing summary — emitted even when every provider failed,
+// so a consumer always sees the reason before the non-zero exit
 {
   "type": "summary",
   "contract_version": 1,
@@ -226,13 +236,19 @@ How each adapter works:
   branch, `version`, models and the first human prompt; tail for the last
   timestamp and the final branch. Meta rows, slash-command wrappers, bash
   wrappers and sidechain (subagent) turns are skipped when picking
-  `first_prompt`.
+  `first_prompt`. A subagent *sidecar* — a separate file whose records all
+  carry the parent's `sessionId` — is not a session of its own: it is detected
+  in the head read and skipped, so a session is emitted once per run and its
+  row keeps pointing at its own transcript. A transcript whose complete records
+  parse as nothing is reported as a diagnostic rather than published under its
+  file name; an empty one is simply not a session yet.
 - **codex** — `rollout-*.jsonl` under `~/.codex/sessions` and
   `~/.codex/archived_sessions`. The first line is a `session_meta` record, which
   makes codex the richest source: originator, `cli_version`, git remote, initial
   commit, workspace roots and model all come from it. Subagent threads are real
   rollouts but not user sessions, so they are excluded — exactly as the full
-  sync excludes them.
+  sync excludes them — and remembered in `discovery_skips` so a rescan does not
+  re-read them.
 - **cursor** — `~/.cursor/projects/<encoded-path>/agent-transcripts/<id>/<id>.jsonl`.
   Cursor transcripts carry **no timestamps at all**, so `first_activity_ms` is
   always `null` and `last_activity_ms` is the file mtime. `cwd` is decoded from
@@ -283,9 +299,32 @@ Files inside the head budget are read once and serve as their own tail. Only
 newline-terminated records are parsed: a transcript being appended to right now
 has a partial trailing line, and that line is not yet a record.
 
-`sessions list` paginates by recency instead: `--limit` plus `--before-ms`
-(keyset), served by `idx_sessions_last`, or `idx_sessions_source_last` when
-`--source` is given.
+<a id="pagination"></a>
+
+`sessions list` paginates by recency instead. The catalog's total order is
+
+```sql
+ORDER BY last_activity_ms DESC, source ASC, session_id ASC
+```
+
+with rows of unknown recency (`last_activity_ms IS NULL`, e.g. a cursor session
+whose file has no mtime) last. Recency alone is not a key — one discovery pass
+stamps many sessions with the same mtime-derived millisecond — so the cursor
+carries the identity columns too:
+
+```jsonc
+{"last_activity_ms": 1782039603000, "source": "codex", "session_id": "0198c2ad-codex"}
+```
+
+Feed it back as `--after-ms` / `--after-source` / `--after-session-id` (the two
+identity flags are required together; omit `--after-ms` to continue through the
+undated tail). `--before-ms` still works as a coarse "older than" cutoff, but it
+cannot separate rows that share a millisecond, so it is not a paging key; it is
+ignored when a cursor is given.
+
+The whole order is carried by `idx_sessions_recency`, or
+`idx_sessions_source_recency` when `--source` is given, so a page is an indexed
+read with no sort.
 
 ---
 
@@ -322,7 +361,9 @@ stamp-guarded upsert into `sessions`:
 
 - the shallow upsert never nulls a value the catalog already holds, never
   raises `first_activity_ms` above what a fuller pass observed, and never
-  downgrades `discovery_state = 'full'`;
+  downgrades a fully indexed row to `'shallow'` — including a row from a
+  database that predates `discovery_state`, whose `NULL` readers interpret as
+  `'full'`;
 - the full-sync path only ever upgrades a row to `'full'`;
 - writes go through the normal busy-retry connection, and the opencode
   provider reads a WAL-safe snapshot rather than the live database.
@@ -338,7 +379,12 @@ the schema is current: it cannot block the writer and cannot be blocked by it.
 The catalog lives in the existing `sessions` table, extended with
 `first_prompt`, `models_json`, `originator`, `agent_version`, `repo_url`,
 `initial_commit`, `workspace_roots_json`, `source_stamp` and `discovery_state`,
-plus the `idx_sessions_source_last` and `idx_sessions_raw_path` indexes.
+plus the `idx_sessions_source_last`, `idx_sessions_raw_path`,
+`idx_sessions_recency` and `idx_sessions_source_recency` indexes. A companion
+`discovery_skips` table remembers sources already examined and found not to be
+sessions (a codex subagent thread, a Claude subagent sidecar), keyed by
+`(source, locator)` with the stamp, so a rescan costs a primary-key lookup
+instead of re-reading them every run.
 Databases created by an older release are migrated in place by ignore-error
 `ALTER TABLE`s in `init_db`, and `schema_is_current` knows about the new
 columns, so a read-only handle over an old database is upgraded instead of
@@ -372,11 +418,11 @@ discoverable".
 ## Programmatic access
 
 - **Native (napi)** — `listSessions(options?)` returns
-  `{contractVersion, sessions}`; `discoverSessions(options?)` runs a shallow
+  `{contractVersion, sessions, nextCursor}`; `discoverSessions(options?)` runs a shallow
   scan and returns the rows plus the summary (collected rather than streamed —
   use the CLI's JSONL output when you want progressive rendering). Both run on
-  a blocking worker thread and accept `sources` / `limit`, with `beforeMs` on
-  the listing.
+  a blocking worker thread and accept `sources` / `limit`, with `beforeMs` and
+  `after` (the previous page's `nextCursor`) on the listing.
 - **TypeScript SDK** — `listSessionCatalog()` / `discoverSessions()` wrap the
   same contract for Node consumers; see the SDK's own documentation for the
   exact signatures.
