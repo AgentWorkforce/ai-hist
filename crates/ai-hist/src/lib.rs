@@ -29,10 +29,11 @@ mod learn;
 
 pub use discover::{
     discover_sessions, discover_sessions_collect, discover_sessions_with_env, list_session_catalog,
-    shallow_providers, Candidate, CatalogListOptions, DiscoverOptions, DiscoveryCounters,
-    DiscoveryDiagnostic, DiscoveryEnv, DiscoverySummary, ProviderSummary, ShallowSession,
-    ShallowSessionProvider, SourceExemption, DEFAULT_CATALOG_LIMIT, DISCOVERY_EXEMPTIONS,
-    SESSION_CATALOG_CONTRACT_VERSION, SHALLOW_SCANNER_VERSION,
+    list_session_catalog_page, shallow_providers, AllProvidersFailed, Candidate, CatalogCursor,
+    CatalogListOptions, DiscoverOptions, DiscoveryCounters, DiscoveryDiagnostic, DiscoveryEnv,
+    DiscoverySummary, ProviderSummary, SessionCatalogPage, ShallowSession, ShallowSessionProvider,
+    SourceExemption, DEFAULT_CATALOG_LIMIT, DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION,
+    SHALLOW_SCANNER_VERSION,
 };
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -126,10 +127,10 @@ pub fn sync_and_push() -> Result<SyncPushOutcome> {
 /// The in-process equivalent of `ai-hist sessions list`: one indexed query
 /// over `sessions`, no provider I/O. A database that does not exist yet is an
 /// empty catalog, not an error — the caller is expected to run discovery next.
-pub fn list_sessions_local(options: &CatalogListOptions) -> Result<Vec<ShallowSession>> {
+pub fn list_sessions_local(options: &CatalogListOptions) -> Result<SessionCatalogPage> {
     let db_path = default_db_path();
     if !db_path.exists() {
-        return Ok(Vec::new());
+        return Ok(SessionCatalogPage::default());
     }
     let conn = match open_db_readonly(&db_path) {
         Ok(conn) if schema_is_current(&conn).unwrap_or(false) => conn,
@@ -137,7 +138,7 @@ pub fn list_sessions_local(options: &CatalogListOptions) -> Result<Vec<ShallowSe
         // unreadable handle: let the writable open sort it out.
         _ => open_db(&db_path)?,
     };
-    list_session_catalog(&conn, options)
+    list_session_catalog_page(&conn, options)
 }
 
 /// Shallow discovery against the default database, with the rows collected.
@@ -492,13 +493,29 @@ enum SessionsAction {
         /// Restrict to a source (repeatable). Defaults to every discoverable source.
         #[arg(long)]
         source: Vec<String>,
-        /// Maximum rows (default 50).
+        /// Maximum rows (default 50). Must not be negative.
         #[arg(long)]
         limit: Option<i64>,
-        /// Keyset pagination: only sessions older than this epoch-ms cutoff.
+        /// Coarse cutoff: only sessions older than this epoch-ms. Cannot
+        /// separate sessions that share a millisecond — pass the previous
+        /// page's `next_cursor` fields to walk pages exactly.
         #[arg(long)]
         before_ms: Option<i64>,
-        /// Emit `{"contract_version":N,"sessions":[...]}` as one JSON object.
+        /// Precise continuation: `source` of the previous page's last row.
+        /// Requires --after-session-id.
+        #[arg(long, requires = "after_session_id")]
+        after_source: Option<String>,
+        /// Precise continuation: `session_id` of the previous page's last row.
+        /// Requires --after-source.
+        #[arg(long, requires = "after_source")]
+        after_session_id: Option<String>,
+        /// Precise continuation: `last_activity_ms` of the previous page's last
+        /// row. Omit (with --after-source/--after-session-id given) to continue
+        /// through the rows whose recency is unknown.
+        #[arg(long)]
+        after_ms: Option<i64>,
+        /// Emit `{"contract_version":N,"sessions":[...],"next_cursor":…}` as one
+        /// JSON object.
         #[arg(long)]
         json: bool,
     },
@@ -1273,20 +1290,40 @@ pub fn run() -> Result<()> {
                 source,
                 limit,
                 before_ms,
+                after_source,
+                after_session_id,
+                after_ms,
                 json,
             } => {
                 for source in &source {
                     validate_source(Some(source))?;
                 }
-                let rows = list_session_catalog(
+                // SQLite reads a negative LIMIT as "no limit", so `--limit -1`
+                // would quietly dump the entire catalog instead of erroring.
+                if let Some(limit) = limit {
+                    anyhow::ensure!(limit >= 0, "--limit must not be negative (got {limit})");
+                }
+                // clap's `requires` already pairs the two identity flags; the
+                // timestamp is optional because the rows whose recency is
+                // unknown sort last and are continued through without one.
+                let after = match (after_source, after_session_id) {
+                    (Some(source), Some(session_id)) => Some(CatalogCursor {
+                        last_activity_ms: after_ms,
+                        source,
+                        session_id,
+                    }),
+                    _ => None,
+                };
+                let page = list_session_catalog_page(
                     &conn,
                     &CatalogListOptions {
                         sources: source,
                         limit,
                         before_ms,
+                        after,
                     },
                 )?;
-                print_session_catalog(&rows, json)
+                print_session_catalog(&page, json)
             }
             SessionsAction::Discover {
                 source,
@@ -1299,15 +1336,20 @@ pub fn run() -> Result<()> {
 
 /// Render `ai-hist sessions list`.
 ///
-/// The JSON form is one object, not a bare array, so the contract version
-/// travels with the payload: `{"contract_version":1,"sessions":[…]}`.
-fn print_session_catalog(rows: &[ShallowSession], as_json: bool) -> Result<()> {
+/// The JSON form is one object, not a bare array, so the contract version and
+/// the pagination cursor travel with the payload:
+/// `{"contract_version":1,"sessions":[…],"next_cursor":{…}|null}`. Feed
+/// `next_cursor` back as `--after-ms/--after-source/--after-session-id` to get
+/// the next page; it is null once the catalog is exhausted.
+fn print_session_catalog(page: &SessionCatalogPage, as_json: bool) -> Result<()> {
+    let rows = &page.sessions;
     if as_json {
         println!(
             "{}",
             json!({
                 "contract_version": SESSION_CATALOG_CONTRACT_VERSION,
                 "sessions": rows,
+                "next_cursor": page.next_cursor,
             })
         );
         return Ok(());
@@ -1320,6 +1362,17 @@ fn print_session_catalog(rows: &[ShallowSession], as_json: bool) -> Result<()> {
         println!("{}", fmt_session_row(row));
     }
     println!("  {} session(s)", rows.len());
+    if let Some(cursor) = &page.next_cursor {
+        println!(
+            "  more available: --after-source {} --after-session-id {}{}",
+            cursor.source,
+            cursor.session_id,
+            cursor
+                .last_activity_ms
+                .map(|ms| format!(" --after-ms {ms}"))
+                .unwrap_or_default()
+        );
+    }
     Ok(())
 }
 
@@ -1362,7 +1415,7 @@ fn run_session_discovery(
 ) -> Result<()> {
     let options = DiscoverOptions { sources, limit };
     let mut count = 0usize;
-    let summary = discover_sessions(conn, &options, |session| {
+    let outcome = discover_sessions(conn, &options, |session| {
         count += 1;
         if as_json {
             match serde_json::to_value(session) {
@@ -1378,7 +1431,21 @@ fn run_session_discovery(
         } else {
             println!("{}", fmt_session_row(session));
         }
-    })?;
+    });
+    // An every-provider failure is still a failure, but the diagnostics are
+    // the reason a caller ran this at all. Render the collected stream and the
+    // summary trailer first, so a JSONL consumer never sees a truncated stream
+    // followed by an opaque exit code.
+    let (summary, failure) = match outcome {
+        Ok(summary) => (summary, None),
+        Err(error) => match error.downcast::<AllProvidersFailed>() {
+            Ok(failed) => {
+                let summary = failed.summary.clone();
+                (summary, Some(anyhow::Error::from(failed)))
+            }
+            Err(error) => return Err(error),
+        },
+    };
     for diagnostic in &summary.diagnostics {
         if as_json {
             println!(
@@ -1413,6 +1480,9 @@ fn run_session_discovery(
             summary.counters.files_opened,
             summary.counters.shallow_reads
         );
+    }
+    if let Some(failure) = failure {
+        return Err(failure);
     }
     Ok(())
 }

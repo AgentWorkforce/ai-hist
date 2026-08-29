@@ -52,19 +52,46 @@ export interface CatalogSession {
    */
   fromCache: boolean
 }
+/**
+ * A precise continuation point in the catalog's total order,
+ * `(lastActivityMs DESC, source ASC, sessionId ASC)`.
+ *
+ * Recency alone is not a key -- one discovery pass can stamp many sessions
+ * with the same millisecond -- so the identity columns make the cursor total.
+ * `lastActivityMs` is null for the tail of rows whose recency is unknown.
+ */
+export interface CatalogCursor {
+  lastActivityMs?: number
+  source: string
+  sessionId: string
+}
 /** Filters for the cache-only catalog listing. */
 export interface ListSessionsOptions {
   /** Restrict to these sources. Omit for every discoverable source. */
   sources?: Array<string>
-  /** Row cap (default 50). */
+  /** Row cap (default 50). Must not be negative. */
   limit?: number
-  /** Keyset pagination: only sessions older than this epoch-ms cutoff. */
+  /**
+   * Coarse cutoff: only sessions older than this epoch-ms. Cannot separate
+   * sessions sharing a millisecond; use `after` to walk pages. Ignored when
+   * `after` is set.
+   */
   beforeMs?: number
+  /** Precise continuation: the previous page's `nextCursor`. */
+  after?: CatalogCursor
 }
-/** The cache-only catalog listing plus the contract version it was built with. */
+/**
+ * The cache-only catalog listing, the contract version it was built with, and
+ * the cursor that continues it.
+ */
 export interface SessionCatalog {
   contractVersion: number
   sessions: Array<CatalogSession>
+  /**
+   * Pass back as `after` for the next page; null once the catalog is
+   * exhausted (the page came back short of its limit).
+   */
+  nextCursor?: CatalogCursor
 }
 /** Filters for one shallow discovery run. */
 export interface DiscoverSessionsOptions {

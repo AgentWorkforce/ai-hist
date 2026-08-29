@@ -166,6 +166,9 @@ fn list_serves_the_catalog_after_the_provider_files_are_gone() {
     assert_eq!(sessions[1]["session_id"], "claude-cli");
     assert!(sessions.iter().all(|row| row["from_cache"] == true));
 
+    // A page that did not fill its limit ends the walk.
+    assert_eq!(payload["next_cursor"], Value::Null);
+
     let filtered = isolated(
         &temp,
         &db_path,
@@ -176,6 +179,132 @@ fn list_serves_the_catalog_after_the_provider_files_are_gone() {
     let payload: Value = serde_json::from_slice(&filtered.stdout).unwrap();
     assert_eq!(payload["sessions"].as_array().unwrap().len(), 1);
     assert_eq!(payload["sessions"][0]["source"], "claude");
+}
+
+#[test]
+fn list_paginates_with_the_cursor_it_hands_back() {
+    let temp = fake_home();
+    let db_path = temp.path().join("history.db");
+    assert!(isolated(&temp, &db_path, &["sessions", "discover"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let first = isolated(
+        &temp,
+        &db_path,
+        &["sessions", "list", "--json", "--limit", "1"],
+    )
+    .output()
+    .unwrap();
+    let page: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(page["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(page["sessions"][0]["session_id"], "codex-cli");
+    let cursor = &page["next_cursor"];
+    assert_eq!(cursor["source"], "codex");
+    assert_eq!(cursor["session_id"], "codex-cli");
+    assert!(cursor["last_activity_ms"].is_i64());
+
+    let second = isolated(
+        &temp,
+        &db_path,
+        &[
+            "sessions",
+            "list",
+            "--json",
+            "--limit",
+            "1",
+            "--after-ms",
+            &cursor["last_activity_ms"].as_i64().unwrap().to_string(),
+            "--after-source",
+            cursor["source"].as_str().unwrap(),
+            "--after-session-id",
+            cursor["session_id"].as_str().unwrap(),
+        ],
+    )
+    .output()
+    .unwrap();
+    let page: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(page["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        page["sessions"][0]["session_id"], "claude-cli",
+        "the second page continues where the first stopped"
+    );
+}
+
+#[test]
+fn a_negative_limit_is_rejected_rather_than_dumping_the_catalog() {
+    let temp = fake_home();
+    let db_path = temp.path().join("history.db");
+    assert!(isolated(&temp, &db_path, &["sessions", "discover"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    // SQLite reads a negative LIMIT as "unlimited".
+    let output = isolated(
+        &temp,
+        &db_path,
+        // `--limit=-1` rather than `--limit -1`: clap reads a bare `-1` as a
+        // flag, so the equals form is what actually reaches the guard.
+        &["sessions", "list", "--json", "--limit=-1"],
+    )
+    .output()
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--limit must not be negative"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // `discover --limit` is unsigned, so clap rejects it before it reaches us.
+    let discover = isolated(
+        &temp,
+        &db_path,
+        &["sessions", "discover", "--json", "--limit=-1"],
+    )
+    .output()
+    .unwrap();
+    assert!(!discover.status.success());
+}
+
+#[test]
+fn an_every_provider_failure_still_emits_its_diagnostics_and_summary() {
+    let temp = fake_home();
+    let db_path = temp.path().join("history.db");
+    fs::write(temp.path().join("opencode.db"), "definitely not sqlite").unwrap();
+
+    // Only the broken provider is selected, so the whole run fails -- but a
+    // JSONL consumer must still receive the reason before the exit code.
+    let output = isolated(
+        &temp,
+        &db_path,
+        &["sessions", "discover", "--json", "--source", "opencode"],
+    )
+    .output()
+    .unwrap();
+    assert!(
+        !output.status.success(),
+        "an every-provider failure is an error"
+    );
+    let lines = jsonl(&String::from_utf8_lossy(&output.stdout));
+    let diagnostics: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["type"] == "diagnostic")
+        .collect();
+    assert_eq!(diagnostics.len(), 1, "{lines:#?}");
+    assert_eq!(diagnostics[0]["source"], "opencode");
+    let summary = lines.last().expect("a summary trailer");
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["providers"]["opencode"]["failed"], true);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no provider made progress"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

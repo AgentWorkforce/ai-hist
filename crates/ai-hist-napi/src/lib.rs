@@ -99,22 +99,43 @@ impl From<ai_hist_cli::ShallowSession> for CatalogSession {
     }
 }
 
+/// A precise continuation point in the catalog's total order,
+/// `(lastActivityMs DESC, source ASC, sessionId ASC)`.
+///
+/// Recency alone is not a key -- one discovery pass can stamp many sessions
+/// with the same millisecond -- so the identity columns make the cursor total.
+/// `lastActivityMs` is null for the tail of rows whose recency is unknown.
+#[napi(object)]
+pub struct CatalogCursor {
+    pub last_activity_ms: Option<i64>,
+    pub source: String,
+    pub session_id: String,
+}
+
 /// Filters for the cache-only catalog listing.
 #[napi(object)]
 pub struct ListSessionsOptions {
     /// Restrict to these sources. Omit for every discoverable source.
     pub sources: Option<Vec<String>>,
-    /// Row cap (default 50).
+    /// Row cap (default 50). Must not be negative.
     pub limit: Option<i64>,
-    /// Keyset pagination: only sessions older than this epoch-ms cutoff.
+    /// Coarse cutoff: only sessions older than this epoch-ms. Cannot separate
+    /// sessions sharing a millisecond; use `after` to walk pages. Ignored when
+    /// `after` is set.
     pub before_ms: Option<i64>,
+    /// Precise continuation: the previous page's `nextCursor`.
+    pub after: Option<CatalogCursor>,
 }
 
-/// The cache-only catalog listing plus the contract version it was built with.
+/// The cache-only catalog listing, the contract version it was built with, and
+/// the cursor that continues it.
 #[napi(object)]
 pub struct SessionCatalog {
     pub contract_version: u32,
     pub sessions: Vec<CatalogSession>,
+    /// Pass back as `after` for the next page; null once the catalog is
+    /// exhausted (the page came back short of its limit).
+    pub next_cursor: Option<CatalogCursor>,
 }
 
 /// Filters for one shallow discovery run.
@@ -187,20 +208,44 @@ pub async fn list_sessions(options: Option<ListSessionsOptions>) -> napi::Result
         sources: None,
         limit: None,
         before_ms: None,
+        after: None,
     });
+    if let Some(limit) = options.limit {
+        // SQLite reads a negative LIMIT as "unlimited"; reject rather than
+        // silently hand back the whole catalog.
+        if limit < 0 {
+            return Err(napi::Error::from_reason(format!(
+                "limit must not be negative (got {limit})"
+            )));
+        }
+    }
     let request = ai_hist_cli::CatalogListOptions {
         sources: options.sources.unwrap_or_default(),
         limit: options.limit,
         before_ms: options.before_ms,
+        after: options.after.map(|cursor| ai_hist_cli::CatalogCursor {
+            last_activity_ms: cursor.last_activity_ms,
+            source: cursor.source,
+            session_id: cursor.session_id,
+        }),
     };
-    let sessions =
+    let page =
         napi::tokio::task::spawn_blocking(move || ai_hist_cli::list_sessions_local(&request))
             .await
             .map_err(|e| napi::Error::from_reason(format!("worker thread panicked: {e}")))?
             .map_err(|e| napi::Error::from_reason(format!("{e:#}")))?;
     Ok(SessionCatalog {
         contract_version: ai_hist_cli::SESSION_CATALOG_CONTRACT_VERSION,
-        sessions: sessions.into_iter().map(CatalogSession::from).collect(),
+        sessions: page
+            .sessions
+            .into_iter()
+            .map(CatalogSession::from)
+            .collect(),
+        next_cursor: page.next_cursor.map(|cursor| CatalogCursor {
+            last_activity_ms: cursor.last_activity_ms,
+            source: cursor.source,
+            session_id: cursor.session_id,
+        }),
     })
 }
 
