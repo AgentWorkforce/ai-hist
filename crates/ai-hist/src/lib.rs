@@ -512,7 +512,11 @@ enum SessionsAction {
         /// Precise continuation: `last_activity_ms` of the previous page's last
         /// row. Omit (with --after-source/--after-session-id given) to continue
         /// through the rows whose recency is unknown.
-        #[arg(long)]
+        ///
+        /// Requires --after-source (which in turn requires --after-session-id):
+        /// a timestamp alone is not a cursor, and silently ignoring it would
+        /// restart the walk at page one instead of continuing it.
+        #[arg(long, requires = "after_source")]
         after_ms: Option<i64>,
         /// Emit `{"contract_version":N,"sessions":[...],"next_cursor":…}` as one
         /// JSON object.
@@ -1438,13 +1442,13 @@ fn run_session_discovery(
     // followed by an opaque exit code.
     let (summary, failure) = match outcome {
         Ok(summary) => (summary, None),
-        Err(error) => match error.downcast::<AllProvidersFailed>() {
-            Ok(failed) => {
-                let summary = failed.summary.clone();
-                (summary, Some(anyhow::Error::from(failed)))
-            }
-            Err(error) => return Err(error),
-        },
+        // `downcast`'s Err arm carries the original error untouched, so `?`
+        // propagates any other failure exactly as it arrived.
+        Err(error) => {
+            let failed = error.downcast::<AllProvidersFailed>()?;
+            let summary = failed.summary.clone();
+            (summary, Some(anyhow::Error::from(failed)))
+        }
     };
     for diagnostic in &summary.diagnostics {
         if as_json {

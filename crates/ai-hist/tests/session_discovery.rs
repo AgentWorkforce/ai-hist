@@ -233,6 +233,67 @@ fn list_paginates_with_the_cursor_it_hands_back() {
     );
 }
 
+/// A timestamp alone is not a cursor. Accepting one and ignoring it restarted
+/// the walk at page one while reporting success, so a paginating client would
+/// loop over the first page forever.
+#[test]
+fn an_incomplete_pagination_cursor_is_rejected_rather_than_ignored() {
+    let temp = fake_home();
+    let db_path = temp.path().join("history.db");
+    assert!(isolated(&temp, &db_path, &["sessions", "discover"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    for incomplete in [
+        vec!["--after-ms=1782039603000"],
+        vec!["--after-source", "codex"],
+        vec!["--after-session-id", "codex-cli"],
+        vec![
+            "--after-ms=1782039603000",
+            "--after-session-id",
+            "codex-cli",
+        ],
+    ] {
+        let mut args = vec!["sessions", "list", "--json"];
+        args.extend(incomplete.iter().copied());
+        let output = isolated(&temp, &db_path, &args).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "an incomplete cursor must be rejected: {args:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("required") || stderr.contains("requires"),
+            "clap must name the missing flag for {args:?}: {stderr}"
+        );
+    }
+
+    // The complete triple is still accepted.
+    let output = isolated(
+        &temp,
+        &db_path,
+        &[
+            "sessions",
+            "list",
+            "--json",
+            "--after-ms=1782039603000",
+            "--after-source",
+            "codex",
+            "--after-session-id",
+            "codex-cli",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn a_negative_limit_is_rejected_rather_than_dumping_the_catalog() {
     let temp = fake_home();
