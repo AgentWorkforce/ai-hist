@@ -320,6 +320,103 @@ fn an_incomplete_trailing_record_is_ignored_but_the_session_still_appears() {
     );
 }
 
+/// A subagent sidecar is its own file whose records carry the *parent's*
+/// sessionId. Enumerating it as a session emitted the parent twice and let the
+/// two files fight over one row's raw_path/source_stamp, so one of them was
+/// re-read on every run forever.
+#[test]
+fn a_subagent_sidecar_is_not_a_second_copy_of_its_parent_session() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+    claude_session(
+        home.path(),
+        "agent-sub",
+        concat!(
+            r#"{"type":"user","uuid":"su1","sessionId":"claude-1","isSidechain":true,"cwd":"/work/app","timestamp":"2026-06-20T10:02:00.000Z","message":{"role":"user","content":"Research the repo."}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"sa1","sessionId":"claude-1","isSidechain":true,"cwd":"/work/app","timestamp":"2026-06-20T10:03:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Report."}]}}"#,
+            "\n"
+        ),
+        1_750_000_050_000,
+    );
+
+    let first = discover(&conn, home.path(), &only(&["claude"]));
+    assert_eq!(
+        first.ids(),
+        vec!["claude:claude-1"],
+        "the parent session must be emitted exactly once per run"
+    );
+    assert_eq!(first.summary.providers["claude"].candidates, 2);
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+    // The row points at the session's own transcript, not at the sidecar.
+    let raw_path: String = conn
+        .query_row(
+            "SELECT raw_path FROM sessions WHERE session_id = 'claude-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(raw_path.ends_with("claude-1.jsonl"), "{raw_path}");
+
+    let second = discover(&conn, home.path(), &only(&["claude"]));
+    assert_eq!(second.ids(), vec!["claude:claude-1"]);
+    assert_eq!(
+        second.summary.counters.shallow_reads, 0,
+        "neither the transcript nor its sidecar may be re-read when nothing changed"
+    );
+    assert_eq!(second.summary.skipped_unchanged, 2);
+    assert_eq!(
+        second.rows[0].source_stamp, first.rows[0].source_stamp,
+        "the stamp must be stable across rescans"
+    );
+}
+
+/// The same defect class as the claude sidecar: a codex subagent thread is a
+/// real rollout that is not a session, so "no catalog row" left nothing for the
+/// stamp check to match and it was re-read on every run.
+#[test]
+fn a_non_session_source_is_remembered_so_rescans_do_not_reread_it() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    codex_rollout(home.path(), "codex-1", CODEX_BODY, 1_750_000_200_000);
+    codex_rollout(
+        home.path(),
+        "codex-sub",
+        concat!(
+            r#"{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{"id":"codex-sub","cwd":"/work/api","thread_source":"subagent"}}"#,
+            "\n"
+        ),
+        1_750_000_300_000,
+    );
+
+    let first = discover(&conn, home.path(), &only(&["codex"]));
+    assert_eq!(first.summary.counters.shallow_reads, 2);
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert_eq!(
+        second.summary.counters.shallow_reads, 0,
+        "a source already known not to be a session must not be re-read"
+    );
+    assert_eq!(second.ids(), vec!["codex:codex-1"]);
+
+    // A file that later does become a session drops its marker.
+    codex_rollout(
+        home.path(),
+        "codex-sub",
+        &CODEX_BODY.replace("codex-1", "codex-sub"),
+        1_750_000_400_000,
+    );
+    let third = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(third.ids().contains(&"codex:codex-sub".to_string()));
+    let markers: i64 = conn
+        .query_row("SELECT COUNT(*) FROM discovery_skips", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(markers, 0, "a stale non-session marker must be cleared");
+}
+
 #[test]
 fn a_malformed_transcript_does_not_hide_its_healthy_neighbours() {
     let conn = catalog();
@@ -335,11 +432,54 @@ fn a_malformed_transcript_does_not_hide_its_healthy_neighbours() {
 
     let found = discover(&conn, home.path(), &only(&["claude"]));
     let ids = found.ids();
-    assert!(ids.contains(&"claude:claude-1".to_string()), "{ids:?}");
-    // The unparseable file still has a stable identity from its file name, but
-    // it must never take the healthy session's row with it.
+    assert_eq!(
+        ids,
+        vec!["claude:claude-1"],
+        "a corrupt file must not be published as a session under its file name"
+    );
     assert_eq!(found.summary.providers["claude"].candidates, 2);
-    assert!(found.summary.discovered >= 1);
+    assert_eq!(found.summary.discovered, 1);
+    // The corruption is named rather than silently absorbed.
+    let diagnostic = found
+        .summary
+        .diagnostics
+        .iter()
+        .find(|entry| entry.source == "claude")
+        .expect("a diagnostic for the corrupt transcript");
+    assert!(
+        diagnostic
+            .locator
+            .as_deref()
+            .is_some_and(|locator| locator.ends_with("broken.jsonl")),
+        "the diagnostic must name the broken file: {diagnostic:?}"
+    );
+    assert!(
+        diagnostic.error.contains("no parseable JSON records"),
+        "{diagnostic:?}"
+    );
+    // A row exists for neither the corrupt file's stem nor anything else.
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+/// An empty transcript is a session that has only just started, not a corrupt
+/// one: nothing to catalog yet, and no diagnostic noise every run.
+#[test]
+fn an_empty_transcript_is_not_a_session_and_not_an_error() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+    claude_session(home.path(), "starting", "", 1_750_000_100_000);
+
+    let found = discover(&conn, home.path(), &only(&["claude"]));
+    assert_eq!(found.ids(), vec!["claude:claude-1"]);
+    assert!(
+        found.summary.diagnostics.is_empty(),
+        "{:?}",
+        found.summary.diagnostics
+    );
 }
 
 #[test]
@@ -585,6 +725,39 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     let second = discover(&conn, home.path(), &only(&["opencode"]));
     assert_eq!(second.summary.skipped_unchanged, 1);
     assert_eq!(second.summary.counters.shallow_reads, 0);
+}
+
+/// A single opencode part can hold a whole pasted file. The excerpt is cut in
+/// SQL so only the capped prefix ever crosses into Rust.
+#[test]
+fn a_huge_opencode_part_is_truncated_before_it_reaches_rust() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let huge = "x".repeat(EXCERPT_MAX_CHARS * 8);
+    opencode_db(
+        home.path(),
+        &format!(
+            r#"INSERT INTO session VALUES ('oc-big', '/work/oc', 1750000600000, 1750000700000);
+               INSERT INTO message VALUES ('m1', 'oc-big', 1750000600000, '{{"role":"user"}}');
+               INSERT INTO part VALUES ('p1', 'm1', 'oc-big', 1750000600000, json_object('type', 'text', 'text', '{huge}'));"#
+        ),
+    );
+
+    let found = discover(&conn, home.path(), &only(&["opencode"]));
+    let prompt = found.row("oc-big").first_prompt.clone().expect("a prompt");
+    assert_eq!(
+        prompt.chars().count(),
+        EXCERPT_MAX_CHARS,
+        "the excerpt must be capped at the documented bound"
+    );
+    let stored: String = conn
+        .query_row(
+            "SELECT first_prompt FROM sessions WHERE session_id = 'oc-big'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored.chars().count(), EXCERPT_MAX_CHARS);
 }
 
 // ---------------------------------------------------------------------------
@@ -895,7 +1068,7 @@ fn the_cache_only_listing_survives_the_provider_files_disappearing() {
 
 #[test]
 fn the_catalog_query_reads_only_the_sessions_table() {
-    let sql = catalog_list_sql(&CatalogListOptions::default());
+    let (sql, _) = catalog_list_query(&CatalogListOptions::default());
     assert!(sql.contains("FROM sessions"), "{sql}");
     for forbidden in ["history", "session_events", "tool_calls", "file_edits"] {
         assert!(
@@ -977,12 +1150,182 @@ fn the_catalog_listing_filters_by_source_and_paginates_by_recency() {
     assert_eq!(next[0].session_id, "x1");
 }
 
+fn seed_row(conn: &Connection, source: &str, session_id: &str, last: Option<i64>) {
+    conn.execute(
+        "INSERT INTO sessions (session_id, source, last_activity_ms, discovery_state) \
+         VALUES (?, ?, ?, 'shallow')",
+        params![session_id, source, last],
+    )
+    .unwrap();
+}
+
+/// Walk the whole catalog one page at a time and assert the walk is a
+/// partition: every row exactly once, in the catalog's total order.
+fn walk_pages(conn: &Connection, page_size: i64) -> Vec<(String, String)> {
+    let mut seen = Vec::new();
+    let mut after = None;
+    loop {
+        let page = list_session_catalog_page(
+            conn,
+            &CatalogListOptions {
+                limit: Some(page_size),
+                after: after.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        seen.extend(
+            page.sessions
+                .iter()
+                .map(|row| (row.source.clone(), row.session_id.clone())),
+        );
+        match page.next_cursor {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+        assert!(seen.len() < 500, "pagination did not terminate");
+    }
+    seen
+}
+
+/// Recency alone is not a key: one discovery pass stamps many sessions with the
+/// same mtime-derived millisecond, and a timestamp-only cursor drops every row
+/// tied with the page boundary.
+#[test]
+fn pagination_walks_tied_timestamps_without_skipping_or_repeating_rows() {
+    let conn = catalog();
+    // Twelve sessions across three timestamps: every page boundary lands in
+    // the middle of a tie group.
+    for (source, index) in [("claude", 0), ("codex", 1), ("cursor", 2), ("grok", 3)] {
+        for (tie, last) in [(0, 300_i64), (1, 200), (2, 100)] {
+            seed_row(
+                &conn,
+                source,
+                &format!("{source}-{tie}-{index}"),
+                Some(last),
+            );
+        }
+    }
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(total, 12);
+
+    let all = walk_pages(&conn, 5);
+    assert_eq!(all.len(), 12, "every row must appear exactly once: {all:?}");
+    let unique: BTreeSet<_> = all.iter().cloned().collect();
+    assert_eq!(unique.len(), 12, "no row may repeat across pages: {all:?}");
+
+    // The paged walk must equal one unpaginated read of the whole catalog.
+    let straight: Vec<(String, String)> = list_session_catalog(
+        &conn,
+        &CatalogListOptions {
+            limit: Some(100),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .iter()
+    .map(|row| (row.source.clone(), row.session_id.clone()))
+    .collect();
+    assert_eq!(all, straight, "paging must not reorder the catalog");
+}
+
+/// Sessions whose recency is unknown sort after every dated row. A cursor that
+/// only carries a timestamp can never reach them, so the whole undated tail
+/// would be invisible to a paginating client.
+#[test]
+fn pagination_reaches_the_undated_tail() {
+    let conn = catalog();
+    seed_row(&conn, "claude", "dated-a", Some(300));
+    seed_row(&conn, "claude", "dated-b", Some(300));
+    seed_row(&conn, "cursor", "undated-a", None);
+    seed_row(&conn, "cursor", "undated-b", None);
+    seed_row(&conn, "grok", "undated-c", None);
+
+    let all = walk_pages(&conn, 2);
+    assert_eq!(
+        all,
+        vec![
+            ("claude".to_string(), "dated-a".to_string()),
+            ("claude".to_string(), "dated-b".to_string()),
+            ("cursor".to_string(), "undated-a".to_string()),
+            ("cursor".to_string(), "undated-b".to_string()),
+            ("grok".to_string(), "undated-c".to_string()),
+        ],
+        "undated rows sort last but must still be reachable"
+    );
+
+    // Stepping straight from a dated cursor into the undated tail works too.
+    let page = list_session_catalog_page(
+        &conn,
+        &CatalogListOptions {
+            limit: Some(10),
+            after: Some(CatalogCursor {
+                last_activity_ms: Some(300),
+                source: "claude".into(),
+                session_id: "dated-b".into(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(page.sessions.len(), 3);
+    assert!(page
+        .sessions
+        .iter()
+        .all(|row| row.last_activity_ms.is_none()));
+    assert!(
+        page.next_cursor.is_none(),
+        "a short page ends the walk rather than looping"
+    );
+}
+
+#[test]
+fn a_full_page_carries_a_cursor_and_a_short_one_does_not() {
+    let conn = catalog();
+    for index in 0..3 {
+        seed_row(&conn, "claude", &format!("c{index}"), Some(100 - index));
+    }
+    let full = list_session_catalog_page(
+        &conn,
+        &CatalogListOptions {
+            limit: Some(3),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(full.sessions.len(), 3);
+    assert_eq!(
+        full.next_cursor,
+        Some(CatalogCursor {
+            last_activity_ms: Some(98),
+            source: "claude".into(),
+            session_id: "c2".into(),
+        }),
+        "a page that fills its limit hands back its last row as the cursor"
+    );
+    let short = list_session_catalog_page(
+        &conn,
+        &CatalogListOptions {
+            limit: Some(10),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(short.sessions.len(), 3);
+    assert_eq!(short.next_cursor, None);
+}
+
 #[test]
 fn the_catalog_listing_is_served_by_an_index_not_a_table_scan() {
     let conn = catalog();
-    let plan = |options: &CatalogListOptions, args: Vec<Box<dyn rusqlite::ToSql>>| -> String {
-        let sql = format!("EXPLAIN QUERY PLAN {}", catalog_list_sql(options));
-        let mut stmt = conn.prepare(&sql).unwrap();
+    // The plan is taken from the *same* builder the listing runs, so this
+    // cannot pass against a restated copy of the query while the real one
+    // drifts into a table scan.
+    let plan = |options: &CatalogListOptions| -> String {
+        let (sql, args) = catalog_list_query(options);
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
         let params = rusqlite::params_from_iter(args.iter().map(|arg| arg.as_ref()));
         stmt.query_map(params, |row| row.get::<_, String>(3))
             .unwrap()
@@ -991,31 +1334,41 @@ fn the_catalog_listing_is_served_by_an_index_not_a_table_scan() {
             .join(" | ")
     };
 
-    let unfiltered = plan(&CatalogListOptions::default(), vec![Box::new(10_i64)]);
+    let unfiltered = plan(&CatalogListOptions::default());
     assert!(
-        unfiltered.contains("idx_sessions_last"),
-        "the recency ordering must be served by idx_sessions_last: {unfiltered}"
+        unfiltered.contains("idx_sessions_recency"),
+        "the catalog's total order must be served by idx_sessions_recency: {unfiltered}"
     );
     assert!(
         !unfiltered.contains("TEMP B-TREE"),
         "the listing must not sort the table: {unfiltered}"
     );
 
-    let filtered = plan(
-        &CatalogListOptions {
-            sources: vec!["claude".into()],
-            limit: Some(10),
-            before_ms: Some(1),
-        },
-        vec![
-            Box::new("claude".to_string()),
-            Box::new(1_i64),
-            Box::new(10_i64),
-        ],
-    );
+    // The paginated form is the one that runs on every page after the first;
+    // it must stay indexed too, composite cursor predicate and all.
+    let paginated = plan(&CatalogListOptions {
+        limit: Some(10),
+        after: Some(CatalogCursor {
+            last_activity_ms: Some(500),
+            source: "claude".into(),
+            session_id: "c1".into(),
+        }),
+        ..Default::default()
+    });
     assert!(
-        filtered.contains("SEARCH") && filtered.contains("idx_sessions_source_last"),
-        "a source-filtered listing must search idx_sessions_source_last: {filtered}"
+        paginated.contains("idx_sessions_recency") && !paginated.contains("TEMP B-TREE"),
+        "a paginated listing must stay index-ordered: {paginated}"
+    );
+
+    let filtered = plan(&CatalogListOptions {
+        sources: vec!["claude".into()],
+        limit: Some(10),
+        before_ms: Some(1),
+        after: None,
+    });
+    assert!(
+        filtered.contains("idx_sessions_source_recency") && !filtered.contains("TEMP B-TREE"),
+        "a source-filtered listing must be served by idx_sessions_source_recency: {filtered}"
     );
 }
 
@@ -1065,6 +1418,106 @@ fn a_shallow_rescan_never_downgrades_a_fully_indexed_row() {
         "the stamp records which scanner wrote it: {:?}",
         row.source_stamp
     );
+}
+
+/// A row written before `discovery_state` existed carries NULL, which readers
+/// deliberately interpret as fully indexed. The upsert has to agree, or the
+/// first discovery run on an upgraded database quietly demotes every legacy
+/// session to `shallow`.
+#[test]
+fn a_legacy_row_with_no_discovery_state_is_not_demoted_to_shallow() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let path = claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+    // Exactly what a pre-catalog database holds: the original nine columns
+    // populated, every column this feature added still NULL.
+    conn.execute(
+        "INSERT INTO sessions \
+         (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, \
+          last_assistant_text, raw_path, parser_version) \
+         VALUES ('claude-1', 'claude', '/work/app', 'main', 1, 2, 'legacy tail', ?, 1)",
+        [path.to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    let before: Option<String> = conn
+        .query_row(
+            "SELECT discovery_state FROM sessions WHERE session_id = 'claude-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(before, None, "the fixture must start as a legacy row");
+
+    let found = discover(&conn, home.path(), &only(&["claude"]));
+    let row = found.row("claude-1");
+    assert_eq!(
+        row.discovery_state, "full",
+        "a NULL discovery_state means fully indexed and must survive a shallow rescan"
+    );
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT discovery_state FROM sessions WHERE session_id = 'claude-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored.as_deref(), Some("full"));
+    assert_eq!(
+        row.last_assistant_text.as_deref(),
+        Some("legacy tail"),
+        "the legacy row's own evidence must survive too"
+    );
+    assert_eq!(row.first_prompt.as_deref(), Some("the real first prompt"));
+}
+
+/// The limit counts emitted sessions. Truncating candidates up front let a
+/// codex subagent thread -- which is not a session -- eat a result slot.
+#[test]
+fn non_session_candidates_do_not_consume_limit_slots() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    // The two newest candidates are subagent threads; the real sessions are
+    // older, so a candidate-truncating limit returned one session for a limit
+    // of two.
+    for (index, id) in ["sub-a", "sub-b"].iter().enumerate() {
+        codex_rollout(
+            home.path(),
+            id,
+            &format!(
+                concat!(
+                    r#"{{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{{"id":"{}","cwd":"/work/api","thread_source":"subagent"}}}}"#,
+                    "\n"
+                ),
+                id
+            ),
+            1_750_000_900_000 + index as i64,
+        );
+    }
+    for (index, id) in ["real-a", "real-b", "real-c"].iter().enumerate() {
+        codex_rollout(
+            home.path(),
+            id,
+            &CODEX_BODY.replace("codex-1", id),
+            1_750_000_800_000 + index as i64,
+        );
+    }
+
+    let found = discover(
+        &conn,
+        home.path(),
+        &DiscoverOptions {
+            sources: vec!["codex".into()],
+            limit: Some(2),
+        },
+    );
+    assert_eq!(
+        found.ids(),
+        vec!["codex:real-c".to_string(), "codex:real-b".to_string()],
+        "a limit of 2 must yield 2 real sessions, newest first"
+    );
+    assert_eq!(found.summary.discovered, 2);
+    // The two subagent threads were read (and remembered) but did not count.
+    assert_eq!(found.summary.counters.shallow_reads, 4);
 }
 
 #[test]

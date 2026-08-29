@@ -506,7 +506,26 @@ impl ShallowSessionProvider for ClaudeProvider {
         };
         let mut models = Vec::new();
         let mut session_id = None;
+        // A subagent sidecar transcript is its own file whose records carry the
+        // *parent's* sessionId (see `ingest_claude_transcript`). Enumerating it
+        // as a session would emit the parent twice per run and let the two
+        // files fight over one row's raw_path/source_stamp, so the stamp never
+        // matched again and one of them was re-read forever.
+        let mut identified_records = 0usize;
+        let mut sidechain_records = 0usize;
+        let mut parsed_records = 0usize;
         for value in json_lines(&bounded.head) {
+            parsed_records += 1;
+            if value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+            {
+                identified_records += 1;
+                if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+                    sidechain_records += 1;
+                }
+            }
             if session_id.is_none() {
                 session_id = value
                     .get("sessionId")
@@ -542,6 +561,26 @@ impl ShallowSessionProvider for ClaudeProvider {
             if let Some(branch) = value.get("gitBranch").and_then(Value::as_str) {
                 session.git_branch = Some(branch.to_string());
             }
+        }
+        // Every identified record in the head belongs to a sidechain: this is a
+        // sidecar for a session whose own transcript is enumerated separately.
+        // A session's primary transcript always opens with non-sidechain turns,
+        // because a subagent can only be spawned by one.
+        if identified_records > 0 && sidechain_records == identified_records {
+            return Ok(None);
+        }
+        // A file with complete records that parse as nothing is corrupt, not a
+        // session. Publishing it under its file stem would put a fabricated
+        // row in the catalog and hide the corruption; a diagnostic names it.
+        // A file with no complete records at all is merely empty (a session
+        // that has just started) and is simply not a session yet.
+        if parsed_records == 0 {
+            anyhow::ensure!(
+                bounded.head.is_empty(),
+                "no parseable JSON records in the first {} record(s)",
+                bounded.head.len()
+            );
+            return Ok(None);
         }
         let Some(session_id) = session_id.or_else(|| {
             path.file_stem()
@@ -1039,24 +1078,24 @@ impl ShallowSessionProvider for OpencodeProvider {
         let Some((directory, created, updated)) = row else {
             return Ok(None);
         };
+        // The excerpt is cut in SQL, not in Rust: a single opencode part can
+        // hold a whole pasted file, and materializing it just to take the
+        // first 4096 characters would break the bounded-read promise for a
+        // catalog entry.
         let first_prompt = conn
             .query_row(
-                "SELECT p.data FROM part p JOIN message m ON m.id = p.message_id \
+                "SELECT substr(json_extract(p.data, '$.text'), 1, ?) \
+                 FROM part p JOIN message m ON m.id = p.message_id \
                  WHERE p.session_id = ? AND json_extract(m.data, '$.role') = 'user' \
                  AND json_extract(p.data, '$.type') = 'text' \
                  ORDER BY COALESCE(p.time_created, m.time_created) ASC LIMIT 1",
-                [&candidate.locator],
-                |row| row.get::<_, String>(0),
+                params![EXCERPT_MAX_CHARS as i64, &candidate.locator],
+                |row| row.get::<_, Option<String>>(0),
             )
             .ok()
-            .and_then(|data| serde_json::from_str::<Value>(&data).ok())
-            .and_then(|value| {
-                value
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(excerpt)
-                    .filter(|text| !text.is_empty())
-            });
+            .flatten()
+            .map(|text| excerpt(&text))
+            .filter(|text| !text.is_empty());
         let mut models = Vec::new();
         if let Ok(model) = conn.query_row(
             "SELECT json_extract(data, '$.modelID') FROM message \
@@ -1221,6 +1260,24 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShallowSession> {
     })
 }
 
+/// A precise continuation point in the catalog's total order.
+///
+/// The catalog is ordered `(last_activity_ms DESC, source ASC, session_id ASC)`.
+/// Recency alone is not a key: a single discovery pass can stamp dozens of
+/// sessions with the same mtime-derived millisecond, and a cursor that carries
+/// only a timestamp silently drops every row tied with the page boundary. The
+/// identity columns make the cursor total.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogCursor {
+    /// Last activity of the final row on the previous page; `None` for a row
+    /// whose recency is unknown (those sort last, after every dated row).
+    pub last_activity_ms: Option<i64>,
+    /// Source of the final row on the previous page.
+    pub source: String,
+    /// Session id of the final row on the previous page.
+    pub session_id: String,
+}
+
 /// Options for the cache-only catalog listing.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogListOptions {
@@ -1228,20 +1285,30 @@ pub struct CatalogListOptions {
     pub sources: Vec<String>,
     /// Row cap; defaults to [`DEFAULT_CATALOG_LIMIT`].
     pub limit: Option<i64>,
-    /// Keyset pagination cursor: only rows strictly older than this.
+    /// Coarse cutoff: only sessions strictly older than this millisecond.
+    /// Convenient for "show me anything before last Tuesday", but it cannot
+    /// separate rows that share a millisecond — use [`CatalogListOptions::after`]
+    /// to walk pages. Ignored when `after` is set.
     pub before_ms: Option<i64>,
+    /// Precise continuation from the previous page's `next_cursor`.
+    pub after: Option<CatalogCursor>,
 }
 
-/// List the session catalog straight out of the database.
+/// One page of the catalog plus the cursor that continues it.
+#[derive(Debug, Clone, Default)]
+pub struct SessionCatalogPage {
+    /// The rows, newest first.
+    pub sessions: Vec<ShallowSession>,
+    /// Pass as [`CatalogListOptions::after`] for the next page. `None` when
+    /// this page did not fill its limit, i.e. the catalog is exhausted.
+    pub next_cursor: Option<CatalogCursor>,
+}
+
+/// The catalog listing query and its bound arguments.
 ///
-/// Pure SQL over `sessions`: no filesystem access, no provider I/O, and no
-/// scan of `history` / `session_events` / `tool_calls`. `trajectory` rows are
-/// excluded defensively — trajectories are derived records, not sessions, and
-/// must never appear in a session list even if something wrote one.
-pub fn list_session_catalog(
-    conn: &Connection,
-    options: &CatalogListOptions,
-) -> Result<Vec<ShallowSession>> {
+/// Built in one place so the query-plan test asserts the plan of the statement
+/// that actually runs.
+fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     let mut sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE source <> 'trajectory'");
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if !options.sources.is_empty() {
@@ -1251,12 +1318,59 @@ pub fn list_session_catalog(
             args.push(Box::new(source.clone()));
         }
     }
-    if let Some(before_ms) = options.before_ms {
-        sql.push_str(" AND last_activity_ms < ?");
-        args.push(Box::new(before_ms));
+    match options.after.as_ref() {
+        // Everything strictly after the cursor in the catalog's total order.
+        // Undated rows sort last, so a dated cursor must still reach them.
+        Some(cursor) => match cursor.last_activity_ms {
+            Some(ms) => {
+                sql.push_str(
+                    " AND (last_activity_ms IS NULL OR last_activity_ms < ? \
+                       OR (last_activity_ms = ? \
+                           AND (source > ? OR (source = ? AND session_id > ?))))",
+                );
+                args.push(Box::new(ms));
+                args.push(Box::new(ms));
+                args.push(Box::new(cursor.source.clone()));
+                args.push(Box::new(cursor.source.clone()));
+                args.push(Box::new(cursor.session_id.clone()));
+            }
+            None => {
+                sql.push_str(
+                    " AND last_activity_ms IS NULL \
+                       AND (source > ? OR (source = ? AND session_id > ?))",
+                );
+                args.push(Box::new(cursor.source.clone()));
+                args.push(Box::new(cursor.source.clone()));
+                args.push(Box::new(cursor.session_id.clone()));
+            }
+        },
+        None => {
+            if let Some(before_ms) = options.before_ms {
+                sql.push_str(" AND last_activity_ms < ?");
+                args.push(Box::new(before_ms));
+            }
+        }
     }
-    sql.push_str(" ORDER BY last_activity_ms DESC LIMIT ?");
+    sql.push_str(" ORDER BY last_activity_ms DESC, source ASC, session_id ASC LIMIT ?");
     args.push(Box::new(options.limit.unwrap_or(DEFAULT_CATALOG_LIMIT)));
+    (sql, args)
+}
+
+/// List the session catalog straight out of the database.
+///
+/// Pure SQL over `sessions`: no filesystem access, no provider I/O, and no
+/// scan of `history` / `session_events` / `tool_calls`. `trajectory` rows are
+/// excluded defensively — trajectories are derived records, not sessions, and
+/// must never appear in a session list even if something wrote one.
+///
+/// Rows come back in the catalog's total order:
+/// `(last_activity_ms DESC, source ASC, session_id ASC)`, with rows of unknown
+/// recency last. Use [`list_session_catalog_page`] to paginate.
+pub fn list_session_catalog(
+    conn: &Connection,
+    options: &CatalogListOptions,
+) -> Result<Vec<ShallowSession>> {
+    let (sql, args) = catalog_list_query(options);
     let mut stmt = conn.prepare(&sql)?;
     let params = rusqlite::params_from_iter(args.iter().map(|arg| arg.as_ref()));
     let rows = stmt
@@ -1265,19 +1379,30 @@ pub fn list_session_catalog(
     Ok(rows)
 }
 
-/// The SQL `list_session_catalog` would run, for query-plan assertions.
-#[cfg(test)]
-fn catalog_list_sql(options: &CatalogListOptions) -> String {
-    let mut sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE source <> 'trajectory'");
-    if !options.sources.is_empty() {
-        let placeholders = vec!["?"; options.sources.len()].join(", ");
-        sql.push_str(&format!(" AND source IN ({placeholders})"));
-    }
-    if options.before_ms.is_some() {
-        sql.push_str(" AND last_activity_ms < ?");
-    }
-    sql.push_str(" ORDER BY last_activity_ms DESC LIMIT ?");
-    sql
+/// [`list_session_catalog`] plus the cursor that continues it.
+///
+/// The cursor is `None` once a page comes back short of its limit, so a
+/// caller walks the catalog by following `next_cursor` until it is absent —
+/// no duplicated and no skipped rows, even when a whole page shares one
+/// millisecond.
+pub fn list_session_catalog_page(
+    conn: &Connection,
+    options: &CatalogListOptions,
+) -> Result<SessionCatalogPage> {
+    let sessions = list_session_catalog(conn, options)?;
+    let limit = options.limit.unwrap_or(DEFAULT_CATALOG_LIMIT);
+    let next_cursor = (limit > 0 && sessions.len() as i64 >= limit)
+        .then(|| sessions.last())
+        .flatten()
+        .map(|row| CatalogCursor {
+            last_activity_ms: row.last_activity_ms,
+            source: row.source.clone(),
+            session_id: row.session_id.clone(),
+        });
+    Ok(SessionCatalogPage {
+        sessions,
+        next_cursor,
+    })
 }
 
 fn fetch_catalog_row(
@@ -1303,12 +1428,64 @@ fn fetch_catalog_row_by_path(
         .ok())
 }
 
+/// Whether this source was already examined at this exact stamp and found not
+/// to be a session.
+///
+/// Without this, every codex subagent thread and every claude sidecar — real
+/// files that legitimately produce no catalog row — was re-read on every
+/// single run, because "no row" left nothing for the stamp check to match.
+fn is_known_non_session(
+    conn: &Connection,
+    source: &str,
+    locator: &str,
+    stamp: &str,
+) -> Result<bool> {
+    let known: Option<String> = conn
+        .query_row(
+            "SELECT stamp FROM discovery_skips WHERE source = ? AND locator = ?",
+            params![source, locator],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(known.as_deref() == Some(stamp))
+}
+
+/// Remember that this source, at this stamp, is not a session.
+fn record_non_session(conn: &Connection, source: &str, locator: &str, stamp: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO discovery_skips (source, locator, stamp, reason, updated_ms) \
+         VALUES (?, ?, ?, 'not-a-session', ?) \
+         ON CONFLICT(source, locator) DO UPDATE SET \
+         stamp = excluded.stamp, reason = excluded.reason, updated_ms = excluded.updated_ms",
+        params![source, locator, stamp, now_ms()],
+    )?;
+    Ok(())
+}
+
+/// Drop a stale non-session marker once a source does resolve to a session.
+fn clear_non_session(conn: &Connection, source: &str, locator: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM discovery_skips WHERE source = ? AND locator = ?",
+        params![source, locator],
+    )?;
+    Ok(())
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
+}
+
 /// Write a shallow row into the catalog.
 ///
 /// Never nulls out a value the catalog already holds, never lowers
 /// `first_activity_ms` past what a fuller pass observed, and never downgrades
-/// a `discovery_state = 'full'` row to `'shallow'` — a shallow rescan of a
-/// fully indexed session still refreshes its metadata and stamp.
+/// a fully indexed row to `'shallow'` — including a row from a database that
+/// predates `discovery_state`, whose NULL readers deliberately interpret as
+/// `'full'`. A shallow rescan of such a row still refreshes its metadata and
+/// stamp.
 pub fn upsert_shallow_session(conn: &Connection, session: &ShallowSession) -> Result<()> {
     conn.execute(
         "INSERT INTO sessions \
@@ -1338,7 +1515,9 @@ pub fn upsert_shallow_session(conn: &Connection, session: &ShallowSession) -> Re
          initial_commit = COALESCE(excluded.initial_commit, sessions.initial_commit), \
          workspace_roots_json = COALESCE(excluded.workspace_roots_json, sessions.workspace_roots_json), \
          source_stamp = COALESCE(excluded.source_stamp, sessions.source_stamp), \
-         discovery_state = CASE WHEN sessions.discovery_state = 'full' THEN 'full' ELSE 'shallow' END",
+         discovery_state = CASE \
+             WHEN sessions.discovery_state IS NULL OR sessions.discovery_state = 'full' \
+             THEN 'full' ELSE 'shallow' END",
         params![
             session.session_id,
             session.source,
@@ -1417,6 +1596,32 @@ pub struct DiscoverySummary {
     /// Work actually performed.
     pub counters: DiscoveryCounters,
 }
+
+/// Every selected provider failed to enumerate, so the run made no progress.
+///
+/// Carries the run's summary — diagnostics included — so a caller can report
+/// what each provider said before propagating the failure.
+#[derive(Debug)]
+pub struct AllProvidersFailed {
+    /// The run as far as it got, including one diagnostic per failed provider.
+    pub summary: DiscoverySummary,
+}
+
+impl std::fmt::Display for AllProvidersFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "all {} session provider(s) failed; no provider made progress",
+            self.summary
+                .providers
+                .values()
+                .filter(|provider| provider.failed)
+                .count()
+        )
+    }
+}
+
+impl std::error::Error for AllProvidersFailed {}
 
 fn stored_stamp(raw: &str) -> String {
     format!("v{SHALLOW_SCANNER_VERSION}:{raw}")
@@ -1507,9 +1712,12 @@ pub fn discover_sessions_with_env(
         }
     }
     if !providers.is_empty() && failed_providers == providers.len() {
-        anyhow::bail!(
-            "all {failed_providers} session provider(s) failed; no provider made progress"
-        );
+        // Still a failure, but the diagnostics explaining *why* each provider
+        // failed are the useful part. Carrying the summary inside the error
+        // lets a JSONL consumer receive the diagnostic lines and a summary
+        // trailer before the non-zero exit, instead of a bare message.
+        summary.counters = env.counters();
+        return Err(AllProvidersFailed { summary }.into());
     }
 
     // Global recency ordering. Candidates with no recency signal sort last;
@@ -1520,16 +1728,25 @@ pub fn discover_sessions_with_env(
             .then_with(|| a.source.cmp(b.source))
             .then_with(|| a.locator.cmp(&b.locator))
     });
-    if let Some(limit) = options.limit {
-        candidates.truncate(limit);
-    }
-
     let by_source: BTreeMap<&str, &dyn ShallowSessionProvider> = providers
         .iter()
         .map(|provider| (provider.source(), provider.as_ref()))
         .collect();
 
+    // The limit counts *emitted sessions*, not candidates. Truncating the
+    // candidate list up front let a codex subagent thread or a claude sidecar
+    // -- neither of which is a session -- eat a result slot, so `--limit 3`
+    // could hand back two sessions while older valid ones went unread.
+    let limit = options.limit.unwrap_or(usize::MAX);
+    let mut emitted = 0usize;
+    // One session can be reached through more than one file in a single run
+    // (a transcript plus its subagent sidecars). Emit it once.
+    let mut emitted_sessions: BTreeSet<(String, String)> = BTreeSet::new();
+
     for candidate in &candidates {
+        if emitted >= limit {
+            break;
+        }
         let Some(provider) = by_source.get(candidate.source) else {
             continue;
         };
@@ -1544,14 +1761,31 @@ pub fn discover_sessions_with_env(
             if let Some(entry) = summary.providers.get_mut(candidate.source) {
                 entry.skipped_unchanged += 1;
             }
-            on_row(&cached);
+            if emitted_sessions.insert((cached.source.clone(), cached.session_id.clone())) {
+                emitted += 1;
+                on_row(&cached);
+            }
+            continue;
+        }
+        // A source already examined and found not to be a session (a codex
+        // subagent thread, a claude sidecar) is remembered by its stamp, so a
+        // rescan costs a PK lookup instead of a fresh read every single run.
+        if is_known_non_session(conn, candidate.source, &candidate.locator, &expected)? {
+            env.note_skipped();
+            summary.skipped_unchanged += 1;
+            if let Some(entry) = summary.providers.get_mut(candidate.source) {
+                entry.skipped_unchanged += 1;
+            }
             continue;
         }
         env.note_shallow_read();
         let read = provider.read_shallow(env, candidate);
         let session = match read {
             Ok(Some(session)) => session,
-            Ok(None) => continue,
+            Ok(None) => {
+                record_non_session(conn, candidate.source, &candidate.locator, &expected)?;
+                continue;
+            }
             Err(error) => {
                 summary.diagnostics.push(DiscoveryDiagnostic {
                     source: candidate.source.to_string(),
@@ -1580,9 +1814,12 @@ pub fn discover_sessions_with_env(
             });
             continue;
         }
+        // A file that used to be skipped as a non-session (or was never one)
+        // must not keep a stale marker once it resolves to a session.
+        clear_non_session(conn, candidate.source, &candidate.locator)?;
         // Emit the merged catalog row, so what a caller sees is exactly what
         // the catalog now holds (including a preserved `full` state).
-        let emitted = fetch_catalog_row(conn, &session.source, &session.session_id)?
+        let row = fetch_catalog_row(conn, &session.source, &session.session_id)?
             .map(|mut row| {
                 row.from_cache = false;
                 row
@@ -1592,7 +1829,10 @@ pub fn discover_sessions_with_env(
         if let Some(entry) = summary.providers.get_mut(candidate.source) {
             entry.discovered += 1;
         }
-        on_row(&emitted);
+        if emitted_sessions.insert((row.source.clone(), row.session_id.clone())) {
+            emitted += 1;
+            on_row(&row);
+        }
     }
 
     summary.counters = env.counters();
