@@ -371,13 +371,23 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
 
 /// Indexes the session catalog's fast paths depend on.
 ///
-/// The pre-existing guard checks tables and columns only. These two are listed
-/// because the catalog listing's whole promise is an indexed, sort-free read:
-/// a database that somehow has the columns but not the indexes would be served
-/// read-only with a full scan and a temp b-tree, silently. Missing means "not
-/// current", which routes the caller through the writable open that creates
-/// them.
-const REQUIRED_SESSIONS_INDEXES: &[&str] = &["idx_sessions_recency", "idx_sessions_source_recency"];
+/// The pre-existing guard checks tables and columns only. These are listed
+/// because each one carries a promise the catalog makes: the two recency
+/// indexes make a listing an indexed, sort-free read, and `idx_sessions_raw_path`
+/// makes discovery's "has this transcript changed?" lookup a search rather than
+/// a scan of every session on every candidate. A database that somehow has the
+/// columns but not an index would otherwise be served with silently degraded
+/// plans. Missing means "not current", which routes the caller through the
+/// writable open that recreates them.
+///
+/// The older `idx_sessions_cwd` / `idx_sessions_branch` / `idx_sessions_last` /
+/// `idx_sessions_source_last` are deliberately absent: nothing in the catalog
+/// path depends on them any more.
+const REQUIRED_SESSIONS_INDEXES: &[&str] = &[
+    "idx_sessions_recency",
+    "idx_sessions_source_recency",
+    "idx_sessions_raw_path",
+];
 
 /// Whether this database already has everything [`init_db`] would add.
 ///
@@ -1904,6 +1914,20 @@ mod tests {
         let db_path = dir.path().join("indexless.db");
         let conn = open_db(&db_path).unwrap();
         assert!(schema_is_current(&conn).unwrap());
+        // Named explicitly so dropping one from the guard is a deliberate act:
+        // the recency pair carries the listing's sort-free order, and
+        // idx_sessions_raw_path carries discovery's per-candidate "has this
+        // transcript changed?" lookup.
+        for needed in [
+            "idx_sessions_recency",
+            "idx_sessions_source_recency",
+            "idx_sessions_raw_path",
+        ] {
+            assert!(
+                REQUIRED_SESSIONS_INDEXES.contains(&needed),
+                "{needed} is load-bearing and must stay in the guard"
+            );
+        }
         for index in REQUIRED_SESSIONS_INDEXES {
             conn.execute_batch(&format!("DROP INDEX {index}")).unwrap();
             assert!(
