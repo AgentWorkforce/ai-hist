@@ -496,14 +496,31 @@ test('the catalog is empty in JSONL fallback mode', async () => {
 // discoverSessions
 // ---------------------------------------------------------------------------
 
-/** Minimal fake child process that scripts stdout/stderr/exit for one run. */
+/**
+ * Minimal fake child process that scripts stdout/stderr/exit for one run.
+ *
+ * `kill` is real rather than absent: an aborted run has to actually stop the
+ * child, and a fake without the method would swallow `child.kill?.()` as a
+ * no-op, so the abort tests would keep passing if the implementation quietly
+ * stopped killing it. Recorded in `kills`, and a killed child stops producing
+ * output the way a real one does.
+ */
 function fakeSpawn(script: { chunks?: string[]; stderr?: string; code?: number; errorCode?: string }) {
   const calls: Array<{ bin: string; args: string[] }> = [];
+  const kills: Array<NodeJS.Signals | number | undefined> = [];
   const spawnFn = ((bin: string, args: string[]) => {
     calls.push({ bin, args });
-    const child = new EventEmitter() as EventEmitter & { stdout: EventEmitter; stderr: EventEmitter };
+    const child = new EventEmitter() as EventEmitter & {
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+      kill: (signal?: NodeJS.Signals | number) => boolean;
+    };
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
+    child.kill = (signal?: NodeJS.Signals | number) => {
+      kills.push(signal);
+      return true;
+    };
     setImmediate(() => {
       if (script.errorCode) {
         const err = new Error('spawn failed') as NodeJS.ErrnoException;
@@ -511,13 +528,16 @@ function fakeSpawn(script: { chunks?: string[]; stderr?: string; code?: number; 
         child.emit('error', err);
         return;
       }
-      for (const chunk of script.chunks ?? []) child.stdout.emit('data', Buffer.from(chunk, 'utf8'));
+      for (const chunk of script.chunks ?? []) {
+        if (kills.length > 0) break; // Killed: no more output from this child.
+        child.stdout.emit('data', Buffer.from(chunk, 'utf8'));
+      }
       if (script.stderr) child.stderr.emit('data', script.stderr);
       child.emit('close', script.code ?? 0);
     });
     return child;
   }) as unknown as typeof import('node:child_process').spawn;
-  return { spawnFn, calls };
+  return { spawnFn, calls, kills };
 }
 
 const DISCOVER_SESSION_LINE = JSON.stringify({
@@ -572,7 +592,7 @@ test('discoverSessions parses the JSONL stream into sessions, diagnostics, and a
   // Split mid-line so the incremental line buffering is exercised.
   const stream = `${DISCOVER_SESSION_LINE}\n${DISCOVER_DIAGNOSTIC_LINE}\n${DISCOVER_SUMMARY_LINE}\n`;
   const split = Math.floor(DISCOVER_SESSION_LINE.length / 2);
-  const { spawnFn, calls } = fakeSpawn({ chunks: [stream.slice(0, split), stream.slice(split)] });
+  const { spawnFn, calls, kills } = fakeSpawn({ chunks: [stream.slice(0, split), stream.slice(split)] });
 
   const streamed: string[] = [];
   const result = await discoverSessions({
@@ -639,6 +659,8 @@ test('discoverSessions parses the JSONL stream into sessions, diagnostics, and a
     filesOpened: 1,
     bytesRead: 4096,
   });
+  // A run that completes is never killed — only an aborted one is.
+  assert.deepEqual(kills, []);
 });
 
 test('discoverSessions skips unparseable and unknown lines instead of failing', async () => {
@@ -740,8 +762,8 @@ test('discoverSessions rejects a summary from an unsupported contract version', 
 });
 
 test('an exception from onSession aborts the run instead of escaping the stream', async () => {
-  const { spawnFn } = fakeSpawn({
-    chunks: [`${DISCOVER_SESSION_LINE}\n${DISCOVER_SUMMARY_LINE}\n`],
+  const { spawnFn, kills } = fakeSpawn({
+    chunks: [`${DISCOVER_SESSION_LINE}\n`, `${DISCOVER_SUMMARY_LINE}\n`],
   });
   const boom = new Error('host render failed');
   await assert.rejects(
@@ -754,11 +776,14 @@ test('an exception from onSession aborts the run instead of escaping the stream'
     }),
     (err: unknown) => err === boom,
   );
+  // Rejecting is only half of it: the child has to be stopped, or an aborted
+  // run leaves a process reading the user's disk with nobody listening.
+  assert.equal(kills.length, 1);
 });
 
 test('an exception from onDiagnostic aborts the run too', async () => {
-  const { spawnFn } = fakeSpawn({
-    chunks: [`${DISCOVER_DIAGNOSTIC_LINE}\n${DISCOVER_SUMMARY_LINE}\n`],
+  const { spawnFn, kills } = fakeSpawn({
+    chunks: [`${DISCOVER_DIAGNOSTIC_LINE}\n`, `${DISCOVER_SUMMARY_LINE}\n`],
   });
   const boom = new Error('host logger failed');
   await assert.rejects(
@@ -771,4 +796,5 @@ test('an exception from onDiagnostic aborts the run too', async () => {
     }),
     (err: unknown) => err === boom,
   );
+  assert.equal(kills.length, 1);
 });
