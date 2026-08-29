@@ -352,6 +352,21 @@ const REQUIRED_TABLES: &[&str] = &[
     "sessions",
 ];
 const REQUIRED_HISTORY_COLUMNS: &[&str] = &["prompt_hash", "git_branch"];
+/// Columns [`init_db`] adds to `sessions` after the original DDL. The shallow
+/// session catalog (`ai-hist sessions list` / `discover`) reads every one of
+/// them, so a read-only handle over a database that predates them would fail
+/// with `no such column` instead of migrating.
+const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
+    "first_prompt",
+    "models_json",
+    "originator",
+    "agent_version",
+    "repo_url",
+    "initial_commit",
+    "workspace_roots_json",
+    "source_stamp",
+    "discovery_state",
+];
 
 /// Whether this database already has everything [`init_db`] would add.
 ///
@@ -371,9 +386,19 @@ pub fn schema_is_current(conn: &Connection) -> Result<bool> {
         .prepare("SELECT name FROM pragma_table_info('history')")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<_>>()?;
-    Ok(REQUIRED_HISTORY_COLUMNS
+    if !REQUIRED_HISTORY_COLUMNS
         .iter()
-        .all(|needed| columns.contains(*needed)))
+        .all(|needed| columns.contains(*needed))
+    {
+        return Ok(false);
+    }
+    let session_columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('sessions')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(REQUIRED_SESSIONS_COLUMNS
+        .iter()
+        .all(|needed| session_columns.contains(*needed)))
 }
 
 /// Open the database for reading only.
@@ -415,10 +440,37 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_assistant_text TEXT,
     raw_path TEXT,
     parser_version INTEGER NOT NULL DEFAULT 1,
+    first_prompt TEXT,
+    models_json TEXT,
+    originator TEXT,
+    agent_version TEXT,
+    repo_url TEXT,
+    initial_commit TEXT,
+    workspace_roots_json TEXT,
+    source_stamp TEXT,
+    discovery_state TEXT,
     PRIMARY KEY (session_id, source)
 );
 "#,
     )?;
+    // `sessions` predates the shallow catalog. Databases created by an older
+    // release keep the original nine columns, so every catalog field is added
+    // here as an ignore-error ALTER; a fresh database gets the same shape from
+    // the CREATE TABLE above and these become no-ops. Both paths converge.
+    // Anything added here must also be listed in REQUIRED_SESSIONS_COLUMNS.
+    for column in [
+        "first_prompt TEXT",
+        "models_json TEXT",
+        "originator TEXT",
+        "agent_version TEXT",
+        "repo_url TEXT",
+        "initial_commit TEXT",
+        "workspace_roots_json TEXT",
+        "source_stamp TEXT",
+        "discovery_state TEXT",
+    ] {
+        let _ = conn.execute(&format!("ALTER TABLE sessions ADD COLUMN {column}"), []);
+    }
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_history_hash ON history(prompt_hash)",
         [],
@@ -450,6 +502,18 @@ CREATE TABLE IF NOT EXISTS sessions (
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_activity_ms DESC)",
+        [],
+    )?;
+    // Source-filtered catalog listing (`sessions list --source codex`) orders by
+    // recency inside one source; without this the planner sorts the whole table.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_source_last ON sessions(source, last_activity_ms DESC)",
+        [],
+    )?;
+    // Shallow discovery keys its "has this file changed?" lookup on the raw
+    // path, because a transcript's session id is not known until it is read.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_raw_path ON sessions(source, raw_path)",
         [],
     )?;
     conn.execute(
@@ -1721,5 +1785,103 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sessions_exists, 1);
+    }
+
+    /// The catalog columns must reach a database that predates them, and a
+    /// read-only handle must refuse to serve that database until they do —
+    /// otherwise `sessions list` fails with `no such column` instead of
+    /// migrating.
+    #[test]
+    fn session_catalog_columns_migrate_onto_a_pre_catalog_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        {
+            let legacy = Connection::open(&db_path).unwrap();
+            legacy.execute_batch(SCHEMA).unwrap();
+            legacy
+                .execute_batch(
+                    "ALTER TABLE history ADD COLUMN git_branch TEXT;
+                     CREATE TABLE sessions (
+                         session_id TEXT NOT NULL,
+                         source TEXT NOT NULL,
+                         cwd TEXT,
+                         git_branch TEXT,
+                         first_activity_ms INTEGER,
+                         last_activity_ms INTEGER,
+                         last_assistant_text TEXT,
+                         raw_path TEXT,
+                         parser_version INTEGER NOT NULL DEFAULT 1,
+                         PRIMARY KEY (session_id, source)
+                     );
+                     INSERT INTO sessions (session_id, source, last_activity_ms)
+                     VALUES ('legacy-1', 'claude', 42);",
+                )
+                .unwrap();
+            assert!(
+                !schema_is_current(&legacy).unwrap(),
+                "a database without the catalog columns must not be served read-only"
+            );
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        let columns = conn
+            .prepare("SELECT name FROM pragma_table_info('sessions')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<HashSet<String>>>()
+            .unwrap();
+        for needed in REQUIRED_SESSIONS_COLUMNS {
+            assert!(columns.contains(*needed), "missing column {needed}");
+        }
+        // Existing rows survive the migration with the new columns null.
+        let (id, state): (String, Option<String>) = conn
+            .query_row(
+                "SELECT session_id, discovery_state FROM sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(id, "legacy-1");
+        assert_eq!(state, None);
+    }
+
+    /// A fresh database and a migrated one must end up with the same `sessions`
+    /// shape, or the CREATE TABLE and the ALTER TABLE list have drifted apart.
+    #[test]
+    fn fresh_and_migrated_session_tables_converge() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = open_db(&dir.path().join("fresh.db")).unwrap();
+        let legacy_path = dir.path().join("legacy.db");
+        {
+            let legacy = Connection::open(&legacy_path).unwrap();
+            legacy
+                .execute_batch(
+                    "CREATE TABLE sessions (
+                         session_id TEXT NOT NULL,
+                         source TEXT NOT NULL,
+                         cwd TEXT,
+                         git_branch TEXT,
+                         first_activity_ms INTEGER,
+                         last_activity_ms INTEGER,
+                         last_assistant_text TEXT,
+                         raw_path TEXT,
+                         parser_version INTEGER NOT NULL DEFAULT 1,
+                         PRIMARY KEY (session_id, source)
+                     );",
+                )
+                .unwrap();
+        }
+        let migrated = open_db(&legacy_path).unwrap();
+        let columns = |conn: &Connection| {
+            conn.prepare("SELECT name FROM pragma_table_info('sessions') ORDER BY name")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .unwrap()
+        };
+        assert_eq!(columns(&fresh), columns(&migrated));
     }
 }
