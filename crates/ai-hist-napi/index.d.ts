@@ -20,3 +20,116 @@ export declare function syncLocal(): Promise<void>
  * thread so the Node event loop is never blocked.
  */
 export declare function syncAndPush(): Promise<SyncPushResult>
+/**
+ * One coding-agent session as the shallow catalog knows it.
+ *
+ * `firstPrompt` is derived by RelayHistory (a bounded excerpt of the first
+ * substantive human turn); everything else is observed in provider data, and
+ * anything the provider does not record stays null rather than being invented.
+ */
+export interface CatalogSession {
+  source: string
+  sessionId: string
+  cwd?: string
+  gitBranch?: string
+  firstActivityMs?: number
+  lastActivityMs?: number
+  firstPrompt?: string
+  lastAssistantText?: string
+  models: Array<string>
+  originator?: string
+  agentVersion?: string
+  repoUrl?: string
+  initialCommit?: string
+  workspaceRoots: Array<string>
+  rawPath?: string
+  sourceStamp?: string
+  /** `"shallow"` (catalog row only) or `"full"` (full evidence ingested). */
+  discoveryState: string
+  /**
+   * `true` when the row was served from the catalog without re-reading the
+   * provider source.
+   */
+  fromCache: boolean
+}
+/** Filters for the cache-only catalog listing. */
+export interface ListSessionsOptions {
+  /** Restrict to these sources. Omit for every discoverable source. */
+  sources?: Array<string>
+  /** Row cap (default 50). */
+  limit?: number
+  /** Keyset pagination: only sessions older than this epoch-ms cutoff. */
+  beforeMs?: number
+}
+/** The cache-only catalog listing plus the contract version it was built with. */
+export interface SessionCatalog {
+  contractVersion: number
+  sessions: Array<CatalogSession>
+}
+/** Filters for one shallow discovery run. */
+export interface DiscoverSessionsOptions {
+  /** Restrict to these sources. Omit for every adapter. */
+  sources?: Array<string>
+  /** Global cap across all providers, applied by recency. Omit for no cap. */
+  limit?: number
+}
+/**
+ * A non-fatal failure during discovery. One provider (or one malformed
+ * session) failing never blocks the rest of the run.
+ */
+export interface DiscoveryDiagnostic {
+  source: string
+  locator?: string
+  error: string
+}
+/** Per-provider tallies for one discovery run. */
+export interface ProviderSummary {
+  source: string
+  candidates: number
+  discovered: number
+  skippedUnchanged: number
+  failed: boolean
+}
+/** What one discovery run actually did — bounded-work evidence, not timings. */
+export interface DiscoveryCounters {
+  candidatesEnumerated: number
+  shallowReads: number
+  skippedUnchanged: number
+  filesOpened: number
+  bytesRead: number
+}
+/** A source that deliberately has no shallow adapter, and why. */
+export interface SourceExemption {
+  source: string
+  reason: string
+}
+/** Outcome of one shallow discovery run, with the rows collected. */
+export interface DiscoverResult {
+  contractVersion: number
+  sessions: Array<CatalogSession>
+  discovered: number
+  skippedUnchanged: number
+  providers: Array<ProviderSummary>
+  exemptSources: Array<SourceExemption>
+  diagnostics: Array<DiscoveryDiagnostic>
+  counters: DiscoveryCounters
+}
+/**
+ * List the session catalog from the local database only.
+ *
+ * One indexed query over `sessions`: no provider transcript is opened and no
+ * history/event/tool-call table is scanned, so this stays fast on first paint
+ * even with thousands of historical sessions. A database that does not exist
+ * yet is an empty catalog — call `discoverSessions()` to populate it.
+ */
+export declare function listSessions(options?: ListSessionsOptions | undefined | null): Promise<SessionCatalog>
+/**
+ * Discover sessions from the known provider locations with bounded reads.
+ *
+ * Candidates from every provider are merged by recency before the limit is
+ * applied, so a limit is global rather than per-provider. Sources whose bytes
+ * have not changed since the last run are served from the catalog. Rows are
+ * collected rather than streamed; use the CLI's JSONL output for progressive
+ * consumption.
+ */
+export declare function discoverSessions(options?: DiscoverSessionsOptions | undefined | null): Promise<DiscoverResult>
