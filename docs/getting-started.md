@@ -60,6 +60,16 @@ ai-hist search "auth" # confirm it captured something
 
 The local DB lives at `~/.local/share/ai-hist/ai-history.db`. This is what `push` sends.
 
+To see *which* agent sessions this machine has — without waiting for a full index —
+use the session catalog:
+
+```bash
+ai-hist sessions discover --limit 20   # refresh the catalog, newest 20 across all tools
+ai-hist sessions list                  # read it back instantly (no provider files touched)
+```
+
+> Full reference: [`session-catalog.md`](session-catalog.md).
+
 ---
 
 ## Step 3 — Cloud sync

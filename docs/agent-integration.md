@@ -104,7 +104,24 @@ Empty result → `{"decision":"allow","warnings":[]}` → the hook no-ops cleanl
 
 ---
 
-## 6. Quick reference
+## 6. Enumerate sessions without indexing them
+
+Before you can reason about a session you have to know it exists. The **session catalog** answers that locally and cheaply, and it is a separate surface from the cloud loop above — no auth, no network, no full index:
+
+```bash
+ai-hist sessions discover --json --limit 20   # bounded scan of every provider, newest first
+ai-hist sessions list --json                  # cached read: one indexed query, zero provider I/O
+```
+
+Both emit a versioned contract (`contract_version: 1`) — parse it and fail loudly on a version you don't know. `discover --json` is JSONL: session rows in global recency order, then per-provider `diagnostic` lines, then a closing `summary` carrying operation counters (`files_opened`, `bytes_read`, …) so you can verify the run stayed cheap. Rows are identity only — `session_id`, `cwd`, branch, first prompt, models, provenance. Events, tool calls, token usage and full transcripts still require `ai-hist sync`; `discovery_state` on each row tells you which you have.
+
+The same operations are available in-process through the napi binding (`listSessions` / `discoverSessions`) and as an MCP tool, so an agent can enumerate recent work without shelling out.
+
+> Full contract, per-provider capability matrix, and ordering/limit semantics: [`session-catalog.md`](session-catalog.md).
+
+---
+
+## 7. Quick reference
 
 ```bash
 # one-time: build + authenticate (see docs/cloud-sync.md)
@@ -114,6 +131,10 @@ ai-hist admin-mint --base-url <dev-url> --org <org> --user "$USER"   # dev only;
 # every session
 ai-hist push --json                                          # sync your work
 ai-hist pair check --file <path> --task "<summary>" --json   # ask for warnings before a risky step
+
+# local session discovery (no auth, no network)
+ai-hist sessions discover --json --limit 20                  # refresh the catalog
+ai-hist sessions list --json                                 # read it back
 ```
 
-See also: `docs/cloud-sync.md` (human setup), `docs/pair-hooks.md` (hook/MCP wiring), and the `trajectories` repo `docs/convergence-integration.md` (full event-mapping contract).
+See also: `docs/cloud-sync.md` (human setup), `docs/pair-hooks.md` (hook/MCP wiring), `docs/session-catalog.md` (local session discovery), and the `trajectories` repo `docs/convergence-integration.md` (full event-mapping contract).
