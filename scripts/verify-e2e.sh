@@ -27,6 +27,16 @@ json_field() {
   ' "$1"
 }
 
+# Print one field of a JSONL stream piped on stdin (the `sessions discover`
+# shape). The argument is a JS expression over `d`, the array of parsed lines.
+jsonl_field() {
+  node -e '
+    const d = require("node:fs").readFileSync(0, "utf8")
+      .split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    process.stdout.write(String(eval(process.argv[1])));
+  ' "$1"
+}
+
 export AI_HIST_DB="$TMP/ai-history.db"
 export TRAJECTORY_ROOT="$TMP/trajectories"
 export OPENCODE_DB="$TMP/opencode.db"
@@ -147,6 +157,95 @@ assert_eq "grok session metadata" "$grok_session" "/tmp/e2e/grok|main|grok assis
 
 synthetic=$(sqlite3 "$AI_HIST_DB" "SELECT COUNT(*) FROM history WHERE source='grok' AND prompt LIKE '%synthetic prompt%'")
 assert_eq "grok synthetic prompt count" "$synthetic" "0"
+
+# --- session catalog -------------------------------------------------------
+# Shallow discovery over the same multi-provider fake HOME, then the cache-only
+# listing a desktop app paints from. Both carry the catalog contract version.
+discover_json=$("$ROOT/ai-hist" sessions discover --json)
+
+discovered_sources=$(printf '%s\n' "$discover_json" | jsonl_field \
+  'd.filter((l) => l.type === "session").map((l) => l.source).sort().join(",")')
+assert_eq "discovered sources" "$discovered_sources" "claude,codex,cursor,grok,opencode"
+
+discover_contract=$(printf '%s\n' "$discover_json" | jsonl_field \
+  'd.find((l) => l.type === "summary").contract_version')
+assert_eq "discover contract version" "$discover_contract" "1"
+
+discover_trailer=$(printf '%s\n' "$discover_json" | jsonl_field 'd[d.length - 1].type')
+assert_eq "discover trailer" "$discover_trailer" "summary"
+
+discover_exempt=$(printf '%s\n' "$discover_json" | jsonl_field \
+  'd.find((l) => l.type === "summary").exempt_sources.map((e) => e.source).join(",")')
+assert_eq "discover exemptions" "$discover_exempt" "trajectory"
+
+# Trajectories are derived records, never sessions.
+discover_trajectories=$(printf '%s\n' "$discover_json" | jsonl_field \
+  'd.filter((l) => l.type === "session" && l.source === "trajectory").length')
+assert_eq "discovered trajectories" "$discover_trajectories" "0"
+
+# Codex session_meta provenance is observed, not invented.
+codex_branch=$(printf '%s\n' "$discover_json" | jsonl_field \
+  'String(d.find((l) => l.type === "session" && l.source === "codex").git_branch)')
+assert_eq "codex discovered branch" "$codex_branch" "main"
+codex_repo=$(printf '%s\n' "$discover_json" | jsonl_field \
+  'String(d.find((l) => l.type === "session" && l.source === "codex").repo_url)')
+assert_eq "codex discovered repo url" "$codex_repo" "null"
+
+# Cursor records no per-message timestamps: mtime is reported as last activity
+# and first activity stays null rather than being fabricated.
+cursor_first=$(printf '%s\n' "$discover_json" | jsonl_field \
+  'String(d.find((l) => l.type === "session" && l.source === "cursor").first_activity_ms)')
+assert_eq "cursor first activity" "$cursor_first" "null"
+cursor_last=$(printf '%s\n' "$discover_json" | jsonl_field \
+  'String(d.find((l) => l.type === "session" && l.source === "cursor").last_activity_ms !== null)')
+assert_eq "cursor last activity present" "$cursor_last" "true"
+
+# A rescan re-reads nothing: unchanged stamps are served from the catalog.
+rescan_reads=$("$ROOT/ai-hist" sessions discover --json | jsonl_field \
+  'd.find((l) => l.type === "summary").counters.shallow_reads')
+assert_eq "rescan shallow reads" "$rescan_reads" "0"
+rescan_skipped=$("$ROOT/ai-hist" sessions discover --json | jsonl_field \
+  'd.find((l) => l.type === "summary").skipped_unchanged')
+assert_eq "rescan skipped unchanged" "$rescan_skipped" "5"
+
+# The global limit is shared across providers, not applied per provider.
+limited=$("$ROOT/ai-hist" sessions discover --json --limit 2 | jsonl_field \
+  'd.filter((l) => l.type === "session").length')
+assert_eq "global discover limit" "$limited" "2"
+
+list_json=$("$ROOT/ai-hist" sessions list --json)
+list_contract=$(printf '%s\n' "$list_json" | json_field 'd.contract_version')
+assert_eq "sessions list contract version" "$list_contract" "1"
+
+list_sessions=$(printf '%s\n' "$list_json" | json_field \
+  'd.sessions.map((s) => `${s.source}:${s.session_id}`).sort().join(",")')
+assert_eq "sessions list rows" "$list_sessions" \
+  "claude:claude-e2e,codex:codex-e2e,cursor:cursor-e2e,grok:grok-e2e,opencode:opencode-e2e"
+
+# The catalog lists newest first.
+list_ordered=$(printf '%s\n' "$list_json" | json_field \
+  'JSON.stringify(d.sessions.map((s) => s.last_activity_ms)) === JSON.stringify(d.sessions.map((s) => s.last_activity_ms).slice().sort((a, b) => b - a))')
+assert_eq "sessions list ordering" "$list_ordered" "true"
+
+# Sessions the full sync already ingested stay marked `full`; the ones only
+# shallow discovery knows about are `shallow`.
+claude_state=$(printf '%s\n' "$list_json" | json_field \
+  'd.sessions.find((s) => s.source === "claude").discovery_state')
+assert_eq "claude discovery state" "$claude_state" "full"
+cursor_state=$(printf '%s\n' "$list_json" | json_field \
+  'd.sessions.find((s) => s.source === "cursor").discovery_state')
+assert_eq "cursor discovery state" "$cursor_state" "shallow"
+
+# The derived first-prompt excerpt skips synthetic/control turns.
+grok_prompt=$(printf '%s\n' "$list_json" | json_field \
+  'd.sessions.find((s) => s.source === "grok").first_prompt')
+assert_eq "grok first prompt" "$grok_prompt" "e2e grok release tagging prompt"
+
+list_filtered=$("$ROOT/ai-hist" sessions list --json --source codex --limit 5 | json_field \
+  'd.sessions.map((s) => s.source).join(",")')
+assert_eq "sessions list source filter" "$list_filtered" "codex"
+
+"$ROOT/ai-hist" sessions list >/dev/null
 
 "$ROOT/ai-hist" --db "$AI_HIST_DB" tag codex-e2e release-e2e --source codex
 "$ROOT/ai-hist" --db "$AI_HIST_DB" search release --tag release-e2e --json
