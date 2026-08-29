@@ -350,6 +350,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "tags",
     "session_tags",
     "sessions",
+    "discovery_skips",
 ];
 const REQUIRED_HISTORY_COLUMNS: &[&str] = &["prompt_hash", "git_branch"];
 /// Columns [`init_db`] adds to `sessions` after the original DDL. The shallow
@@ -367,6 +368,16 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
     "source_stamp",
     "discovery_state",
 ];
+
+/// Indexes the session catalog's fast paths depend on.
+///
+/// The pre-existing guard checks tables and columns only. These two are listed
+/// because the catalog listing's whole promise is an indexed, sort-free read:
+/// a database that somehow has the columns but not the indexes would be served
+/// read-only with a full scan and a temp b-tree, silently. Missing means "not
+/// current", which routes the caller through the writable open that creates
+/// them.
+const REQUIRED_SESSIONS_INDEXES: &[&str] = &["idx_sessions_recency", "idx_sessions_source_recency"];
 
 /// Whether this database already has everything [`init_db`] would add.
 ///
@@ -396,9 +407,20 @@ pub fn schema_is_current(conn: &Connection) -> Result<bool> {
         .prepare("SELECT name FROM pragma_table_info('sessions')")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<_>>()?;
-    Ok(REQUIRED_SESSIONS_COLUMNS
+    if !REQUIRED_SESSIONS_COLUMNS
         .iter()
-        .all(|needed| session_columns.contains(*needed)))
+        .all(|needed| session_columns.contains(*needed))
+    {
+        return Ok(false);
+    }
+    let mut index =
+        conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1")?;
+    for name in REQUIRED_SESSIONS_INDEXES {
+        if !index.exists([name])? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Open the database for reading only.
@@ -430,6 +452,14 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE history ADD COLUMN git_branch TEXT", []);
     conn.execute_batch(
         r#"
+CREATE TABLE IF NOT EXISTS discovery_skips (
+    source TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    stamp TEXT NOT NULL,
+    reason TEXT,
+    updated_ms INTEGER,
+    PRIMARY KEY (source, locator)
+);
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT NOT NULL,
     source TEXT NOT NULL,
@@ -457,19 +487,24 @@ CREATE TABLE IF NOT EXISTS sessions (
     // release keep the original nine columns, so every catalog field is added
     // here as an ignore-error ALTER; a fresh database gets the same shape from
     // the CREATE TABLE above and these become no-ops. Both paths converge.
-    // Anything added here must also be listed in REQUIRED_SESSIONS_COLUMNS.
-    for column in [
-        "first_prompt TEXT",
-        "models_json TEXT",
-        "originator TEXT",
-        "agent_version TEXT",
-        "repo_url TEXT",
-        "initial_commit TEXT",
-        "workspace_roots_json TEXT",
-        "source_stamp TEXT",
-        "discovery_state TEXT",
-    ] {
-        let _ = conn.execute(&format!("ALTER TABLE sessions ADD COLUMN {column}"), []);
+    // The list is REQUIRED_SESSIONS_COLUMNS itself rather than a copy of it:
+    // three declarations of the same nine names (CREATE TABLE, this loop, the
+    // read-only guard) is two chances to drift, and every catalog column is
+    // TEXT, so the guard list is the migration list.
+    for column in REQUIRED_SESSIONS_COLUMNS {
+        // "Already there" is the expected outcome on every run after the
+        // first, and the only error worth swallowing. Anything else -- a
+        // read-only file, a corrupt page, a locked database -- means the
+        // migration did not happen, and hiding it here turns one clear failure
+        // at init into `no such column` on the user's first listing.
+        if let Err(error) = conn.execute(
+            &format!("ALTER TABLE sessions ADD COLUMN {column} TEXT"),
+            [],
+        ) {
+            if !error.to_string().contains("duplicate column name") {
+                return Err(error).with_context(|| format!("adding column sessions.{column}"));
+            }
+        }
     }
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_history_hash ON history(prompt_hash)",
@@ -508,6 +543,19 @@ CREATE TABLE IF NOT EXISTS sessions (
     // recency inside one source; without this the planner sorts the whole table.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sessions_source_last ON sessions(source, last_activity_ms DESC)",
+        [],
+    )?;
+    // The catalog's total order is (last_activity_ms DESC, source, session_id):
+    // recency alone ties constantly, because every mtime-derived session in one
+    // scan can share a timestamp, and a keyset paginator that cannot break
+    // those ties silently drops rows between pages. These two indexes carry the
+    // whole ORDER BY so the listing is still answered without a sort.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_recency ON sessions(last_activity_ms DESC, source, session_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_source_recency ON sessions(source, last_activity_ms DESC, session_id)",
         [],
     )?;
     // Shallow discovery keys its "has this file changed?" lookup on the raw
@@ -1845,6 +1893,27 @@ mod tests {
             .unwrap();
         assert_eq!(id, "legacy-1");
         assert_eq!(state, None);
+    }
+
+    /// The catalog listing's promise is an indexed, sort-free read. A database
+    /// that has the columns but not the indexes would be served read-only with
+    /// degraded plans, silently, so the guard covers them too.
+    #[test]
+    fn a_database_missing_a_catalog_index_is_not_served_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("indexless.db");
+        let conn = open_db(&db_path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        for index in REQUIRED_SESSIONS_INDEXES {
+            conn.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+            assert!(
+                !schema_is_current(&conn).unwrap(),
+                "{index} is load-bearing for the catalog listing"
+            );
+            // init_db is idempotent, so the writable path heals it.
+            init_db(&conn).unwrap();
+            assert!(schema_is_current(&conn).unwrap());
+        }
     }
 
     /// A fresh database and a migrated one must end up with the same `sessions`
