@@ -49,7 +49,7 @@ npm run build
 node dist/mcp-server.js
 ```
 
-The MCP server exposes tools for search, recent history, session lookup, temporal context, evidence packing, stats, trajectory search, and task WHY lookup over stdio. It runs on the user's machine and uses the same data-opening behavior as the SDK: SQLite first, then local fallback scanning.
+The MCP server exposes tools for search, recent history, the session catalog, session lookup, temporal context, evidence packing, stats, trajectory search, and task WHY lookup over stdio. It runs on the user's machine and uses the same data-opening behavior as the SDK: SQLite first, then local fallback scanning.
 
 To expose only one project through MCP, pass a project scope when launching the server. Exact project matches and child paths are included.
 
@@ -67,6 +67,48 @@ Contract tools:
 - `stats()`
 - `search_trajectories(query, limit?)`
 - `why_for_task(query)`
+- `list_sessions(sources?, limit?, before_ms?)`
+
+## Session catalog
+
+`sessions` is a materialized catalog of every coding-agent session ai-hist knows about — one row per `(source, session_id)`, with cwd, git branch, first/last activity, the first prompt, observed models, originator, agent version, and repo identity. It is populated by shallow discovery (cheap, metadata only) and upgraded in place by a full `ai-hist sync`. `discoveryState` says which you are looking at: `'shallow'` for a catalog row whose transcript has not been ingested, `'full'` once it has (rows written before the catalog existed store `NULL` and read as `'full'`).
+
+Reading it is one indexed query over a single table — no provider transcript is opened and no prompt history is scanned — so it is the fast path for "which sessions exist?" on first paint:
+
+```ts
+import { openAiHist, discoverSessions, SESSION_CATALOG_CONTRACT_VERSION } from 'ai-hist';
+
+const hist = await openAiHist();
+const sessions = hist.listSessionCatalog({ limit: 20 });
+for (const s of sessions) {
+  console.log(s.lastActivityMs, s.source, s.sessionId, s.cwd, s.firstPrompt);
+}
+
+// Paginate with a keyset cursor.
+const older = hist.listSessionCatalog({
+  limit: 20,
+  beforeMs: sessions.at(-1)!.lastActivityMs!,
+});
+```
+
+Ordering is `lastActivityMs` descending, rows with no timestamp last, then `source` and `sessionId` so pages are stable. `trajectory` rows are excluded — trajectories are derived records, not sessions. A configured `projectScope` constrains rows by `cwd`, so sources with no working directory (relay) drop out of a scoped listing. In JSONL fallback mode (no SQLite database) the catalog is empty and the method returns `[]`; only the native discovery engine writes it.
+
+To populate or refresh the catalog, run shallow discovery. It scans the known provider locations with bounded reads, orders candidates globally by recency before applying the limit, and skips sources whose bytes have not changed since the last run:
+
+```ts
+const { sessions, diagnostics, summary } = await discoverSessions({
+  sources: ['claude', 'codex'],   // omit for every discoverable source
+  limit: 50,                      // global across providers, by recency
+  onSession: (s) => render(s),    // streams as rows arrive
+});
+
+console.log(summary?.discovered, summary?.skippedUnchanged, summary?.counters.bytesRead);
+for (const d of diagnostics) console.warn(`[${d.source}] ${d.locator ?? ''}: ${d.error}`);
+```
+
+`discoverSessions` is a top-level function, not an `AiHist` method: it drives `ai-hist sessions discover --json` (binary discovery is `$AI_HIST_RUST_BIN` → the install.sh location → `ai-hist` on `PATH`, the same as `pushToCloud`), and that writes the on-disk database. An `AiHist` instance is an in-memory snapshot taken at open time, so re-open it before listing to see freshly discovered rows.
+
+Failure behavior matches the CLI's: one provider blowing up yields a diagnostic and the run still resolves; the promise rejects only when the binary cannot be run at all (the error names `AI_HIST_RUST_BIN`) or when every selected provider failed. Unparseable JSONL lines are skipped rather than failing the run. `summary.contractVersion` is the native output-contract version; compare it against the exported `SESSION_CATALOG_CONTRACT_VERSION` (currently `1`) when a mismatch matters to you.
 
 ## API
 
@@ -83,7 +125,8 @@ hist.sourceKind: 'sqlite' | 'jsonl'
 hist.projectScope: string | undefined
 
 hist.recent(opts?): HistoryEntry[]            // newest prompts first
-hist.listSessions(opts?): SessionSummary[]    // grouped by session_id, last activity DESC
+hist.listSessions(opts?): SessionSummary[]    // grouped from history by session_id, last activity DESC
+hist.listSessionCatalog(opts?): CatalogSession[] // the sessions catalog: cache-only, one indexed query
 hist.getSession(sessionId): HistoryEntry[]    // all prompts in a session, oldest first
 hist.getSessionEvents(sessionId): SessionEvent[] // full transcript: text, thinking, tool calls/results, token usage
 hist.getToolCalls(sessionId): SessionToolCall[]  // the session's tool invocations
@@ -97,9 +140,13 @@ hist.stats(): Stats                           // counts + date range
 
 All list-style methods accept `{ source?, project?, limit?, beforeMs? }`. `beforeMs` is the cursor for paginating older results.
 
+`listSessionCatalog` takes `{ sources?, limit?, beforeMs? }` instead — it filters on the catalog's own `source` column, not on project.
+
 ```ts
 resumeCommand(entry): string | null           // shell command per source; null for relay
 defaultDbPath(): string                       // resolve env / OS default
+discoverSessions(opts?): Promise<DiscoverResult>  // drives `ai-hist sessions discover --json`
+SESSION_CATALOG_CONTRACT_VERSION: number      // native session-catalog output contract (1)
 ```
 
 ## Trajectories
@@ -162,7 +209,34 @@ CREATE TABLE history (
 );
 
 CREATE VIRTUAL TABLE history_fts USING fts5(prompt, project, content='history', content_rowid='id');
+
+CREATE TABLE sessions (
+  session_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  cwd TEXT,
+  git_branch TEXT,
+  first_activity_ms INTEGER,
+  last_activity_ms INTEGER,
+  last_assistant_text TEXT,
+  raw_path TEXT,
+  parser_version INTEGER NOT NULL DEFAULT 1,
+  first_prompt TEXT,
+  models_json TEXT,
+  originator TEXT,
+  agent_version TEXT,
+  repo_url TEXT,
+  initial_commit TEXT,
+  workspace_roots_json TEXT,
+  source_stamp TEXT,
+  discovery_state TEXT,
+  PRIMARY KEY (session_id, source)
+);
+
+CREATE INDEX idx_sessions_source_last ON sessions(source, last_activity_ms DESC);
+CREATE INDEX idx_sessions_raw_path ON sessions(source, raw_path);
 ```
+
+`models_json` and `workspace_roots_json` hold JSON string arrays or `NULL` (never `[]`); the SDK parses both into arrays. The catalog columns were added after 0.5.0, so when the SDK opens an older database file it backfills the missing columns on its in-memory copy with `ALTER TABLE` — the file on disk is not touched, and the absent values read as `NULL`.
 
 Trajectory sync also creates a structured `trajectories` table and inserts each per-run compact file into `history` with `source='trajectory'`, so general history search and WHY-specific lookup both work.
 

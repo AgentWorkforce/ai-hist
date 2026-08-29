@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { mkdtemp, mkdir, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import initSqlJs from 'sql.js';
 import { openAiHist } from './index.js';
@@ -291,11 +291,20 @@ test('MCP server exposes history and trajectory tools over stdio', async () => {
   child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
 
   try {
-    const { tools, stats } = await new Promise<{ tools: Set<string>; stats: { projectScope?: string } }>((resolve, reject) => {
+    type CatalogPayload = {
+      contractVersion?: number;
+      sessions?: Array<{ sessionId: string; source: string; models: string[]; discoveryState: string }>;
+    };
+    const { tools, stats, catalog } = await new Promise<{
+      tools: Set<string>;
+      stats: { projectScope?: string };
+      catalog: CatalogPayload;
+    }>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('timed out waiting for MCP responses')), 5000);
       let buffer = '';
       let tools: Set<string> | null = null;
       let stats: { projectScope?: string } | null = null;
+      let catalog: CatalogPayload | null = null;
 
       child.stdout.on('data', (chunk: Buffer) => {
         buffer += chunk.toString('utf8');
@@ -322,9 +331,13 @@ test('MCP server exposes history and trajectory tools over stdio', async () => {
             const text = message.result?.content?.find((item) => item.type === 'text')?.text ?? '{}';
             stats = JSON.parse(text) as { projectScope?: string };
           }
-          if (tools && stats) {
+          if (message.id === 4) {
+            const text = message.result?.content?.find((item) => item.type === 'text')?.text ?? '{}';
+            catalog = JSON.parse(text) as CatalogPayload;
+          }
+          if (tools && stats && catalog) {
             clearTimeout(timer);
-            resolve({ tools, stats });
+            resolve({ tools, stats, catalog });
           }
         }
       });
@@ -367,6 +380,12 @@ test('MCP server exposes history and trajectory tools over stdio', async () => {
         method: 'tools/call',
         params: { name: 'stats', arguments: {} },
       });
+      writeJsonRpc(child.stdin, {
+        jsonrpc: '2.0',
+        id: 4,
+        method: 'tools/call',
+        params: { name: 'list_sessions', arguments: { limit: 5 } },
+      });
     });
 
     for (const name of [
@@ -382,10 +401,16 @@ test('MCP server exposes history and trajectory tools over stdio', async () => {
       'why_for_task',
       'get_handoff',
       'pair_check',
+      'list_sessions',
     ]) {
       assert.ok(tools.has(name), `missing MCP tool ${name}`);
     }
     assert.equal(stats.projectScope, root);
+    // The catalog tool serves the sessions table, with trajectories excluded.
+    assert.equal(catalog.contractVersion, 1);
+    assert.deepEqual(catalog.sessions?.map((session) => session.sessionId), ['catalog-codex']);
+    assert.deepEqual(catalog.sessions?.[0]?.models, ['gpt-5.4']);
+    assert.equal(catalog.sessions?.[0]?.discoveryState, 'shallow');
   } finally {
     child.kill();
   }
@@ -418,8 +443,38 @@ async function writeScopeFixtureDb(dbPath: string): Promise<void> {
       last_assistant_text TEXT,
       raw_path TEXT,
       parser_version INTEGER NOT NULL DEFAULT 1,
+      first_prompt TEXT,
+      models_json TEXT,
+      originator TEXT,
+      agent_version TEXT,
+      repo_url TEXT,
+      initial_commit TEXT,
+      workspace_roots_json TEXT,
+      source_stamp TEXT,
+      discovery_state TEXT,
       PRIMARY KEY (session_id, source)
     )`);
+    // Catalog rows live in the database's own directory so a project-scoped
+    // server (the MCP smoke test scopes to that directory) can see them.
+    const sessionCwd = dirname(dbPath);
+    const insertSession = db.prepare(
+      `INSERT INTO sessions (session_id, source, cwd, git_branch, first_activity_ms,
+         last_activity_ms, last_assistant_text, raw_path, parser_version, first_prompt,
+         models_json, discovery_state)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    try {
+      insertSession.run([
+        'catalog-codex', 'codex', sessionCwd, 'main', 1_000, 2_000, null, '/raw/codex.jsonl', 1,
+        'catalog codex prompt', '["gpt-5.4"]', 'shallow',
+      ]);
+      insertSession.run([
+        'catalog-traj', 'trajectory', sessionCwd, null, 9_000, 9_000, null, null, 1,
+        null, null, 'full',
+      ]);
+    } finally {
+      insertSession.free();
+    }
     db.run(`CREATE TABLE trajectories (
       id TEXT PRIMARY KEY,
       version INTEGER,

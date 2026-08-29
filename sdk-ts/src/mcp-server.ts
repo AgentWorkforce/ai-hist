@@ -13,7 +13,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { resolve } from "node:path";
 import { z } from "zod";
-import { openAiHist, resumeCommand, type AiHist, type TrajectoryEntry, type HandoffCandidate } from "./index.js";
+import {
+  openAiHist,
+  resumeCommand,
+  SESSION_CATALOG_CONTRACT_VERSION,
+  type AiHist,
+  type TrajectoryEntry,
+  type HandoffCandidate,
+} from "./index.js";
 import { formatPairWarnings, pairCheck } from "./pair-client.js";
 
 // ---------------------------------------------------------------------------
@@ -105,6 +112,9 @@ const READ_ONLY = { readOnlyHint: true, idempotentHint: true, openWorldHint: fal
 const WRITE_LOCAL = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
 const REMOTE_READ_ONLY = { readOnlyHint: true, idempotentHint: true, openWorldHint: true } as const;
 const SOURCE_SCHEMA = z.enum(["claude", "codex", "cursor", "grok", "relay", "trajectory", "opencode"]);
+// The session catalog holds provider sessions only: trajectories are derived
+// records and never appear in a session listing.
+const CATALOG_SOURCE_SCHEMA = z.enum(["claude", "codex", "cursor", "grok", "relay", "opencode"]);
 
 // ---------------------------------------------------------------------------
 // Server
@@ -148,6 +158,12 @@ Grok, OpenCode, Agent Relay, and trajectories — all searchable in a single ind
 
 - **recent_history** — Browse what was worked on recently across all agents, or
   filter by source and project.
+
+- **list_sessions** — List sessions from the local session catalog, newest first:
+  source, session_id, cwd, git branch, first/last activity, first prompt, models,
+  and discovery_state. Cache-only — it reads one indexed table and never opens a
+  transcript, so prefer it over recent_history when the question is "which sessions
+  exist?" rather than "which prompts mention X?".
 
 - **pack_evidence** — Assemble a concise, token-budget-aware summary of the most
   relevant past sessions before starting a new task. Each entry includes a resume
@@ -439,6 +455,68 @@ server.tool(
         lines.push(`[${dt}] #${e.id}\n${e.prompt}`);
       }
       return { content: [{ type: "text", text: lines.join("\n\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "list_sessions",
+  "List coding-agent sessions from the local session catalog, newest first. " +
+    "This is a cache-only read of the `sessions` table: it never opens a provider " +
+    "transcript and never scans prompt history, so it is the cheapest way to answer " +
+    '"what sessions exist?" or "what was I working on in this repo?". Each row carries ' +
+    "source, session_id, cwd, git branch, first/last activity, the first prompt, observed " +
+    "models, originator, agent version, repo identity, and discovery_state ('shallow' = " +
+    "catalog metadata only, 'full' = transcript ingested). Populate or refresh the catalog " +
+    "with `ai-hist sessions discover`; run `ai-hist sync` for full transcripts. Trajectories " +
+    "are not sessions and never appear here — use search_trajectories for those.",
+  {
+    sources: z
+      .array(CATALOG_SOURCE_SCHEMA)
+      .optional()
+      .describe("Restrict to these agent sources. Omit for every source in the catalog."),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(200)
+      .optional()
+      .default(20)
+      .describe("Maximum number of sessions to return. Default: 20."),
+    before_ms: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        "Keyset pagination cursor: only sessions whose last activity is strictly older than " +
+          "this epoch-ms value. Pass the last_activity_ms of the final row of the previous page.",
+      ),
+  },
+  READ_ONLY,
+  async ({ sources, limit, before_ms }) => {
+    try {
+      const hist = await getHist();
+      const sessions = hist.listSessionCatalog({ sources, limit, beforeMs: before_ms });
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                contractVersion: SESSION_CATALOG_CONTRACT_VERSION,
+                sessions,
+                sourceKind: hist.sourceKind,
+                dbPath: hist.dbPath,
+                projectScope: hist.projectScope,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
     } catch (err) {
       return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
     }
