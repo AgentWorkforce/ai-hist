@@ -30,15 +30,31 @@ Useful overrides:
 
 ```bash
 npm run benchmark -- --output=foo.md --db=/path/to/ai-history.db
-npm run benchmark -- --output=foo.json --discovery-limit=250
 AI_HIST_DB=/path/to/ai-history.db npm run benchmark -- --output=foo.md
 ```
 
-The script measures warm catalog pages of 20 and 100 rows, unchanged and first
-shallow discovery, one 200-event page, CLI startup plus catalog listing, and an
-MCP `tools/call` catalog request. Results include database file size so a sparse
-or real database larger than 2 GiB can demonstrate the key invariant: query
-cost follows requested rows/pages, not total file bytes.
+## Benchmark definitions
+
+Discovery benchmarks use a generated home directory containing 1,000 valid,
+minimal Claude session transcripts. Setup, fixture creation, and source-file
+changes happen outside the timed regions. The fixture makes each run repeatable
+and lets the changed-source case avoid modifying real provider history.
+
+The number at the end of a benchmark name is the requested session or event
+limit, not a cache size.
+
+| Benchmark | Setup outside timing | Timed work |
+|---|---|---|
+| `cold shallow discovery N` | Fresh fixture; database does not exist | Create/migrate the database, enumerate the 1,000 candidates, shallow-read the newest N files, and upsert N catalog rows through SDK -> N-API -> Rust |
+| `unchanged shallow discovery N` | Run one cold discovery of N into a fresh database | Enumerate candidates, match source stamps, and return N cached rows without opening unchanged transcripts |
+| `cold->changed shallow discovery N` | Run one cold discovery of N, then append a valid assistant record to those N fixture transcripts | Enumerate candidates, detect changed stamps, shallow-read the N changed files, and update their catalog rows |
+| `warm session events N` | Select a full session from the configured real database and make one untimed 200-event request | Open the database and return up to N cached events through SDK -> N-API -> Rust; provider transcripts are not read |
+| `CLI startup + cold shallow discovery 20` | Fresh database and the generated fixture | Start a new Node process, load the CLI and native addon, then perform cold discovery of 20 sessions and serialize JSON |
+| `MCP cold shallow discovery 20` | Start and initialize the MCP server with a fresh database and the generated fixture | Perform one MCP `tools/call` round trip that cold-discovers 20 sessions; MCP process startup and initialization are excluded |
+
+The report includes the real database file size used by the event benchmarks,
+so a database larger than 2 GiB can demonstrate that event-query cost follows
+the requested page rather than total database bytes.
 
 For a sparse validation fixture, copy a real migrated database and extend the
 file sparsely on a filesystem that supports sparse files. Do not run this test
@@ -52,14 +68,19 @@ byte RelayHistory database with an active WAL:
 
 | Operation | Time | Rows/work |
 |---|---:|---:|
-| warm cache-only catalog | 1.18 ms | 20 rows |
-| warm cache-only catalog | 5.67 ms | 100 rows |
-| event page | 9.64 ms | 137 rows requested with a 200 cap |
-| first shallow discovery | 1,064.44 ms | 100 rows; 57.0 MiB bounded reads |
-| unchanged shallow discovery | 34.07 ms | 100 rows; zero files opened |
-| CLI startup + catalog | 46.74 ms | 20 rows |
-| MCP `list_sessions` | 7.93 ms | 20 rows |
+| cold shallow discovery | 46.52 ms | 20 rows |
+| cold shallow discovery | 50.53 ms | 100 rows |
+| cold shallow discovery | 232.38 ms | 1,000 rows |
+| unchanged shallow discovery | 8.85 ms | 20 rows; zero files opened |
+| unchanged shallow discovery | 10.02 ms | 100 rows; zero files opened |
+| unchanged shallow discovery | 24.14 ms | 1,000 rows; zero files opened |
+| cold->changed shallow discovery | 14.82 ms | 20 changed rows |
+| cold->changed shallow discovery | 32.14 ms | 100 changed rows |
+| cold->changed shallow discovery | 217.45 ms | 1,000 changed rows |
+| warm session events | 1.27 ms | 20 rows |
+| warm session events | 2.09 ms | 200 rows |
+| CLI startup + cold shallow discovery | 82.05 ms | 20 rows |
+| MCP cold shallow discovery | 28.88 ms | 20 rows |
 
-The 20-row catalog query did not load or copy the 2.8 GiB database: Rust opened
-it directly and returned the indexed page. Event retrieval likewise returned a
-bounded page.
+The event queries did not load or copy the 2.8 GiB database: Rust opened it
+directly and returned a bounded indexed page.

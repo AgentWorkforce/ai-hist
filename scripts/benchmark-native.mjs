@@ -1,10 +1,9 @@
-import { execFile } from 'node:child_process';
-import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { execFile, spawn } from 'node:child_process';
+import { appendFile, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { arch, cpus, platform, release, tmpdir } from 'node:os';
 import { dirname, extname, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { promisify } from 'node:util';
-import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   defaultDbPath, discoverSessions, getSessionEventsPage, listSessionCatalogPage,
@@ -33,10 +32,7 @@ const dbPath = resolve(option('db') || process.env.AI_HIST_DB || defaultDbPath()
 const outputOption = option('output');
 const outputPath = outputOption ? resolve(invocationDirectory, outputOption) : null;
 const pretty = flag('pretty');
-const discoveryLimit = Number(option('discovery-limit') || 100);
-if (!Number.isInteger(discoveryLimit) || discoveryLimit < 1) {
-  throw new Error('--discovery-limit must be a positive integer');
-}
+const discoveryLimits = [20, 100, 1_000];
 
 async function timed(name, operation) {
   const start = performance.now();
@@ -44,9 +40,11 @@ async function timed(name, operation) {
   return { name, ms: Number((performance.now() - start).toFixed(2)), value };
 }
 
-async function mcpList() {
+async function mcpColdDiscovery(home, benchmarkDbPath) {
   const child = spawn(process.execPath, [join(repositoryRoot, 'sdk-ts/dist/mcp-server.js')], {
-    cwd: repositoryRoot, env: { ...process.env, AI_HIST_DB: dbPath }, stdio: ['pipe', 'pipe', 'inherit'],
+    cwd: repositoryRoot,
+    env: { ...process.env, HOME: home, USERPROFILE: home, AI_HIST_DB: benchmarkDbPath },
+    stdio: ['pipe', 'pipe', 'inherit'],
   });
   let buffer = '';
   let nextId = 1;
@@ -78,47 +76,144 @@ async function mcpList() {
       protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'benchmark', version: '1' },
     });
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
-    const start = performance.now();
-    await request('tools/call', { name: 'list_sessions', arguments: { limit: 20 } });
-    return Number((performance.now() - start).toFixed(2));
+    const measurement = await timed('MCP cold shallow discovery 20', () => request('tools/call', {
+      name: 'discover_sessions', arguments: { sources: ['claude'], limit: 20 },
+    }));
+    if (measurement.value.error || measurement.value.result?.isError) {
+      throw new Error(`MCP discovery failed: ${JSON.stringify(measurement.value)}`);
+    }
+    return { name: measurement.name, ms: measurement.ms, rows: 20 };
   } finally {
     child.kill();
   }
 }
 
+async function createDiscoveryFixture(home, count) {
+  const project = join(home, '.claude', 'projects', '-relayhistory-benchmark');
+  await mkdir(project, { recursive: true });
+  const baseTimestamp = Date.UTC(2026, 0, 1);
+  for (let index = 0; index < count; index++) {
+    const sessionId = `benchmark-${String(index).padStart(4, '0')}`;
+    const timestampMs = baseTimestamp + index * 1_000;
+    const timestamp = new Date(timestampMs).toISOString();
+    const path = join(project, `${sessionId}.jsonl`);
+    const records = [
+      { sessionId, cwd: '/benchmark/project', gitBranch: 'main', type: 'user', message: { role: 'user', content: `benchmark prompt ${index}` }, timestamp },
+      { sessionId, type: 'assistant', message: { role: 'assistant', model: 'benchmark-model', content: `benchmark response ${index}` }, timestamp },
+    ];
+    await writeFile(path, `${records.map((record) => JSON.stringify(record)).join('\n')}\n`, 'utf8');
+    await utimes(path, timestampMs / 1_000, timestampMs / 1_000);
+  }
+}
+
+async function withHome(home, operation) {
+  const previousHome = process.env.HOME;
+  const previousProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    return await operation();
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousProfile;
+  }
+}
+
+async function discoverFixture(home, benchmarkDbPath, limit) {
+  return withHome(home, () => discoverSessions({
+    dbPath: benchmarkDbPath, sources: ['claude'], limit,
+  }));
+}
+
+async function changeDiscoveredSessions(sessions) {
+  const timestamp = new Date().toISOString();
+  const originals = [];
+  for (const session of sessions) {
+    if (!session.rawPath) continue;
+    const metadata = await stat(session.rawPath);
+    originals.push({
+      path: session.rawPath,
+      contents: await readFile(session.rawPath),
+      accessedAt: metadata.atime,
+      modifiedAt: metadata.mtime,
+    });
+    const record = {
+      sessionId: session.sessionId,
+      type: 'assistant',
+      message: { role: 'assistant', model: 'benchmark-model', content: 'changed benchmark response' },
+      timestamp,
+    };
+    await appendFile(session.rawPath, `${JSON.stringify(record)}\n`, 'utf8');
+  }
+  return originals;
+}
+
+async function restoreFixtureSessions(originals) {
+  for (const original of originals) {
+    await writeFile(original.path, original.contents);
+    await utimes(original.path, original.accessedAt, original.modifiedAt);
+  }
+}
+
 const info = await stat(dbPath);
 const results = [];
-await listSessionCatalogPage({ dbPath, limit: 20 }); // initialize addon and warm OS cache
-for (const limit of [20, 100]) {
-  const measurement = await timed(`warm catalog ${limit}`, () => listSessionCatalogPage({ dbPath, limit }));
-  results.push({ name: measurement.name, ms: measurement.ms, rows: measurement.value.sessions.length });
-}
-
-const firstPage = await listSessionCatalogPage({ dbPath, limit: 20 });
-const candidate = firstPage.sessions.find((session) => session.discoveryState === 'full') ?? firstPage.sessions[0];
-if (candidate) {
-  const measurement = await timed('event page 200', () => getSessionEventsPage(candidate.sessionId, {
-    dbPath, source: candidate.source, limit: 200,
-  }));
-  results.push({ name: measurement.name, ms: measurement.ms, rows: measurement.value.events.length });
-}
-
 const temporary = await mkdtemp(join(tmpdir(), 'relayhistory-benchmark-'));
 try {
-  const discoveryOptions = { dbPath: join(temporary, 'history.db'), sources: ['claude', 'codex'], limit: discoveryLimit };
-  const first = await timed(`first shallow discovery ${discoveryLimit}`, () => discoverSessions(discoveryOptions));
-  results.push({ name: first.name, ms: first.ms, rows: first.value.sessions.length, counters: first.value.counters });
-  const unchanged = await timed(`unchanged shallow discovery ${discoveryLimit}`, () => discoverSessions(discoveryOptions));
-  results.push({ name: unchanged.name, ms: unchanged.ms, rows: unchanged.value.sessions.length, counters: unchanged.value.counters });
+  const fixtureHome = join(temporary, 'home');
+  await createDiscoveryFixture(fixtureHome, Math.max(...discoveryLimits));
+
+  const coldResults = [];
+  const unchangedResults = [];
+  const changedResults = [];
+  for (const limit of discoveryLimits) {
+    const coldDb = join(temporary, `cold-${limit}.db`);
+    const cold = await timed(`cold shallow discovery ${limit}`, () => discoverFixture(fixtureHome, coldDb, limit));
+    coldResults.push({ name: cold.name, ms: cold.ms, rows: cold.value.sessions.length, counters: cold.value.counters });
+
+    const unchangedDb = join(temporary, `unchanged-${limit}.db`);
+    await discoverFixture(fixtureHome, unchangedDb, limit);
+    const unchanged = await timed(`unchanged shallow discovery ${limit}`, () => discoverFixture(fixtureHome, unchangedDb, limit));
+    unchangedResults.push({ name: unchanged.name, ms: unchanged.ms, rows: unchanged.value.sessions.length, counters: unchanged.value.counters });
+
+    const changedDb = join(temporary, `changed-${limit}.db`);
+    const seeded = await discoverFixture(fixtureHome, changedDb, limit);
+    const originals = await changeDiscoveredSessions(seeded.sessions);
+    try {
+      const changed = await timed(`cold->changed shallow discovery ${limit}`, () => discoverFixture(fixtureHome, changedDb, limit));
+      changedResults.push({ name: changed.name, ms: changed.ms, rows: changed.value.sessions.length, counters: changed.value.counters });
+    } finally {
+      await restoreFixtureSessions(originals);
+    }
+  }
+  results.push(...coldResults, ...unchangedResults, ...changedResults);
+
+  const firstPage = await listSessionCatalogPage({ dbPath, limit: 20 });
+  const candidate = firstPage.sessions.find((session) => session.discoveryState === 'full') ?? firstPage.sessions[0];
+  if (!candidate) throw new Error(`No session is available in ${dbPath} for the event benchmarks`);
+  await getSessionEventsPage(candidate.sessionId, { dbPath, source: candidate.source, limit: 200 });
+  for (const limit of [20, 200]) {
+    const events = await timed(`warm session events ${limit}`, () => getSessionEventsPage(candidate.sessionId, {
+      dbPath, source: candidate.source, limit,
+    }));
+    results.push({ name: events.name, ms: events.ms, rows: events.value.events.length });
+  }
+
+  const cliDb = join(temporary, 'cli-cold.db');
+  const cli = await timed('CLI startup + cold shallow discovery 20', () => execFileAsync(process.execPath, [
+    join(repositoryRoot, 'sdk-ts/dist/cli.js'), 'sessions', 'discover', '--source', 'claude',
+    '--db', cliDb, '--limit', '20', '--json',
+  ], {
+    env: { ...process.env, HOME: fixtureHome, USERPROFILE: fixtureHome },
+    maxBuffer: 10 * 1024 * 1024,
+  }));
+  results.push({ name: cli.name, ms: cli.ms, rows: JSON.parse(cli.value.stdout).sessions.length });
+
+  results.push(await mcpColdDiscovery(fixtureHome, join(temporary, 'mcp-cold.db')));
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }
-
-const cli = await timed('CLI startup + catalog 20', () => execFileAsync(process.execPath, [
-  join(repositoryRoot, 'sdk-ts/dist/cli.js'), 'sessions', 'list', '--db', dbPath, '--limit', '20', '--json',
-], { maxBuffer: 10 * 1024 * 1024 }));
-results.push({ name: cli.name, ms: cli.ms, rows: JSON.parse(cli.value.stdout).sessions.length });
-results.push({ name: 'MCP list_sessions 20', ms: await mcpList(), rows: 20 });
 
 const report = {
   generatedAt: new Date().toISOString(),
