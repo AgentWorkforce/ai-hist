@@ -13,6 +13,15 @@ Write the report to a file with:
 npm run benchmark -- --output=foo.md
 ```
 
+Show a compact terminal table with only the benchmark name and milliseconds:
+
+```bash
+npm run benchmark -- --pretty
+```
+
+`--pretty` can be combined with `--output` to save the full report while
+showing the compact table in the terminal.
+
 The output format follows the extension: `.md` writes a Markdown report and
 any other extension writes JSON. Omit `--output` to print JSON to stdout. npm
 requires the `--` separator before benchmark-specific options.

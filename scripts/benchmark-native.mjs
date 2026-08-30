@@ -23,9 +23,16 @@ function option(name) {
   return process.env[`npm_config_${name.replaceAll('-', '_')}`];
 }
 
+function flag(name) {
+  if (process.argv.includes(`--${name}`)) return true;
+  const value = process.env[`npm_config_${name.replaceAll('-', '_')}`]?.toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes';
+}
+
 const dbPath = resolve(option('db') || process.env.AI_HIST_DB || defaultDbPath());
 const outputOption = option('output');
 const outputPath = outputOption ? resolve(invocationDirectory, outputOption) : null;
+const pretty = flag('pretty');
 const discoveryLimit = Number(option('discovery-limit') || 100);
 if (!Number.isInteger(discoveryLimit) || discoveryLimit < 1) {
   throw new Error('--discovery-limit must be a positive integer');
@@ -157,13 +164,29 @@ function markdown(value) {
   return lines.join('\n');
 }
 
+function prettyTable(value) {
+  const rows = value.results.map((result) => ({ name: result.name, ms: result.ms.toFixed(2) }));
+  const nameWidth = Math.max('name'.length, ...rows.map((row) => row.name.length));
+  const millisecondsWidth = Math.max('ms'.length, ...rows.map((row) => row.ms.length));
+  return [
+    `${'name'.padEnd(nameWidth)} | ${'ms'.padStart(millisecondsWidth)}`,
+    `${'-'.repeat(nameWidth)}-+-${'-'.repeat(millisecondsWidth)}`,
+    ...rows.map((row) => `${row.name.padEnd(nameWidth)} | ${row.ms.padStart(millisecondsWidth)}`),
+    '',
+  ].join('\n');
+}
+
 const rendered = outputPath && extname(outputPath).toLowerCase() === '.md'
   ? markdown(report)
   : `${JSON.stringify(report, null, 2)}\n`;
 
 if (outputPath) {
   await writeFile(outputPath, rendered, 'utf8');
-  console.log(`RelayHistory benchmark written to ${outputPath}`);
-} else {
+  if (!pretty) console.log(`RelayHistory benchmark written to ${outputPath}`);
+}
+
+if (pretty) {
+  process.stdout.write(prettyTable(report));
+} else if (!outputPath) {
   process.stdout.write(rendered);
 }
