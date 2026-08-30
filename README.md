@@ -33,6 +33,18 @@ ai-hist sessions list --limit 100
 No Rust toolchain, C/C++ compiler, standalone CLI, curl installer, or runtime
 binary download is used.
 
+### Checking your version
+
+`ai-hist --version` prints the installed npm package version. In an interactive
+terminal it also checks npm for a newer release, with a three-second timeout and
+silent offline fallback. Suppress the notice with `--no-warning` or
+`RELAYHISTORY_NO_UPDATE_CHECK=1`:
+
+```bash
+ai-hist --version
+ai-hist --version --no-warning
+```
+
 ## TypeScript
 
 ```ts

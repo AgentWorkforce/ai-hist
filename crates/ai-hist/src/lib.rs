@@ -649,7 +649,7 @@ enum SetupAction {
 
 #[derive(Subcommand)]
 enum LinkAction {
-    /// Link the most recent matching session to a git commit and optional git note.
+    /// Link the best matching session to a git commit and optional git note.
     Commit {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
@@ -3042,12 +3042,6 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Translate a desired interval (seconds) into a cron schedule expression plus a
-/// human cadence. cron's finest granularity is one minute. When an interval
-/// isn't exactly expressible we round toward a *less* frequent cadence, never
-/// more — a scheduled cloud push should never fire more often than the user
-/// asked. Intervals of a day or longer collapse to a daily run (the coarsest
-/// simple cron cadence).
 /// Smallest divisor of `base` that is `>= n`. Using a divisor keeps a `*/step`
 /// cron field uniform — a non-divisor step (e.g. `*/45`) fires a short interval
 /// at the field's rollover (`:00, :45, :00` → a 15-minute gap).

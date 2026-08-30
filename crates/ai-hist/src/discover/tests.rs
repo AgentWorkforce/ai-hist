@@ -848,7 +848,7 @@ fn the_limit_is_global_not_per_provider() {
     let conn = catalog();
     let home = tempfile::tempdir().unwrap();
     // Two providers, three sessions each, interleaved in time. The three
-    // newest overall are two claude sessions and one codex session.
+    // newest overall are two codex sessions and one claude session.
     for (index, id) in ["claude-a", "claude-b", "claude-c"].iter().enumerate() {
         let body = CLAUDE_BODY.replace("claude-1", id);
         claude_session(

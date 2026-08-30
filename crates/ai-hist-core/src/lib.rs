@@ -549,8 +549,9 @@ CREATE TABLE IF NOT EXISTS sessions (
         "CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_activity_ms DESC)",
         [],
     )?;
-    // Source-filtered catalog listing (`sessions list --source codex`) orders by
-    // recency inside one source; without this the planner sorts the whole table.
+    // Recency inside one source. Superseded for the source-filtered catalog
+    // listing (`sessions list --source codex`) by `idx_sessions_source_recency`
+    // below, which carries that listing's whole ORDER BY.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sessions_source_last ON sessions(source, last_activity_ms DESC)",
         [],

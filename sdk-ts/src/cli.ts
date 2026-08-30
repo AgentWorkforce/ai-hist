@@ -1,11 +1,56 @@
 #!/usr/bin/env node
 
+import { readFile } from 'node:fs/promises';
+
 import {
   discoverSessions, getSession, getSessionEventsPage, listSessionCatalogPage,
   recent, search, stats, sync, type CatalogCursor,
 } from './index.js';
 
 type Parsed = { positional: string[]; flags: Map<string, string | true> };
+
+type PackageMetadata = { version?: string };
+
+function versionTriple(value: string): [number, number, number] | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(value);
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+}
+
+function newerVersion(current: string, latest: string): boolean {
+  const left = versionTriple(current);
+  const right = versionTriple(latest);
+  if (!left || !right) return false;
+  for (let index = 0; index < left.length; index++) {
+    if (right[index] !== left[index]) return right[index] > left[index];
+  }
+  return false;
+}
+
+async function packageVersion(): Promise<string> {
+  const contents = await readFile(new URL('../package.json', import.meta.url), 'utf8');
+  return (JSON.parse(contents) as PackageMetadata).version ?? 'unknown';
+}
+
+async function maybePrintUpdateNotice(current: string, args: string[]): Promise<void> {
+  const optOut = process.env.RELAYHISTORY_NO_UPDATE_CHECK;
+  if (!process.stderr.isTTY || args.includes('--no-warning') || (optOut && optOut !== '0')) return;
+  try {
+    const response = await fetch('https://registry.npmjs.org/ai-hist/latest', {
+      signal: AbortSignal.timeout(3_000),
+      headers: { accept: 'application/json' },
+    });
+    if (!response.ok) return;
+    const latest = (await response.json()) as PackageMetadata;
+    if (!latest.version || !newerVersion(current, latest.version)) return;
+    process.stderr.write(
+      `\nA new version of ai-hist is available: ${current} -> ${latest.version}\n` +
+      'Update with:\n  npm install --global ai-hist@latest\n' +
+      '(pass --no-warning or set RELAYHISTORY_NO_UPDATE_CHECK=1 to hide this notice)\n',
+    );
+  } catch {
+    // Version checks are best-effort; --version stays useful while offline.
+  }
+}
 
 function parse(argv: string[]): Parsed {
   const positional: string[] = [];
@@ -71,7 +116,14 @@ function cursorFlag<T>(args: Parsed): T | undefined {
 }
 
 async function main(): Promise<void> {
-  const args = parse(process.argv.slice(2));
+  const rawArgs = process.argv.slice(2);
+  if (rawArgs.includes('--version') || rawArgs.includes('-V')) {
+    const version = await packageVersion();
+    process.stdout.write(`ai-hist ${version}\n`);
+    await maybePrintUpdateNotice(version, rawArgs);
+    return;
+  }
+  const args = parse(rawArgs);
   const [command, subcommand, ...rest] = args.positional;
   const json = args.flags.has('json');
 

@@ -33,6 +33,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
   databases migrate in place on the next open.
 - Expose `listSessions` and `discoverSessions` from the napi binding, so a Node
   host can drive the catalog in-process instead of shelling out.
+- The npm-installed `ai-hist --version` reports the SDK package version and can
+  notify interactive users when a newer npm release exists. The best-effort
+  check has a 3-second timeout and is suppressed with `--no-warning` or
+  `RELAYHISTORY_NO_UPDATE_CHECK=1`.
 
 ### Breaking
 
