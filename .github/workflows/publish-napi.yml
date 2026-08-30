@@ -137,11 +137,12 @@ jobs:
         run: npx napi create-npm-dir -t . && npx napi artifacts --dir artifacts
       # npm >= 11.5 is required for the OIDC trusted-publisher flow (the runner's
       # bundled npm 10.x can't mint OIDC tokens, so publish fails unauthenticated).
-      # Pinned to the 11.x major: npm@latest (12+) raised its Node engine floor
-      # above the Node this workflow pins, breaking the publish (EBADENGINE).
+      # Pinned to an exact version: npm@latest (12+) raised its Node engine floor
+      # above the Node this workflow pins, breaking the publish (EBADENGINE), and
+      # an exact pin keeps publishes reproducible.
       - name: Upgrade npm for OIDC
         if: ${{ !inputs.dry_run }}
-        run: npm install -g npm@11
+        run: npm install -g npm@11.19.1
       - name: Publish
         env:
           DRY_RUN: ${{ inputs.dry_run }}

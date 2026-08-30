@@ -355,10 +355,11 @@ jobs:
           fi
 
       # npm >= 11.5.1 is required for the OIDC trusted-publisher flow. Pinned to
-      # the 11.x major: npm@latest (12+) raised its Node engine floor above the
-      # Node this workflow pins, so chasing latest breaks the publish (EBADENGINE).
+      # an exact version: npm@latest (12+) raised its Node engine floor above the
+      # Node this workflow pins, so chasing latest breaks the publish (EBADENGINE),
+      # and an exact pin keeps publishes reproducible.
       - name: Install npm 11
-        run: npm install -g npm@11
+        run: npm install -g npm@11.19.1
 
       # Authentication note: this workflow does NOT use an NPM_TOKEN. It relies
       # on npm's OIDC trusted-publisher flow — the `id-token: write` permission
