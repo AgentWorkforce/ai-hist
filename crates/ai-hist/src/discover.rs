@@ -44,14 +44,20 @@
 //! so a concurrent `ai-hist sync` and a concurrent `discover` converge: the
 //! full-sync path only ever upgrades a row to `discovery_state = 'full'`, and
 //! the shallow path never downgrades one. Writes go through the normal
-//! busy-retry connection.
+//! busy-retry connection, batched into one short transaction per read window
+//! so a run of fresh rows costs one commit, not hundreds.
+//!
+//! Within a run, shallow reads of file-backed providers fan out across worker
+//! threads (see [`ScanEnv`]). The candidate walk, the emission order, and the
+//! set of sources read are identical to a serial run — parallelism changes
+//! wall-clock time, never observable behaviour.
 
-use std::cell::Cell;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use ai_hist_core::SOURCE_CHOICES;
@@ -185,6 +191,29 @@ pub struct DiscoveryCounters {
     pub bytes_read: u64,
 }
 
+/// Thread-safe accumulator behind [`DiscoveryCounters`], shared with the read
+/// workers a run fans out.
+#[derive(Default)]
+struct CounterCell {
+    candidates_enumerated: AtomicU64,
+    shallow_reads: AtomicU64,
+    skipped_unchanged: AtomicU64,
+    files_opened: AtomicU64,
+    bytes_read: AtomicU64,
+}
+
+impl CounterCell {
+    fn snapshot(&self) -> DiscoveryCounters {
+        DiscoveryCounters {
+            candidates_enumerated: self.candidates_enumerated.load(Ordering::Relaxed),
+            shallow_reads: self.shallow_reads.load(Ordering::Relaxed),
+            skipped_unchanged: self.skipped_unchanged.load(Ordering::Relaxed),
+            files_opened: self.files_opened.load(Ordering::Relaxed),
+            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Environment one discovery run operates in: where the provider data lives,
 /// the catalog connection, and the run's counters.
 pub struct DiscoveryEnv<'a> {
@@ -193,7 +222,7 @@ pub struct DiscoveryEnv<'a> {
     /// Path to the opencode database.
     pub opencode_db: PathBuf,
     conn: &'a Connection,
-    counters: Cell<DiscoveryCounters>,
+    counters: CounterCell,
 }
 
 impl<'a> DiscoveryEnv<'a> {
@@ -203,7 +232,7 @@ impl<'a> DiscoveryEnv<'a> {
             home: crate::home_dir(),
             opencode_db: crate::default_opencode_db_path(),
             conn,
-            counters: Cell::new(DiscoveryCounters::default()),
+            counters: CounterCell::default(),
         }
     }
 
@@ -215,7 +244,7 @@ impl<'a> DiscoveryEnv<'a> {
             home,
             opencode_db,
             conn,
-            counters: Cell::new(DiscoveryCounters::default()),
+            counters: CounterCell::default(),
         }
     }
 
@@ -225,40 +254,71 @@ impl<'a> DiscoveryEnv<'a> {
         self.conn
     }
 
+    /// The thread-shareable slice of this environment: provider roots plus
+    /// the run's counters, without the catalog connection. What a shallow
+    /// read receives, on whatever thread it runs.
+    pub fn scan(&self) -> ScanEnv<'_> {
+        ScanEnv {
+            home: &self.home,
+            opencode_db: &self.opencode_db,
+            counters: &self.counters,
+        }
+    }
+
     /// Counters accumulated so far.
     pub fn counters(&self) -> DiscoveryCounters {
-        self.counters.get()
-    }
-
-    fn note_open(&self) {
-        let mut counters = self.counters.get();
-        counters.files_opened += 1;
-        self.counters.set(counters);
-    }
-
-    fn note_bytes(&self, bytes: u64) {
-        let mut counters = self.counters.get();
-        counters.bytes_read += bytes;
-        self.counters.set(counters);
+        self.counters.snapshot()
     }
 
     fn note_candidates(&self, count: u64) {
-        let mut counters = self.counters.get();
-        counters.candidates_enumerated += count;
-        self.counters.set(counters);
+        self.counters
+            .candidates_enumerated
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     fn note_shallow_read(&self) {
-        let mut counters = self.counters.get();
-        counters.shallow_reads += 1;
-        self.counters.set(counters);
+        self.counters.shallow_reads.fetch_add(1, Ordering::Relaxed);
     }
 
     fn note_skipped(&self) {
-        let mut counters = self.counters.get();
-        counters.skipped_unchanged += 1;
-        self.counters.set(counters);
+        self.counters
+            .skipped_unchanged
+            .fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// What a shallow read is allowed to touch: the provider roots and the run's
+/// counters, never the catalog connection. `Sync`, so the engine can fan
+/// bounded reads out across worker threads.
+#[derive(Clone, Copy)]
+pub struct ScanEnv<'a> {
+    /// Home directory the file-backed providers are rooted at.
+    pub home: &'a Path,
+    /// Path to the opencode database.
+    pub opencode_db: &'a Path,
+    counters: &'a CounterCell,
+}
+
+impl ScanEnv<'_> {
+    fn note_open(&self) {
+        self.counters.files_opened.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_bytes(&self, bytes: u64) {
+        self.counters.bytes_read.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// What a provider's [`read_shallow`](ShallowSessionProvider::read_shallow)
+/// needs access to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShallowReadAccess {
+    /// Provider files (and provider-owned databases) only. The engine may run
+    /// these reads on worker threads, several at a time.
+    Filesystem,
+    /// The RelayHistory catalog connection. These reads run serially on the
+    /// engine thread with `catalog` present.
+    Catalog,
 }
 
 /// One provider's shallow adapter.
@@ -269,15 +329,24 @@ impl<'a> DiscoveryEnv<'a> {
 /// source. Returning `Ok(None)` from `read_shallow` means "this candidate is
 /// not a session" (a codex subagent thread, a file with no usable metadata) —
 /// it is not an error.
-pub trait ShallowSessionProvider {
+pub trait ShallowSessionProvider: Sync {
     /// The `SOURCE_CHOICES` name this adapter covers.
     fn source(&self) -> &'static str;
     /// Cheap enumeration: directory walk + stat, or one indexed query.
     fn enumerate(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>>;
+    /// What [`read_shallow`](ShallowSessionProvider::read_shallow) touches.
+    fn read_access(&self) -> ShallowReadAccess {
+        ShallowReadAccess::Filesystem
+    }
     /// Bounded read of one candidate into a catalog row.
+    ///
+    /// Runs on a worker thread with `catalog` absent, unless the provider
+    /// declares [`ShallowReadAccess::Catalog`] — then it runs on the engine
+    /// thread and `catalog` is always present.
     fn read_shallow(
         &self,
-        env: &DiscoveryEnv<'_>,
+        scan: &ScanEnv<'_>,
+        catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>>;
 }
@@ -318,30 +387,92 @@ pub fn shallow_providers() -> Vec<Box<dyn ShallowSessionProvider>> {
 // bounded reads
 // ---------------------------------------------------------------------------
 
-/// The complete JSONL records a bounded read recovered from one file.
+/// The bounded byte regions a read recovered from one file, exposed as lazy
+/// line iterators so a scanner that finds what it needs early never pays to
+/// parse the rest.
 ///
-/// Only newline-terminated records are returned, matching the project's
+/// Only newline-terminated records are visible, matching the project's
 /// incomplete-record convention: a transcript being written right now has a
 /// partial trailing line, and that line is not yet a record.
 struct BoundedJsonl {
-    head: Vec<String>,
-    tail: Vec<String>,
+    /// Complete-line region from the start of the file — the whole file when
+    /// it fits the head budget.
+    head: Vec<u8>,
+    /// Complete-line region ending at the last complete record, for a file
+    /// past the head budget. Empty when `head` reaches end of file and serves
+    /// as its own tail.
+    tail: Vec<u8>,
 }
 
-fn complete_lines(buffer: &[u8], drop_leading_fragment: bool) -> Vec<String> {
-    let text = String::from_utf8_lossy(buffer);
-    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
-    if lines.last().is_some_and(|line| !line.ends_with('\n')) {
-        lines.pop();
+/// Truncate a freshly read buffer to its final newline, dropping a partial
+/// trailing record.
+fn keep_complete_lines(buffer: &mut Vec<u8>) {
+    match buffer.iter().rposition(|&byte| byte == b'\n') {
+        Some(last_newline) => buffer.truncate(last_newline + 1),
+        None => buffer.clear(),
     }
-    if drop_leading_fragment && !lines.is_empty() {
-        lines.remove(0);
+}
+
+fn trimmed_record(line: &[u8]) -> Option<&[u8]> {
+    let mut line = line;
+    while let [rest @ .., last] = line {
+        if last.is_ascii_whitespace() {
+            line = rest;
+        } else {
+            break;
+        }
     }
-    lines
-        .into_iter()
-        .map(|line| line.trim_end_matches(['\n', '\r']).to_string())
-        .filter(|line| !line.trim().is_empty())
-        .collect()
+    while let [first, rest @ ..] = line {
+        if first.is_ascii_whitespace() {
+            line = rest;
+        } else {
+            break;
+        }
+    }
+    (!line.is_empty()).then_some(line)
+}
+
+/// Non-empty complete records, oldest first.
+fn records(buffer: &[u8]) -> impl Iterator<Item = &[u8]> {
+    buffer
+        .split(|&byte| byte == b'\n')
+        .filter_map(trimmed_record)
+}
+
+/// Non-empty complete records, newest first.
+fn records_rev(buffer: &[u8]) -> impl Iterator<Item = &[u8]> {
+    buffer
+        .rsplit(|&byte| byte == b'\n')
+        .filter_map(trimmed_record)
+}
+
+impl BoundedJsonl {
+    /// Records from the start of the file, oldest first, capped at
+    /// [`HEAD_SCAN_MAX_LINES`].
+    fn head_records(&self) -> impl Iterator<Item = &[u8]> {
+        records(&self.head).take(HEAD_SCAN_MAX_LINES)
+    }
+
+    /// Records from the end of the file, newest first. For a file inside the
+    /// head budget this walks the head region backwards, so every record —
+    /// including ones past the head line cap — is reachable.
+    fn tail_records_rev(&self) -> impl Iterator<Item = &[u8]> {
+        let region = if self.tail.is_empty() {
+            &self.head
+        } else {
+            &self.tail
+        };
+        records_rev(region)
+    }
+}
+
+/// Parse one record. Falls back through a lossy decode so a record holding
+/// invalid UTF-8 inside its strings still parses, as it always has.
+fn parse_record(line: &[u8]) -> Option<Value> {
+    serde_json::from_slice(line).ok().or_else(|| {
+        let text = String::from_utf8_lossy(line);
+        serde_json::from_str(&text).ok()
+    })
 }
 
 /// Read the head (and, for a large file, the tail) of a JSONL transcript
@@ -349,51 +480,51 @@ fn complete_lines(buffer: &[u8], drop_leading_fragment: bool) -> Vec<String> {
 ///
 /// One file handle regardless of size. Files inside the head budget are read
 /// once and serve as their own tail.
-fn read_bounded_jsonl(env: &DiscoveryEnv<'_>, path: &Path) -> Result<BoundedJsonl> {
+fn read_bounded_jsonl(scan: &ScanEnv<'_>, path: &Path) -> Result<BoundedJsonl> {
     let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    env.note_open();
+    scan.note_open();
     let len = file.metadata()?.len();
     if len <= HEAD_SCAN_MAX_BYTES {
         let mut buffer = Vec::with_capacity(len as usize);
         file.read_to_end(&mut buffer)?;
-        env.note_bytes(buffer.len() as u64);
-        let mut lines = complete_lines(&buffer, false);
-        let tail = lines.clone();
-        lines.truncate(HEAD_SCAN_MAX_LINES);
-        return Ok(BoundedJsonl { head: lines, tail });
+        scan.note_bytes(buffer.len() as u64);
+        keep_complete_lines(&mut buffer);
+        return Ok(BoundedJsonl {
+            head: buffer,
+            tail: Vec::new(),
+        });
     }
-    let mut head_buffer = vec![0u8; HEAD_SCAN_MAX_BYTES as usize];
+    let mut head = vec![0u8; HEAD_SCAN_MAX_BYTES as usize];
     let mut filled = 0usize;
-    while filled < head_buffer.len() {
-        let read = file.read(&mut head_buffer[filled..])?;
+    while filled < head.len() {
+        let read = file.read(&mut head[filled..])?;
         if read == 0 {
             break;
         }
         filled += read;
     }
-    head_buffer.truncate(filled);
-    env.note_bytes(filled as u64);
-    let mut head = complete_lines(&head_buffer, false);
-    head.truncate(HEAD_SCAN_MAX_LINES);
+    head.truncate(filled);
+    scan.note_bytes(filled as u64);
+    keep_complete_lines(&mut head);
 
     let tail_start = len.saturating_sub(TAIL_SCAN_MAX_BYTES);
     file.seek(SeekFrom::Start(tail_start))?;
-    let mut tail_buffer = Vec::with_capacity(TAIL_SCAN_MAX_BYTES as usize);
-    file.take(TAIL_SCAN_MAX_BYTES)
-        .read_to_end(&mut tail_buffer)?;
-    env.note_bytes(tail_buffer.len() as u64);
-    let tail = complete_lines(&tail_buffer, tail_start > 0);
+    let mut tail = Vec::with_capacity(TAIL_SCAN_MAX_BYTES as usize);
+    file.take(TAIL_SCAN_MAX_BYTES).read_to_end(&mut tail)?;
+    scan.note_bytes(tail.len() as u64);
+    // The seek landed mid-record; everything before the first newline is the
+    // torn remainder of a record the head may or may not hold.
+    if let Some(first_newline) = tail.iter().position(|&byte| byte == b'\n') {
+        tail.drain(..=first_newline);
+    } else {
+        tail.clear();
+    }
+    keep_complete_lines(&mut tail);
     Ok(BoundedJsonl { head, tail })
 }
 
 fn excerpt(text: &str) -> String {
     text.trim().chars().take(EXCERPT_MAX_CHARS).collect()
-}
-
-fn json_lines(lines: &[String]) -> impl Iterator<Item = Value> + '_ {
-    lines
-        .iter()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
 }
 
 /// A JSON array column value, or `None` when there is nothing observed to
@@ -488,17 +619,18 @@ impl ShallowSessionProvider for ClaudeProvider {
         file_candidates(
             "claude",
             crate::collect_matching_files(&env.home.join(".claude/projects"), "", "jsonl")?,
-            crate::file_stamp,
+            crate::file_stamp_and_modified,
         )
     }
 
     fn read_shallow(
         &self,
-        env: &DiscoveryEnv<'_>,
+        scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
         let path = PathBuf::from(&candidate.locator);
-        let bounded = read_bounded_jsonl(env, &path)?;
+        let bounded = read_bounded_jsonl(scan, &path)?;
         let mut session = ShallowSession {
             source: "claude".into(),
             raw_path: Some(candidate.locator.clone()),
@@ -511,10 +643,16 @@ impl ShallowSessionProvider for ClaudeProvider {
         // as a session would emit the parent twice per run and let the two
         // files fight over one row's raw_path/source_stamp, so the stamp never
         // matched again and one of them was re-read forever.
-        let mut identified_records = 0usize;
+        let mut primary_record_seen = false;
         let mut sidechain_records = 0usize;
+        let mut identified_records = 0usize;
         let mut parsed_records = 0usize;
-        for value in json_lines(&bounded.head) {
+        let mut head_records_seen = 0usize;
+        for line in bounded.head_records() {
+            head_records_seen += 1;
+            let Some(value) = parse_record(line) else {
+                continue;
+            };
             parsed_records += 1;
             if value
                 .get("sessionId")
@@ -524,6 +662,8 @@ impl ShallowSessionProvider for ClaudeProvider {
                 identified_records += 1;
                 if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
                     sidechain_records += 1;
+                } else {
+                    primary_record_seen = true;
                 }
             }
             if session_id.is_none() {
@@ -553,13 +693,41 @@ impl ShallowSessionProvider for ClaudeProvider {
             if session.first_prompt.is_none() {
                 session.first_prompt = claude_substantive_prompt(&value);
             }
-        }
-        for value in json_lines(&bounded.tail) {
-            if let Some(ts) = claude_timestamp(&value) {
-                session.last_activity_ms = Some(ts);
+            // Every observed field is settled, a model has been seen, and a
+            // primary record proves this is not a sidecar: nothing further in
+            // the head can change the row (additional models stay
+            // best-effort), so stop paying to parse it.
+            if primary_record_seen
+                && !models.is_empty()
+                && session.cwd.is_some()
+                && session.git_branch.is_some()
+                && session.agent_version.is_some()
+                && session.first_activity_ms.is_some()
+                && session.first_prompt.is_some()
+            {
+                break;
             }
-            if let Some(branch) = value.get("gitBranch").and_then(Value::as_str) {
-                session.git_branch = Some(branch.to_string());
+        }
+        let mut need_last_activity = true;
+        let mut need_branch = true;
+        for line in bounded.tail_records_rev() {
+            if !need_last_activity && !need_branch {
+                break;
+            }
+            let Some(value) = parse_record(line) else {
+                continue;
+            };
+            if need_last_activity {
+                if let Some(ts) = claude_timestamp(&value) {
+                    session.last_activity_ms = Some(ts);
+                    need_last_activity = false;
+                }
+            }
+            if need_branch {
+                if let Some(branch) = value.get("gitBranch").and_then(Value::as_str) {
+                    session.git_branch = Some(branch.to_string());
+                    need_branch = false;
+                }
             }
         }
         // Every identified record in the head belongs to a sidechain: this is a
@@ -576,9 +744,8 @@ impl ShallowSessionProvider for ClaudeProvider {
         // that has just started) and is simply not a session yet.
         if parsed_records == 0 {
             anyhow::ensure!(
-                bounded.head.is_empty(),
-                "no parseable JSON records in the first {} record(s)",
-                bounded.head.len()
+                head_records_seen == 0,
+                "no parseable JSON records in the first {head_records_seen} record(s)"
             );
             return Ok(None);
         }
@@ -615,19 +782,19 @@ impl ShallowSessionProvider for CodexProvider {
         ] {
             files.extend(crate::collect_matching_files(&root, "rollout-", "jsonl")?);
         }
-        file_candidates("codex", files, crate::file_stamp)
+        file_candidates("codex", files, crate::file_stamp_and_modified)
     }
 
     fn read_shallow(
         &self,
-        env: &DiscoveryEnv<'_>,
+        scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
         let path = PathBuf::from(&candidate.locator);
-        let bounded = read_bounded_jsonl(env, &path)?;
-        let Some(meta) = bounded.head.first().and_then(|line| {
-            serde_json::from_str::<Value>(line)
-                .ok()
+        let bounded = read_bounded_jsonl(scan, &path)?;
+        let Some(meta) = bounded.head_records().next().and_then(|line| {
+            parse_record(line)
                 .filter(|v| v.get("type").and_then(Value::as_str) == Some("session_meta"))
         }) else {
             return Ok(None);
@@ -669,7 +836,10 @@ impl ShallowSessionProvider for CodexProvider {
         let mut first_prompt = None;
         let mut first_activity_ms = claude_timestamp(&meta);
         let mut last_activity_ms = first_activity_ms;
-        for value in json_lines(&bounded.head) {
+        for line in bounded.head_records() {
+            let Some(value) = parse_record(line) else {
+                continue;
+            };
             if let Some(ts) = claude_timestamp(&value) {
                 first_activity_ms.get_or_insert(ts);
                 last_activity_ms = Some(ts);
@@ -683,10 +853,20 @@ impl ShallowSessionProvider for CodexProvider {
             if first_prompt.is_none() {
                 first_prompt = codex_substantive_prompt(&value);
             }
+            // The first prompt and first timestamp are settled; the tail owns
+            // the last timestamp and models stay best-effort, so nothing
+            // further in the head can change the row.
+            if first_prompt.is_some() && first_activity_ms.is_some() {
+                break;
+            }
         }
-        for value in json_lines(&bounded.tail) {
+        for line in bounded.tail_records_rev() {
+            let Some(value) = parse_record(line) else {
+                continue;
+            };
             if let Some(ts) = claude_timestamp(&value) {
                 last_activity_ms = Some(ts);
+                break;
             }
         }
         let mtime = crate::file_modified_ms(&path);
@@ -765,17 +945,14 @@ impl ShallowSessionProvider for CursorProvider {
                     continue;
                 };
                 let jsonl = session_dir.join(format!("{session_id}.jsonl"));
-                if !jsonl.is_file() {
-                    continue;
-                }
-                let Ok(stamp) = crate::file_stamp(&jsonl) else {
+                let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&jsonl) else {
                     continue;
                 };
                 out.push(Candidate {
                     source: "cursor",
                     locator: jsonl.to_string_lossy().into_owned(),
                     session_id: Some(session_id.to_string()),
-                    recency_hint_ms: crate::file_modified_ms(&jsonl),
+                    recency_hint_ms,
                     stamp,
                 });
             }
@@ -785,18 +962,21 @@ impl ShallowSessionProvider for CursorProvider {
 
     fn read_shallow(
         &self,
-        env: &DiscoveryEnv<'_>,
+        scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
         let path = PathBuf::from(&candidate.locator);
         let Some(session_id) = candidate.session_id.clone() else {
             return Ok(None);
         };
-        let bounded = read_bounded_jsonl(env, &path)?;
+        let bounded = read_bounded_jsonl(scan, &path)?;
         let first_prompt = bounded
-            .head
-            .iter()
-            .filter_map(|line| ai_hist_core::parse_cursor_text(line).ok().flatten())
+            .head_records()
+            .filter_map(|line| {
+                let line = String::from_utf8_lossy(line);
+                ai_hist_core::parse_cursor_text(&line).ok().flatten()
+            })
             .map(|prompt| excerpt(&prompt))
             .find(|prompt| !prompt.is_empty());
         let cwd = path
@@ -842,20 +1022,21 @@ impl ShallowSessionProvider for GrokProvider {
                 "chat_history",
                 "jsonl",
             )?,
-            crate::grok_session_stamp,
+            crate::grok_session_stamp_and_modified,
         )
     }
 
     fn read_shallow(
         &self,
-        env: &DiscoveryEnv<'_>,
+        scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
         let chat = PathBuf::from(&candidate.locator);
         let summary_path = chat.with_file_name("summary.json");
         let summary = if summary_path.is_file() {
-            env.note_open();
-            env.note_bytes(fs::metadata(&summary_path).map(|m| m.len()).unwrap_or(0));
+            scan.note_open();
+            scan.note_bytes(fs::metadata(&summary_path).map(|m| m.len()).unwrap_or(0));
             crate::read_grok_summary(&summary_path)
         } else {
             None
@@ -910,8 +1091,11 @@ impl ShallowSessionProvider for GrokProvider {
         );
         let mut first_prompt = None;
         if chat.is_file() {
-            let bounded = read_bounded_jsonl(env, &chat)?;
-            for value in json_lines(&bounded.head) {
+            let bounded = read_bounded_jsonl(scan, &chat)?;
+            for line in bounded.head_records() {
+                let Some(value) = parse_record(line) else {
+                    continue;
+                };
                 if let Some(text) = crate::grok_chat_text(&value, "user") {
                     first_prompt = Some(excerpt(&text));
                     break;
@@ -945,34 +1129,35 @@ impl ShallowSessionProvider for GrokProvider {
 /// never yields a torn read.
 #[derive(Default)]
 struct OpencodeProvider {
-    snapshot: RefCell<Option<tempfile::TempPath>>,
+    snapshot: Mutex<Option<tempfile::TempPath>>,
 }
 
 impl OpencodeProvider {
-    fn ensure_snapshot(&self, env: &DiscoveryEnv<'_>) -> Result<bool> {
-        if self.snapshot.borrow().is_some() {
+    fn ensure_snapshot(&self, scan: &ScanEnv<'_>) -> Result<bool> {
+        let mut guard = self.snapshot.lock().expect("opencode snapshot lock");
+        if guard.is_some() {
             return Ok(true);
         }
-        if !env.opencode_db.exists() {
+        if !scan.opencode_db.exists() {
             return Ok(false);
         }
         let tmp = tempfile::NamedTempFile::new()?.into_temp_path();
         let live = Connection::open_with_flags(
-            &env.opencode_db,
+            scan.opencode_db,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         )
-        .with_context(|| format!("opening {}", env.opencode_db.display()))?;
+        .with_context(|| format!("opening {}", scan.opencode_db.display()))?;
         live.busy_timeout(Duration::from_secs(5))?;
         live.backup(DatabaseName::Main, &tmp, None)
-            .with_context(|| format!("snapshotting {}", env.opencode_db.display()))?;
-        env.note_open();
-        env.note_bytes(fs::metadata(&env.opencode_db).map(|m| m.len()).unwrap_or(0));
-        *self.snapshot.borrow_mut() = Some(tmp);
+            .with_context(|| format!("snapshotting {}", scan.opencode_db.display()))?;
+        scan.note_open();
+        scan.note_bytes(fs::metadata(scan.opencode_db).map(|m| m.len()).unwrap_or(0));
+        *guard = Some(tmp);
         Ok(true)
     }
 
     fn open_snapshot(&self) -> Result<Connection> {
-        let guard = self.snapshot.borrow();
+        let guard = self.snapshot.lock().expect("opencode snapshot lock");
         let path = guard
             .as_ref()
             .context("opencode snapshot was not prepared")?;
@@ -995,7 +1180,7 @@ impl ShallowSessionProvider for OpencodeProvider {
     }
 
     fn enumerate(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
-        if !self.ensure_snapshot(env)? {
+        if !self.ensure_snapshot(&env.scan())? {
             return Ok(Vec::new());
         }
         let conn = self.open_snapshot()?;
@@ -1042,10 +1227,11 @@ impl ShallowSessionProvider for OpencodeProvider {
 
     fn read_shallow(
         &self,
-        env: &DiscoveryEnv<'_>,
+        scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
-        if !self.ensure_snapshot(env)? {
+        if !self.ensure_snapshot(scan)? {
             return Ok(None);
         }
         let conn = self.open_snapshot()?;
@@ -1163,19 +1349,24 @@ impl ShallowSessionProvider for RelayProvider {
             .collect())
     }
 
+    fn read_access(&self) -> ShallowReadAccess {
+        ShallowReadAccess::Catalog
+    }
+
     fn read_shallow(
         &self,
-        env: &DiscoveryEnv<'_>,
+        _scan: &ScanEnv<'_>,
+        catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
-        let bounds = env.conn().query_row(
+        let conn = catalog.context("relay shallow reads need the catalog connection")?;
+        let bounds = conn.query_row(
             "SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM history \
              WHERE source = 'relay' AND session_id = ?",
             [&candidate.locator],
             |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
         )?;
-        let first_prompt = env
-            .conn()
+        let first_prompt = conn
             .query_row(
                 "SELECT prompt FROM history WHERE source = 'relay' AND session_id = ? \
                  ORDER BY timestamp_ms ASC, id ASC LIMIT 1",
@@ -1200,21 +1391,27 @@ impl ShallowSessionProvider for RelayProvider {
 // shared enumeration helper
 // ---------------------------------------------------------------------------
 
+/// One stat's worth of enumeration facts: the change stamp and the recency
+/// hint in milliseconds.
+type StampAndRecency = (String, Option<i64>);
+
 fn file_candidates(
     source: &'static str,
     files: Vec<PathBuf>,
-    stamp: fn(&Path) -> Result<String>,
+    stamp: fn(&Path) -> Result<StampAndRecency>,
 ) -> Result<Vec<Candidate>> {
     let mut out = Vec::with_capacity(files.len());
     for path in files {
         // A file that vanished between the walk and the stat is not an error;
         // the next run will simply not see it.
-        let Ok(stamp) = stamp(&path) else { continue };
+        let Ok((stamp, recency_hint_ms)) = stamp(&path) else {
+            continue;
+        };
         out.push(Candidate {
             source,
             locator: path.to_string_lossy().into_owned(),
             session_id: None,
-            recency_hint_ms: crate::file_modified_ms(&path),
+            recency_hint_ms,
             stamp,
         });
     }
@@ -1737,56 +1934,176 @@ pub fn discover_sessions_with_env(
     // candidate list up front let a codex subagent thread or a claude sidecar
     // -- neither of which is a session -- eat a result slot, so `--limit 3`
     // could hand back two sessions while older valid ones went unread.
+    //
+    // Candidates are consumed in recency order through windows of potential
+    // emitters. Each window is classified serially against the catalog, its
+    // filesystem reads fan out across worker threads, and its writes land in
+    // one transaction — with rows still emitted strictly in candidate order.
+    // A window never holds more potential emitters than the limit has slots
+    // left, so the set of sources read is exactly what a serial walk reads.
     let limit = options.limit.unwrap_or(usize::MAX);
     let mut emitted = 0usize;
     // One session can be reached through more than one file in a single run
     // (a transcript plus its subagent sidecars). Emit it once.
     let mut emitted_sessions: BTreeSet<(String, String)> = BTreeSet::new();
+    let scan = env.scan();
+    let mut position = 0usize;
 
-    for candidate in &candidates {
-        if emitted >= limit {
-            break;
-        }
-        let Some(provider) = by_source.get(candidate.source) else {
-            continue;
-        };
-        let expected = stored_stamp(&candidate.stamp);
-        let cached = match candidate.session_id.as_deref() {
-            Some(session_id) => fetch_catalog_row(conn, candidate.source, session_id)?,
-            None => fetch_catalog_row_by_path(conn, candidate.source, &candidate.locator)?,
-        };
-        if let Some(cached) = cached.filter(|row| row.source_stamp.as_deref() == Some(&expected)) {
-            env.note_skipped();
-            summary.skipped_unchanged += 1;
-            if let Some(entry) = summary.providers.get_mut(candidate.source) {
-                entry.skipped_unchanged += 1;
-            }
-            if emitted_sessions.insert((cached.source.clone(), cached.session_id.clone())) {
-                emitted += 1;
-                on_row(&cached);
-            }
-            continue;
-        }
-        // A source already examined and found not to be a session (a codex
-        // subagent thread, a claude sidecar) is remembered by its stamp, so a
-        // rescan costs a PK lookup instead of a fresh read every single run.
-        if is_known_non_session(conn, candidate.source, &candidate.locator, &expected)? {
-            env.note_skipped();
-            summary.skipped_unchanged += 1;
-            if let Some(entry) = summary.providers.get_mut(candidate.source) {
-                entry.skipped_unchanged += 1;
-            }
-            continue;
-        }
-        env.note_shallow_read();
-        let read = provider.read_shallow(env, candidate);
-        let session = match read {
-            Ok(Some(session)) => session,
-            Ok(None) => {
-                record_non_session(conn, candidate.source, &candidate.locator, &expected)?;
+    while emitted < limit && position < candidates.len() {
+        let window_cap = (limit - emitted).min(MAX_READ_WINDOW);
+        let mut entries: Vec<WindowEntry<'_>> = Vec::new();
+        let mut potential = 0usize;
+        while position < candidates.len() && potential < window_cap {
+            let candidate = &candidates[position];
+            position += 1;
+            let Some(provider) = by_source.get(candidate.source) else {
+                continue;
+            };
+            let expected = stored_stamp(&candidate.stamp);
+            let cached = match candidate.session_id.as_deref() {
+                Some(session_id) => fetch_catalog_row(conn, candidate.source, session_id)?,
+                None => fetch_catalog_row_by_path(conn, candidate.source, &candidate.locator)?,
+            };
+            if let Some(cached) =
+                cached.filter(|row| row.source_stamp.as_deref() == Some(&expected))
+            {
+                env.note_skipped();
+                summary.skipped_unchanged += 1;
+                if let Some(entry) = summary.providers.get_mut(candidate.source) {
+                    entry.skipped_unchanged += 1;
+                }
+                potential += 1;
+                entries.push(WindowEntry::Cached(cached));
                 continue;
             }
-            Err(error) => {
+            // A source already examined and found not to be a session (a codex
+            // subagent thread, a claude sidecar) is remembered by its stamp, so a
+            // rescan costs a PK lookup instead of a fresh read every single run.
+            if is_known_non_session(conn, candidate.source, &candidate.locator, &expected)? {
+                env.note_skipped();
+                summary.skipped_unchanged += 1;
+                if let Some(entry) = summary.providers.get_mut(candidate.source) {
+                    entry.skipped_unchanged += 1;
+                }
+                continue;
+            }
+            env.note_shallow_read();
+            potential += 1;
+            entries.push(WindowEntry::Read {
+                candidate,
+                provider: *provider,
+                expected,
+                result: None,
+            });
+        }
+
+        let fs_reads: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                matches!(entry, WindowEntry::Read { provider, .. }
+                    if provider.read_access() == ShallowReadAccess::Filesystem)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(fs_reads.len())
+            .min(MAX_READ_WORKERS);
+        if workers > 1 {
+            let next = AtomicUsize::new(0);
+            let results = Mutex::new(Vec::with_capacity(fs_reads.len()));
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(|| loop {
+                        let slot = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&entry_index) = fs_reads.get(slot) else {
+                            break;
+                        };
+                        let WindowEntry::Read {
+                            candidate,
+                            provider,
+                            ..
+                        } = &entries[entry_index]
+                        else {
+                            continue;
+                        };
+                        let outcome = provider.read_shallow(&scan, None, candidate);
+                        results
+                            .lock()
+                            .expect("window read results")
+                            .push((entry_index, outcome));
+                    });
+                }
+            });
+            for (entry_index, outcome) in results.into_inner().expect("window read results") {
+                if let WindowEntry::Read { result, .. } = &mut entries[entry_index] {
+                    *result = Some(outcome);
+                }
+            }
+        }
+
+        // Writes for the whole window share one transaction; a fresh archive
+        // costs one commit per window instead of one per row. An error inside
+        // the window still commits the rows that landed before it — exactly
+        // as durable as when every write stood alone.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let mut window_error: Option<anyhow::Error> = None;
+        'apply: for entry in entries {
+            let (candidate, provider, expected, result) = match entry {
+                WindowEntry::Cached(row) => {
+                    if emitted_sessions.insert((row.source.clone(), row.session_id.clone())) {
+                        emitted += 1;
+                        on_row(&row);
+                    }
+                    continue;
+                }
+                WindowEntry::Read {
+                    candidate,
+                    provider,
+                    expected,
+                    result,
+                } => (candidate, provider, expected, result),
+            };
+            let read = match result {
+                Some(read) => read,
+                // Catalog-backed providers (and a window with nothing worth
+                // fanning out) read here, serially, with the connection.
+                None => provider.read_shallow(&scan, Some(conn), candidate),
+            };
+            let session = match read {
+                Ok(Some(session)) => session,
+                Ok(None) => {
+                    if let Err(error) =
+                        record_non_session(conn, candidate.source, &candidate.locator, &expected)
+                    {
+                        window_error = Some(error);
+                        break 'apply;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    summary.diagnostics.push(DiscoveryDiagnostic {
+                        source: candidate.source.to_string(),
+                        locator: Some(candidate.locator.clone()),
+                        error: format!("{error:#}"),
+                    });
+                    continue;
+                }
+            };
+            if session.session_id.is_empty() {
+                summary.diagnostics.push(DiscoveryDiagnostic {
+                    source: candidate.source.to_string(),
+                    locator: Some(candidate.locator.clone()),
+                    error: "no session id in source".to_string(),
+                });
+                continue;
+            }
+            let mut session = session;
+            session.source_stamp = Some(expected);
+            session.discovery_state = "shallow".to_string();
+            if let Err(error) = upsert_shallow_session(conn, &session) {
                 summary.diagnostics.push(DiscoveryDiagnostic {
                     source: candidate.source.to_string(),
                     locator: Some(candidate.locator.clone()),
@@ -1794,49 +2111,63 @@ pub fn discover_sessions_with_env(
                 });
                 continue;
             }
-        };
-        if session.session_id.is_empty() {
-            summary.diagnostics.push(DiscoveryDiagnostic {
-                source: candidate.source.to_string(),
-                locator: Some(candidate.locator.clone()),
-                error: "no session id in source".to_string(),
-            });
-            continue;
+            // A file that used to be skipped as a non-session (or was never one)
+            // must not keep a stale marker once it resolves to a session.
+            if let Err(error) = clear_non_session(conn, candidate.source, &candidate.locator) {
+                window_error = Some(error);
+                break 'apply;
+            }
+            // Emit the merged catalog row, so what a caller sees is exactly what
+            // the catalog now holds (including a preserved `full` state).
+            let row = match fetch_catalog_row(conn, &session.source, &session.session_id) {
+                Ok(row) => row
+                    .map(|mut row| {
+                        row.from_cache = false;
+                        row
+                    })
+                    .unwrap_or(session),
+                Err(error) => {
+                    window_error = Some(error);
+                    break 'apply;
+                }
+            };
+            summary.discovered += 1;
+            if let Some(entry) = summary.providers.get_mut(candidate.source) {
+                entry.discovered += 1;
+            }
+            if emitted_sessions.insert((row.source.clone(), row.session_id.clone())) {
+                emitted += 1;
+                on_row(&row);
+            }
         }
-        let mut session = session;
-        session.source_stamp = Some(expected);
-        session.discovery_state = "shallow".to_string();
-        if let Err(error) = upsert_shallow_session(conn, &session) {
-            summary.diagnostics.push(DiscoveryDiagnostic {
-                source: candidate.source.to_string(),
-                locator: Some(candidate.locator.clone()),
-                error: format!("{error:#}"),
-            });
-            continue;
+        let commit = conn.execute_batch("COMMIT");
+        if let Some(error) = window_error {
+            return Err(error);
         }
-        // A file that used to be skipped as a non-session (or was never one)
-        // must not keep a stale marker once it resolves to a session.
-        clear_non_session(conn, candidate.source, &candidate.locator)?;
-        // Emit the merged catalog row, so what a caller sees is exactly what
-        // the catalog now holds (including a preserved `full` state).
-        let row = fetch_catalog_row(conn, &session.source, &session.session_id)?
-            .map(|mut row| {
-                row.from_cache = false;
-                row
-            })
-            .unwrap_or(session);
-        summary.discovered += 1;
-        if let Some(entry) = summary.providers.get_mut(candidate.source) {
-            entry.discovered += 1;
-        }
-        if emitted_sessions.insert((row.source.clone(), row.session_id.clone())) {
-            emitted += 1;
-            on_row(&row);
-        }
+        commit?;
     }
 
     summary.counters = env.counters();
     Ok(summary)
+}
+
+/// Most potential emitters one read window may hold, whatever the limit.
+const MAX_READ_WINDOW: usize = 256;
+/// Most worker threads one window's filesystem reads fan out across.
+const MAX_READ_WORKERS: usize = 16;
+
+/// One classified candidate in a read window.
+enum WindowEntry<'c> {
+    /// Stamp matched the catalog: emit the cached row, read nothing.
+    Cached(ShallowSession),
+    /// Needs a shallow read. `result` is filled by the parallel phase for
+    /// filesystem providers; a `None` result is read serially at apply time.
+    Read {
+        candidate: &'c Candidate,
+        provider: &'c dyn ShallowSessionProvider,
+        expected: String,
+        result: Option<Result<Option<ShallowSession>>>,
+    },
 }
 
 /// [`discover_sessions`] with the rows collected instead of streamed.

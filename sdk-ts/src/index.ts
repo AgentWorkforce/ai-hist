@@ -187,6 +187,7 @@ type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {
   nativeContractVersion(): number;
+  nativeBuildProfile?(): string;
   search(query: string, options?: object): Promise<UnknownRecord[]>;
   recent(options?: object): Promise<UnknownRecord[]>;
   getSession(sessionId: string, options?: object): Promise<UnknownRecord[]>;
@@ -377,6 +378,15 @@ function sessionEvent(value: UnknownRecord): SessionEvent {
 
 export function defaultDbPath(): string {
   return process.env.AI_HIST_DB?.trim() || join(homedir(), '.local', 'share', 'ai-hist', 'ai-history.db');
+}
+
+/**
+ * Optimization profile of the loaded native addon: 'release', 'debug', or
+ * 'unknown' for an addon predating the probe. Performance measurements are
+ * only meaningful against 'release'.
+ */
+export async function nativeBuildProfile(): Promise<string> {
+  return nativeCall(async (native) => native.nativeBuildProfile?.() ?? 'unknown');
 }
 
 export async function search(query: string, options: SearchOptions = {}): Promise<HistoryEntry[]> {

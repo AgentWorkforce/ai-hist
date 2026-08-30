@@ -55,6 +55,17 @@ pub fn native_contract_version() -> u32 {
     NATIVE_CONTRACT_VERSION
 }
 
+/// Optimization profile this addon was compiled with: `release` or `debug`.
+/// Performance measurements are only meaningful against `release`.
+#[napi]
+pub fn native_build_profile() -> String {
+    if cfg!(debug_assertions) {
+        "debug".to_string()
+    } else {
+        "release".to_string()
+    }
+}
+
 #[napi(object)]
 pub struct HistoryQueryOptions {
     pub db_path: Option<String>,

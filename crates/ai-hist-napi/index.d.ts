@@ -5,6 +5,11 @@
 
 /** Contract version implemented by this native addon. */
 export declare function nativeContractVersion(): number
+/**
+ * Optimization profile this addon was compiled with: `release` or `debug`.
+ * Performance measurements are only meaningful against `release`.
+ */
+export declare function nativeBuildProfile(): string
 export interface HistoryQueryOptions {
   dbPath?: string
   source?: string

@@ -31,9 +31,9 @@ pub use discover::{
     discover_sessions, discover_sessions_collect, discover_sessions_with_env, list_session_catalog,
     list_session_catalog_page, shallow_providers, AllProvidersFailed, Candidate, CatalogCursor,
     CatalogListOptions, DiscoverOptions, DiscoveryCounters, DiscoveryDiagnostic, DiscoveryEnv,
-    DiscoverySummary, ProviderSummary, SessionCatalogPage, ShallowSession, ShallowSessionProvider,
-    SourceExemption, DEFAULT_CATALOG_LIMIT, DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION,
-    SHALLOW_SCANNER_VERSION,
+    DiscoverySummary, ProviderSummary, ScanEnv, SessionCatalogPage, ShallowReadAccess,
+    ShallowSession, ShallowSessionProvider, SourceExemption, DEFAULT_CATALOG_LIMIT,
+    DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION, SHALLOW_SCANNER_VERSION,
 };
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -6548,8 +6548,17 @@ fn collect_matching_files_inner(
         return Ok(());
     }
     for entry in fs::read_dir(root)? {
-        let path = entry?.path();
-        if path.is_dir() {
+        let entry = entry?;
+        // The directory read already knows each entry's type; only a symlink
+        // needs a stat to see what it points at.
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        let is_dir = if file_type.is_symlink() {
+            path.is_dir()
+        } else {
+            file_type.is_dir()
+        };
+        if is_dir {
             collect_matching_files_inner(&path, prefix, ext, out)?;
         } else if path
             .file_name()
@@ -6563,9 +6572,8 @@ fn collect_matching_files_inner(
     Ok(())
 }
 
-fn file_stamp(path: &Path) -> Result<String> {
-    let metadata = path.metadata()?;
-    Ok(format!(
+fn stamp_of(metadata: &fs::Metadata) -> String {
+    format!(
         "{}:{}",
         metadata
             .modified()
@@ -6574,7 +6582,31 @@ fn file_stamp(path: &Path) -> Result<String> {
             .map(|d| d.as_nanos())
             .unwrap_or(0),
         metadata.len()
-    ))
+    )
+}
+
+fn modified_ms_of(metadata: &fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+}
+
+fn file_stamp(path: &Path) -> Result<String> {
+    Ok(stamp_of(&path.metadata()?))
+}
+
+/// The change stamp and recency hint discovery needs per enumerated file,
+/// from one stat. Errors for anything that is not a regular file.
+fn file_stamp_and_modified(path: &Path) -> Result<(String, Option<i64>)> {
+    let metadata = path.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
+    Ok((stamp_of(&metadata), modified_ms_of(&metadata)))
 }
 
 fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
@@ -6669,8 +6701,15 @@ fn sorted_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     if root.exists() {
         for entry in fs::read_dir(root)? {
-            let path = entry?.path();
-            if path.is_dir() {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            let is_dir = if file_type.is_symlink() {
+                path.is_dir()
+            } else {
+                file_type.is_dir()
+            };
+            if is_dir {
                 dirs.push(path);
             }
         }
@@ -6761,6 +6800,22 @@ fn grok_session_stamp(chat: &Path) -> Result<String> {
         stamp.push_str(&file_stamp(&summary)?);
     }
     Ok(stamp)
+}
+
+/// [`grok_session_stamp`] plus the recency hint, with one stat per file.
+fn grok_session_stamp_and_modified(chat: &Path) -> Result<(String, Option<i64>)> {
+    let metadata = chat.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{} is not a regular file",
+        chat.display()
+    );
+    let mut stamp = stamp_of(&metadata);
+    if let Ok(summary) = chat.with_file_name("summary.json").metadata() {
+        stamp.push('|');
+        stamp.push_str(&stamp_of(&summary));
+    }
+    Ok((stamp, modified_ms_of(&metadata)))
 }
 
 struct GrokSession {
@@ -6878,11 +6933,7 @@ fn percent_decode_path(raw: &str) -> Option<String> {
 }
 
 fn file_modified_ms(path: &Path) -> Option<i64> {
-    path.metadata()
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
+    path.metadata().ok().as_ref().and_then(modified_ms_of)
 }
 
 fn grok_chat_text(value: &Value, role: &str) -> Option<String> {

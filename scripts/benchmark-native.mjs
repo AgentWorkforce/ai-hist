@@ -7,7 +7,19 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import {
   defaultDbPath, discoverSessions, getSessionEventsPage, listSessionCatalogPage,
+  nativeBuildProfile,
 } from '../sdk-ts/dist/index.js';
+
+// A debug addon runs the same algorithms several times slower; its numbers
+// measure the compiler, not RelayHistory.
+const buildProfile = await nativeBuildProfile();
+if (buildProfile !== 'release') {
+  console.error(
+    `The installed ai-hist-native addon is a ${buildProfile} build; benchmarks require release. `
+    + 'Rebuild it with: npm run build --prefix crates/ai-hist-napi',
+  );
+  process.exit(1);
+}
 
 const execFileAsync = promisify(execFile);
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');

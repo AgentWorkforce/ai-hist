@@ -7,6 +7,9 @@ database:
 npm run benchmark
 ```
 
+Benchmarks require a release build of the native addon and refuse a debug one
+(`npm run build --prefix crates/ai-hist-napi` rebuilds it as release).
+
 Write the report to a file with:
 
 ```bash
@@ -68,19 +71,19 @@ byte RelayHistory database with an active WAL:
 
 | Operation | Time | Rows/work |
 |---|---:|---:|
-| cold shallow discovery | 46.52 ms | 20 rows |
-| cold shallow discovery | 50.53 ms | 100 rows |
-| cold shallow discovery | 232.38 ms | 1,000 rows |
-| unchanged shallow discovery | 8.85 ms | 20 rows; zero files opened |
-| unchanged shallow discovery | 10.02 ms | 100 rows; zero files opened |
-| unchanged shallow discovery | 24.14 ms | 1,000 rows; zero files opened |
-| cold->changed shallow discovery | 14.82 ms | 20 changed rows |
-| cold->changed shallow discovery | 32.14 ms | 100 changed rows |
-| cold->changed shallow discovery | 217.45 ms | 1,000 changed rows |
-| warm session events | 1.27 ms | 20 rows |
-| warm session events | 2.09 ms | 200 rows |
-| CLI startup + cold shallow discovery | 82.05 ms | 20 rows |
-| MCP cold shallow discovery | 28.88 ms | 20 rows |
+| cold shallow discovery | 13.83 ms | 20 rows |
+| cold shallow discovery | 16.17 ms | 100 rows |
+| cold shallow discovery | 82.99 ms | 1,000 rows |
+| unchanged shallow discovery | 4.17 ms | 20 rows; zero files opened |
+| unchanged shallow discovery | 5.39 ms | 100 rows; zero files opened |
+| unchanged shallow discovery | 17.72 ms | 1,000 rows; zero files opened |
+| cold->changed shallow discovery | 6.28 ms | 20 changed rows |
+| cold->changed shallow discovery | 11.40 ms | 100 changed rows |
+| cold->changed shallow discovery | 80.42 ms | 1,000 changed rows |
+| warm session events | 0.95 ms | 20 rows |
+| warm session events | 1.82 ms | 200 rows |
+| CLI startup + cold shallow discovery | 54.94 ms | 20 rows |
+| MCP cold shallow discovery | 20.54 ms | 20 rows |
 
 The event queries did not load or copy the 2.8 GiB database: Rust opened it
 directly and returned a bounded indexed page.
