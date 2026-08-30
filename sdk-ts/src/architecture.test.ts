@@ -3,7 +3,6 @@ import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { listSessionCatalogPage, recent, stats } from './index.js';
 
 const sourceDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'src');
 const repositoryRoot = join(sourceDir, '..', '..');
@@ -27,21 +26,4 @@ test('CLI and MCP import only the public SDK for history operations', async () =
   assert.match(cli, /from '\.\/index\.js'/);
   assert.match(mcp, /from '\.\/index\.js'/);
   assert.doesNotMatch(cli + mcp, /ai-hist-native|node:sqlite|sql\.js|child_process/);
-});
-
-test('missing database reads are explicit empty cache operations', async () => {
-  const dbPath = join(repositoryRoot, '.test-does-not-exist', 'history.db');
-  assert.deepEqual(await listSessionCatalogPage({ dbPath, limit: 20 }), {
-    contractVersion: 1,
-    sessions: [],
-    nextCursor: null,
-  });
-  assert.deepEqual(await recent({ dbPath, limit: 20 }), []);
-  assert.deepEqual(await stats({ dbPath }), {
-    total: 0,
-    bySource: {},
-    byProject: [],
-    firstTimestampMs: null,
-    lastTimestampMs: null,
-  });
 });

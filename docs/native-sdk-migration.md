@@ -6,8 +6,14 @@ needed:
 
 ```bash
 npm uninstall --global ai-hist-mcp
+type -a ai-hist
 npm install --global ai-hist ai-hist-mcp
+type -a ai-hist
 ```
+
+Before installing, remove any standalone executable reported by the first
+`type -a` (commonly `~/.local/bin/ai-hist`). After installing, verify the
+first result points into npm's global installation rather than the old binary.
 
 The environment variables `AI_HIST_RUST_BIN` and `AI_HIST_CLI` no longer have
 meaning. `AI_HIST_DB` remains the database-path override.

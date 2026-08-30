@@ -50,8 +50,39 @@ jobs:
       - name: Installed SDK and CLI smoke test
         working-directory: sdk-ts
         run: |
-          npm pack --json >/tmp/ai-hist-pack.json
-          node dist/cli.js sessions list --db /tmp/relayhistory-missing.db --json
+          set -euo pipefail
+          PACK_DIR=$(mktemp -d)
+          SDK_STAGE=$(mktemp -d)
+          PLATFORM_STAGE=$(mktemp -d)
+          SMOKE=$(mktemp -d)
+          VERSION=$(node -p "require('../crates/ai-hist-napi/package.json').version")
+
+          (cd ../crates/ai-hist-napi && npm pack --ignore-scripts --pack-destination "$PACK_DIR")
+          cp package.json README.md "$SDK_STAGE/"
+          cp -R dist "$SDK_STAGE/dist"
+          (cd "$SDK_STAGE" && npm pkg set dependencies.ai-hist-native="$VERSION" && npm pack --ignore-scripts --pack-destination "$PACK_DIR")
+
+          cp ../crates/ai-hist-napi/ai-hist-native.linux-x64-gnu.node "$PLATFORM_STAGE/"
+          VERSION="$VERSION" node -e '
+            const fs = require("node:fs");
+            fs.writeFileSync(process.argv[1], JSON.stringify({
+              name: "ai-hist-native-linux-x64-gnu", version: process.env.VERSION,
+              main: "ai-hist-native.linux-x64-gnu.node",
+              files: ["ai-hist-native.linux-x64-gnu.node"],
+              os: ["linux"], cpu: ["x64"], libc: ["glibc"]
+            }, null, 2));
+          ' "$PLATFORM_STAGE/package.json"
+          (cd "$PLATFORM_STAGE" && npm pack --ignore-scripts --pack-destination "$PACK_DIR")
+
+          cd "$SMOKE"
+          npm init -y >/dev/null
+          npm install --ignore-scripts \
+            "$PACK_DIR/ai-hist-$VERSION.tgz" \
+            "$PACK_DIR/ai-hist-native-$VERSION.tgz" \
+            "$PACK_DIR/ai-hist-native-linux-x64-gnu-$VERSION.tgz"
+          ./node_modules/.bin/ai-hist sessions list --db "$SMOKE/missing.db" --json
+          node --input-type=module -e 'await import("ai-hist")'
+          node -e 'require("ai-hist/package.json")'
 
   node-22-sdk:
     runs-on: ubuntu-latest

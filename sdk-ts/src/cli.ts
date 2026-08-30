@@ -7,7 +7,7 @@ import {
   recent, search, stats, sync, type CatalogCursor,
 } from './index.js';
 
-type Parsed = { positional: string[]; flags: Map<string, string | true> };
+type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
 
 type PackageMetadata = { version?: string };
 
@@ -54,22 +54,26 @@ async function maybePrintUpdateNotice(current: string, args: string[]): Promise<
 
 function parse(argv: string[]): Parsed {
   const positional: string[] = [];
-  const flags = new Map<string, string | true>();
+  const flags = new Map<string, Array<string | true>>();
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (!arg.startsWith('--')) { positional.push(arg); continue; }
     const [name, inline] = arg.slice(2).split('=', 2);
-    if (inline !== undefined) { flags.set(name, inline); continue; }
+    if (inline !== undefined) { flags.set(name, [...(flags.get(name) ?? []), inline]); continue; }
     const next = argv[i + 1];
-    if (next && !next.startsWith('-')) { flags.set(name, next); i++; }
-    else flags.set(name, true);
+    if (next && !next.startsWith('-')) { flags.set(name, [...(flags.get(name) ?? []), next]); i++; }
+    else flags.set(name, [...(flags.get(name) ?? []), true]);
   }
   return { positional, flags };
 }
 
 function textFlag(args: Parsed, name: string): string | undefined {
-  const value = args.flags.get(name);
+  const value = args.flags.get(name)?.at(-1);
   return typeof value === 'string' ? value : undefined;
+}
+
+function textFlags(args: Parsed, name: string): string[] {
+  return (args.flags.get(name) ?? []).filter((value): value is string => typeof value === 'string');
 }
 
 function numberFlag(args: Parsed, name: string): number | undefined {
@@ -91,14 +95,45 @@ function common(args: Parsed) {
   };
 }
 
+function snakeCase(key: string): string {
+  return key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+}
+
+function wireValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(wireValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [snakeCase(key), wireValue(item)]));
+}
+
+function humanLine(value: unknown): string {
+  if (!value || typeof value !== 'object') return String(value);
+  const row = value as Record<string, unknown>;
+  return [row.timestampMs ?? row.lastActivityMs ?? '', row.source ?? '', row.sessionId ?? '', row.project ?? row.cwd ?? '', row.prompt ?? row.firstPrompt ?? '']
+    .filter((item) => item !== '' && item != null)
+    .join('  ');
+}
+
 function output(value: unknown, json: boolean): void {
-  if (json || typeof value !== 'string') process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-  else process.stdout.write(`${value}\n`);
+  if (json) {
+    process.stdout.write(`${JSON.stringify(wireValue(value))}\n`);
+  } else if (Array.isArray(value)) {
+    process.stdout.write(value.length ? `${value.map(humanLine).join('\n')}\n` : 'No results.\n');
+  } else if (typeof value === 'object' && value !== null) {
+    const record = value as Record<string, unknown>;
+    if (Array.isArray(record.sessions)) {
+      process.stdout.write(record.sessions.length ? `${record.sessions.map(humanLine).join('\n')}\n` : 'No sessions in the catalog.\n');
+      if (record.nextCursor) process.stdout.write(`more available: --after '${JSON.stringify(record.nextCursor)}'\n`);
+    } else {
+      process.stdout.write(`${Object.entries(record).map(([key, item]) => `${key}: ${typeof item === 'object' ? JSON.stringify(item) : String(item)}`).join('\n')}\n`);
+    }
+  } else {
+    process.stdout.write(`${String(value)}\n`);
+  }
 }
 
 function usage(): never {
   process.stderr.write(`Usage:
-  ai-hist sessions list [--source SOURCE] [--limit N] [--before-ms MS] [--after JSON] [--json]
+  ai-hist sessions list [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
   ai-hist sessions discover [--source SOURCE] [--limit N] [--json]
   ai-hist search QUERY... [--source SOURCE] [--project PATH] [--limit N] [--json]
   ai-hist recent [N] [--source SOURCE] [--project PATH] [--json]
@@ -115,6 +150,29 @@ function cursorFlag<T>(args: Parsed): T | undefined {
   return raw ? JSON.parse(raw) as T : undefined;
 }
 
+function catalogCursorFlag(args: Parsed): CatalogCursor | undefined {
+  const encoded = cursorFlag<CatalogCursor>(args);
+  if (encoded) return encoded;
+  const source = textFlag(args, 'after-source');
+  const sessionId = textFlag(args, 'after-session-id');
+  if (!source && !sessionId) return undefined;
+  if (!source || !sessionId) throw new Error('--after-source and --after-session-id must be used together');
+  return { lastActivityMs: numberFlag(args, 'after-ms') ?? null, source, sessionId };
+}
+
+function outputDiscovery(value: Awaited<ReturnType<typeof discoverSessions>>, json: boolean): void {
+  if (!json) {
+    for (const session of value.sessions) process.stdout.write(`${humanLine(session)}\n`);
+    process.stdout.write(`${value.sessions.length} session(s): ${value.discovered} discovered, ${value.skippedUnchanged} unchanged\n`);
+    return;
+  }
+  for (const session of value.sessions) output({ type: 'session', ...session }, true);
+  for (const diagnostic of value.diagnostics) output({ type: 'diagnostic', ...diagnostic }, true);
+  const { sessions: _sessions, diagnostics: _diagnostics, ...summary } = value;
+  const providers = Object.fromEntries(summary.providers.map(({ source, ...provider }) => [source, provider]));
+  output({ type: 'summary', ...summary, providers }, true);
+}
+
 async function main(): Promise<void> {
   const rawArgs = process.argv.slice(2);
   if (rawArgs.includes('--version') || rawArgs.includes('-V')) {
@@ -128,20 +186,20 @@ async function main(): Promise<void> {
   const json = args.flags.has('json');
 
   if (command === 'sessions' && subcommand === 'list') {
-    const source = textFlag(args, 'source');
+    const sources = textFlags(args, 'source');
     output(await listSessionCatalogPage({
-      dbPath: textFlag(args, 'db'), sources: source ? [source as never] : undefined,
+      dbPath: textFlag(args, 'db'), sources: sources.length ? sources as never : undefined,
       limit: numberFlag(args, 'limit'), beforeMs: numberFlag(args, 'before-ms'),
-      after: cursorFlag<CatalogCursor>(args),
-    }), true);
+      after: catalogCursorFlag(args),
+    }), json);
     return;
   }
   if (command === 'sessions' && subcommand === 'discover') {
-    const source = textFlag(args, 'source');
-    output(await discoverSessions({
-      dbPath: textFlag(args, 'db'), sources: source ? [source as never] : undefined,
+    const sources = textFlags(args, 'source');
+    outputDiscovery(await discoverSessions({
+      dbPath: textFlag(args, 'db'), sources: sources.length ? sources as never : undefined,
       limit: numberFlag(args, 'limit'),
-    }), true);
+    }), json);
     return;
   }
   if (command === 'search') {
@@ -164,11 +222,11 @@ async function main(): Promise<void> {
     output(await getSessionEventsPage(subcommand, {
       dbPath: textFlag(args, 'db'), source: textFlag(args, 'source') as never,
       limit: numberFlag(args, 'limit'), after: cursorFlag(args),
-    }), true);
+    }), json);
     return;
   }
-  if (command === 'stats') { output(await stats({ dbPath: textFlag(args, 'db'), tag: textFlag(args, 'tag') }), true); return; }
-  if (command === 'sync') { output(await sync({ dbPath: textFlag(args, 'db') }), true); return; }
+  if (command === 'stats') { output(await stats({ dbPath: textFlag(args, 'db'), tag: textFlag(args, 'tag') }), json); return; }
+  if (command === 'sync') { output(await sync({ dbPath: textFlag(args, 'db') }), json); return; }
   usage();
 }
 

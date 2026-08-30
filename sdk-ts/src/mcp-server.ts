@@ -34,28 +34,31 @@ server.tool('search_history', 'Search already-indexed RelayHistory prompts.', {
 
 server.tool('recent_history', 'List recent already-indexed history.', {
   source: SOURCE.optional(), project: z.string().optional(), tag: z.string().optional(),
-  limit: z.number().int().min(1).max(1000).optional().default(20),
-  beforeMs: z.number().int().optional(),
-}, READ, ({ source, project, tag, limit, beforeMs }) => call(() => recent({ source, project, tag, limit, beforeMs })));
+  n: z.number().int().min(1).max(1000).optional().default(20),
+  before_ms: z.number().int().optional(),
+}, READ, ({ source, project, tag, n, before_ms }) => call(() => recent({ source, project, tag, limit: n, beforeMs: before_ms })));
 
 server.tool('list_sessions', 'Cache-only indexed session catalog listing. This never discovers or syncs.', {
   sources: z.array(CATALOG_SOURCE).optional(), limit: z.number().int().min(1).max(1000).optional().default(20),
-  beforeMs: z.number().int().optional(),
-  after: z.object({ lastActivityMs: z.number().int().nullable(), source: z.string(), sessionId: z.string() }).optional(),
-}, READ, (args) => call(() => listSessionCatalogPage(args)));
+  before_ms: z.number().int().optional(),
+  after: z.object({ lastActivityMs: z.number().int().nullable().optional(), source: z.string(), sessionId: z.string() }).optional(),
+}, READ, ({ sources, limit, before_ms, after }) => call(() => listSessionCatalogPage({
+  sources, limit, beforeMs: before_ms,
+  after: after ? { ...after, lastActivityMs: after.lastActivityMs ?? null } : undefined,
+})));
 
 server.tool('discover_sessions', 'Explicit shallow provider discovery. Updates only the session catalog.', {
   sources: z.array(CATALOG_SOURCE).optional(), limit: z.number().int().min(1).max(10000).optional(),
 }, WRITE, (args) => call(() => discoverSessions(args)));
 
 server.tool('get_session', 'Get indexed prompts for one session.', {
-  sessionId: z.string(), source: SOURCE.optional(), tag: z.string().optional(),
-}, READ, ({ sessionId, source, tag }) => call(() => getSession(sessionId, { source, tag })));
+  session_id: z.string(), source: SOURCE.optional(), tag: z.string().optional(),
+}, READ, ({ session_id, source, tag }) => call(() => getSession(session_id, { source, tag })));
 
 server.tool('get_session_events', 'Get one bounded page of normalized events.', {
-  sessionId: z.string(), source: SOURCE.optional(), limit: z.number().int().min(1).max(1000).optional().default(200),
+  session_id: z.string(), source: SOURCE.optional(), limit: z.number().int().min(1).max(1000).optional().default(200),
   after: z.object({ tsMs: z.number().int(), id: z.number().int() }).optional(),
-}, READ, ({ sessionId, source, limit, after }) => call(() => getSessionEventsPage(sessionId, { source, limit, after })));
+}, READ, ({ session_id, source, limit, after }) => call(() => getSessionEventsPage(session_id, { source, limit, after })));
 
 server.tool('history_stats', 'Statistics for already-indexed RelayHistory data.', {
   tag: z.string().optional(),

@@ -387,7 +387,14 @@ const REQUIRED_SESSIONS_INDEXES: &[&str] = &[
     "idx_sessions_recency",
     "idx_sessions_source_recency",
     "idx_sessions_raw_path",
+    "idx_session_events_source_page",
+    "idx_session_events_page",
 ];
+
+const REQUIRED_CATALOG_READ_INDEXES: &[&str] =
+    &["idx_sessions_recency", "idx_sessions_source_recency"];
+const REQUIRED_EVENT_READ_INDEXES: &[&str] =
+    &["idx_session_events_source_page", "idx_session_events_page"];
 
 /// Whether this database already has everything [`init_db`] would add.
 ///
@@ -397,6 +404,25 @@ const REQUIRED_SESSIONS_INDEXES: &[&str] = &[
 /// first search instead of a silent migration. Callers fall back to a writable
 /// open (which migrates) when this returns false.
 pub fn schema_is_current(conn: &Connection) -> Result<bool> {
+    schema_has_required_indexes(conn, REQUIRED_SESSIONS_INDEXES)
+}
+
+/// Whether read-only APIs can safely and efficiently query this database.
+pub fn schema_is_read_current(conn: &Connection) -> Result<bool> {
+    schema_has_required_indexes(conn, &[])
+}
+
+/// Whether the cache-only catalog can use its sort-free query plans.
+pub fn schema_is_catalog_read_current(conn: &Connection) -> Result<bool> {
+    schema_has_required_indexes(conn, REQUIRED_CATALOG_READ_INDEXES)
+}
+
+/// Whether bounded event pagination has both source-scoped and source-less indexes.
+pub fn schema_is_event_read_current(conn: &Connection) -> Result<bool> {
+    schema_has_required_indexes(conn, REQUIRED_EVENT_READ_INDEXES)
+}
+
+fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> Result<bool> {
     let mut table = conn.prepare("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1")?;
     for name in REQUIRED_TABLES {
         if !table.exists([name])? {
@@ -425,7 +451,7 @@ pub fn schema_is_current(conn: &Connection) -> Result<bool> {
     }
     let mut index =
         conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1")?;
-    for name in REQUIRED_SESSIONS_INDEXES {
+    for name in required_indexes {
         if !index.exists([name])? {
             return Ok(false);
         }
@@ -577,6 +603,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(source, session_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_source_page ON session_events(source, session_id, ts_ms, id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_page ON session_events(session_id, ts_ms, id)",
         [],
     )?;
     conn.execute(
@@ -2023,6 +2057,24 @@ mod tests {
             init_db(&conn).unwrap();
             assert!(schema_is_current(&conn).unwrap());
         }
+    }
+
+    #[test]
+    fn read_schema_does_not_require_the_discovery_only_raw_path_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch("DROP INDEX idx_sessions_raw_path")
+            .unwrap();
+
+        assert!(schema_is_read_current(&conn).unwrap());
+        assert!(schema_is_catalog_read_current(&conn).unwrap());
+        assert!(schema_is_event_read_current(&conn).unwrap());
+        assert!(!schema_is_current(&conn).unwrap());
+
+        conn.execute_batch("DROP INDEX idx_session_events_page")
+            .unwrap();
+        assert!(schema_is_read_current(&conn).unwrap());
+        assert!(!schema_is_event_read_current(&conn).unwrap());
     }
 
     /// A fresh database and a migrated one must end up with the same `sessions`

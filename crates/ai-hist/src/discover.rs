@@ -2045,17 +2045,26 @@ pub fn discover_sessions_with_env(
         }
 
         // Writes for the whole window share one transaction; a fresh archive
-        // costs one commit per window instead of one per row. An error inside
-        // the window still commits the rows that landed before it — exactly
-        // as durable as when every write stood alone.
-        conn.execute_batch("BEGIN IMMEDIATE")?;
+        // costs one commit per window instead of one per row. Cached-only
+        // windows stay read-only, and rows are not exposed to callers until
+        // every write they describe has committed successfully.
+        let has_writes = entries
+            .iter()
+            .any(|entry| matches!(entry, WindowEntry::Read { .. }));
+        if has_writes {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
         let mut window_error: Option<anyhow::Error> = None;
+        let mut window_rows = Vec::new();
+        let mut window_sessions = BTreeSet::new();
+        let mut window_discovered = 0usize;
+        let mut window_discovered_by_source: BTreeMap<String, usize> = BTreeMap::new();
         'apply: for entry in entries {
             let (candidate, provider, expected, result) = match entry {
                 WindowEntry::Cached(row) => {
-                    if emitted_sessions.insert((row.source.clone(), row.session_id.clone())) {
-                        emitted += 1;
-                        on_row(&row);
+                    let key = (row.source.clone(), row.session_id.clone());
+                    if !emitted_sessions.contains(&key) && window_sessions.insert(key) {
+                        window_rows.push(row);
                     }
                     continue;
                 }
@@ -2131,20 +2140,36 @@ pub fn discover_sessions_with_env(
                     break 'apply;
                 }
             };
-            summary.discovered += 1;
-            if let Some(entry) = summary.providers.get_mut(candidate.source) {
-                entry.discovered += 1;
-            }
-            if emitted_sessions.insert((row.source.clone(), row.session_id.clone())) {
-                emitted += 1;
-                on_row(&row);
+            window_discovered += 1;
+            *window_discovered_by_source
+                .entry(candidate.source.to_string())
+                .or_default() += 1;
+            let key = (row.source.clone(), row.session_id.clone());
+            if !emitted_sessions.contains(&key) && window_sessions.insert(key) {
+                window_rows.push(row);
             }
         }
-        let commit = conn.execute_batch("COMMIT");
+        if has_writes {
+            if let Err(error) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error.into());
+            }
+        }
+
+        summary.discovered += window_discovered;
+        for (source, discovered) in window_discovered_by_source {
+            if let Some(entry) = summary.providers.get_mut(&source) {
+                entry.discovered += discovered;
+            }
+        }
+        for row in window_rows {
+            emitted_sessions.insert((row.source.clone(), row.session_id.clone()));
+            emitted += 1;
+            on_row(&row);
+        }
         if let Some(error) = window_error {
             return Err(error);
         }
-        commit?;
     }
 
     summary.counters = env.counters();

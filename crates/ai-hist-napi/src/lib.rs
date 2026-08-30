@@ -7,7 +7,8 @@
 use std::path::{Path, PathBuf};
 
 use ai_hist_core::{
-    default_db_path, open_db, open_db_readonly, recent as core_recent, schema_is_current,
+    default_db_path, open_db, open_db_readonly, recent as core_recent,
+    schema_is_catalog_read_current, schema_is_event_read_current, schema_is_read_current,
     search as core_search, session as core_session,
     session_events_page as core_session_events_page, stats as core_stats, HistoryEntry,
     QueryFilter, SessionEvent as CoreSessionEvent, SessionEventCursor as CoreEventCursor,
@@ -222,12 +223,25 @@ where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
 {
+    read_database_with_schema(path, empty, schema_is_read_current, operation).await
+}
+
+async fn read_database_with_schema<T, F>(
+    path: PathBuf,
+    empty: T,
+    schema_current: fn(&rusqlite::Connection) -> anyhow::Result<bool>,
+    operation: F,
+) -> napi::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
+{
     napi::tokio::task::spawn_blocking(move || {
         if !path.exists() {
             return Ok(empty);
         }
         let conn = match open_db_readonly(&path) {
-            Ok(conn) if schema_is_current(&conn).unwrap_or(false) => conn,
+            Ok(conn) if schema_current(&conn).unwrap_or(false) => conn,
             _ => open_db(&path).map_err(|error| database_error(&path, format!("{error:#}")))?,
         };
         operation(&conn)
@@ -342,12 +356,13 @@ pub async fn get_session_events_page(
         ts_ms: cursor.ts_ms,
         id: cursor.id,
     });
-    read_database(
+    read_database_with_schema(
         path,
         SessionEventsPage {
             events: Vec::new(),
             next_cursor: None,
         },
+        schema_is_event_read_current,
         move |conn| {
             let page = core_session_events_page(
                 conn,
@@ -505,11 +520,13 @@ pub async fn list_session_catalog_page(
             session_id: cursor.session_id,
         }),
     };
-    napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::list_sessions_local_at(&path, &request)
-    })
+    read_database_with_schema(
+        path,
+        ai_hist_engine::SessionCatalogPage::default(),
+        schema_is_catalog_read_current,
+        move |conn| ai_hist_engine::list_session_catalog_page(conn, &request),
+    )
     .await
-    .map_err(worker_error)?
     .map(|page| SessionCatalogPage {
         contract_version: ai_hist_engine::SESSION_CATALOG_CONTRACT_VERSION,
         sessions: page
@@ -523,7 +540,6 @@ pub async fn list_session_catalog_page(
             session_id: cursor.session_id,
         }),
     })
-    .map_err(|error| native_error("DATABASE_QUERY_FAILED", format!("{error:#}")))
 }
 
 /// Convenience first-page catalog listing with identical cache-only semantics.
@@ -662,13 +678,13 @@ pub struct SyncResult {
 pub async fn sync(options: Option<SyncOptions>) -> napi::Result<SyncResult> {
     let path = db_path(options.and_then(|options| options.db_path));
     let result_path = path.display().to_string();
-    napi::tokio::task::spawn_blocking(move || ai_hist_engine::sync_local_at(&path))
+    let completed = napi::tokio::task::spawn_blocking(move || ai_hist_engine::sync_local_at(&path))
         .await
         .map_err(worker_error)?
         .map_err(|error| native_error("SYNC_FAILED", format!("{error:#}")))?;
     Ok(SyncResult {
         database_path: result_path,
-        completed: true,
+        completed,
     })
 }
 

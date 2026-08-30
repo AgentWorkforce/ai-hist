@@ -1,9 +1,10 @@
 use ai_hist_core::convergence::MachineIdentity;
 use ai_hist_core::{
     default_db_path, import_json, insert_history, normalize_tag_name, open_db, open_db_readonly,
-    parse_cursor_text, prompt_hash, raw_fts_query_error, recent, resume_command, schema_is_current,
-    search, session, session_events, session_file_edits, session_tool_calls, sync_opencode_db,
-    untag_session, HistoryEntry, QueryFilter, SourceDatabaseError, SOURCE_CHOICES,
+    parse_cursor_text, prompt_hash, raw_fts_query_error, recent, resume_command,
+    schema_is_catalog_read_current, schema_is_current, search, session, session_events,
+    session_file_edits, session_tool_calls, sync_opencode_db, untag_session, HistoryEntry,
+    QueryFilter, SourceDatabaseError, SOURCE_CHOICES,
 };
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
@@ -68,16 +69,16 @@ pub struct SyncPushOutcome {
 /// When another process owns the sync lock the refresh is skipped — the
 /// concurrent scan is already producing the fresh data this caller wants.
 pub fn sync_local() -> Result<()> {
-    sync_local_at(&default_db_path())
+    sync_local_at(&default_db_path()).map(|_| ())
 }
 
 /// Refresh local history into an explicitly selected database.
 ///
 /// This is the reusable engine entry point used by the N-API boundary. The
 /// command-line parser is intentionally not involved.
-pub fn sync_local_at(db_path: &Path) -> Result<()> {
+pub fn sync_local_at(db_path: &Path) -> Result<bool> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    sync_exclusive(db_path).map(|_| ())
+    sync_exclusive(db_path)
 }
 
 /// Sync local agent history into the DB, then push new records to
@@ -148,7 +149,7 @@ pub fn list_sessions_local_at(
         return Ok(SessionCatalogPage::default());
     }
     let conn = match open_db_readonly(db_path) {
-        Ok(conn) if schema_is_current(&conn).unwrap_or(false) => conn,
+        Ok(conn) if schema_is_catalog_read_current(&conn).unwrap_or(false) => conn,
         // Missing migration (a read-only handle skips init_db) or an
         // unreadable handle: let the writable open sort it out.
         _ => open_db(db_path)?,
@@ -7564,9 +7565,9 @@ mod tests {
         load_sync_state, parse_trajectory_file, paths_overlap, prepare_sync_and_push_db,
         process_status_with_programs, save_sync_state, search_all, service_command_args,
         shell_single_quote, source_database_path, strip_url_credentials,
-        sync_claude_session_metadata, sync_exclusive, sync_opencode_exclusive, sync_relaycast,
-        try_acquire_sync_lock, wal_contention_line, write_contention_diagnostic, xml_escape,
-        SearchRole, SyncSourceReport, PUSH_SERVICE, WAL_WARN_BYTES,
+        sync_claude_session_metadata, sync_exclusive, sync_local_at, sync_opencode_exclusive,
+        sync_relaycast, try_acquire_sync_lock, wal_contention_line, write_contention_diagnostic,
+        xml_escape, SearchRole, SyncSourceReport, PUSH_SERVICE, WAL_WARN_BYTES,
     };
     use ai_hist_core::{
         init_db, insert_history, open_db, prompt_hash, HistoryEntry, QueryFilter,
@@ -7694,6 +7695,7 @@ mod tests {
             "the sidecar lock must not initialize SQLite"
         );
         assert!(!sync_exclusive(&alias).unwrap());
+        assert!(!sync_local_at(&alias).unwrap());
         assert!(!sync_opencode_exclusive(&alias, &missing_opencode).unwrap());
         assert!(
             !db_path.exists(),

@@ -94,7 +94,13 @@ async function mcpColdDiscovery(home, benchmarkDbPath) {
     if (measurement.value.error || measurement.value.result?.isError) {
       throw new Error(`MCP discovery failed: ${JSON.stringify(measurement.value)}`);
     }
-    return { name: measurement.name, ms: measurement.ms, rows: 20 };
+    const text = measurement.value.result?.content?.find((item) => item.type === 'text')?.text;
+    if (typeof text !== 'string') throw new Error('MCP discovery returned no text result');
+    let payload;
+    try { payload = JSON.parse(text); }
+    catch (error) { throw new Error(`MCP discovery returned invalid JSON: ${error.message}`); }
+    if (!Array.isArray(payload.sessions)) throw new Error('MCP discovery result has no sessions array');
+    return { name: measurement.name, ms: measurement.ms, rows: payload.sessions.length };
   } finally {
     child.kill();
   }
@@ -220,7 +226,10 @@ try {
     env: { ...process.env, HOME: fixtureHome, USERPROFILE: fixtureHome },
     maxBuffer: 10 * 1024 * 1024,
   }));
-  results.push({ name: cli.name, ms: cli.ms, rows: JSON.parse(cli.value.stdout).sessions.length });
+  const cliRows = cli.value.stdout.trim().split('\n')
+    .map((line) => JSON.parse(line))
+    .filter((line) => line.type === 'session').length;
+  results.push({ name: cli.name, ms: cli.ms, rows: cliRows });
 
   results.push(await mcpColdDiscovery(fixtureHome, join(temporary, 'mcp-cold.db')));
 } finally {

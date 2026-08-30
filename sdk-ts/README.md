@@ -23,11 +23,11 @@ import {
 
 await discoverSessions({ limit: 100 });
 const page = await listSessionCatalogPage({ limit: 20 });
-const prompts = await getSession(page.sessions[0].sessionId);
-const events = await getSessionEventsPage(page.sessions[0].sessionId, { limit: 200 });
-
-for await (const event of sessionEvents(page.sessions[0].sessionId)) {
-  consume(event);
+const first = page.sessions[0];
+if (first) {
+  const prompts = await getSession(first.sessionId);
+  const events = await getSessionEventsPage(first.sessionId, { limit: 200 });
+  for await (const event of sessionEvents(first.sessionId)) consume(event);
 }
 ```
 
@@ -44,4 +44,4 @@ platform packages, addon load failures, SDK/native contract mismatches, and
 database open failures through stable `RelayHistoryError` subclasses.
 
 The old synchronous `AiHist` class and `openAiHist()` API were removed in 1.0.
-See [the migration guide](../docs/native-sdk-migration.md).
+See [the migration guide](https://github.com/AgentWorkforce/relayhistory/blob/main/docs/native-sdk-migration.md).

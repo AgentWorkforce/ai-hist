@@ -58,10 +58,12 @@ import {
 
 await discoverSessions({ limit: 100 });
 const sessions = await listSessionCatalog({ limit: 100 });
-const firstEvents = await getSessionEventsPage(sessions[0].sessionId, {
-  source: sessions[0].source,
-  limit: 200,
-});
+const firstEvents = sessions[0]
+  ? await getSessionEventsPage(sessions[0].sessionId, {
+      source: sessions[0].source,
+      limit: 200,
+    })
+  : null;
 const matches = await search('migration', { limit: 20 });
 await sync(); // explicit full ingestion
 ```

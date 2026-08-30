@@ -377,7 +377,11 @@ function sessionEvent(value: UnknownRecord): SessionEvent {
 }
 
 export function defaultDbPath(): string {
-  return process.env.AI_HIST_DB?.trim() || join(homedir(), '.local', 'share', 'ai-hist', 'ai-history.db');
+  if (process.env.AI_HIST_DB !== undefined) return process.env.AI_HIST_DB;
+  if (process.env.XDG_DATA_HOME !== undefined) {
+    return join(process.env.XDG_DATA_HOME, 'ai-hist', 'ai-history.db');
+  }
+  return join(homedir(), '.local', 'share', 'ai-hist', 'ai-history.db');
 }
 
 /**
@@ -402,7 +406,7 @@ export async function getSession(sessionId: string, options: SessionOptions = {}
 }
 
 export async function listSessionCatalog(options: ListCatalogOptions = {}): Promise<CatalogSession[]> {
-  return nativeCall(async (native) => (await native.listSessionCatalog(options)).map(catalogSession));
+  return (await listSessionCatalogPage(options)).sessions;
 }
 
 export async function listSessionCatalogPage(options: ListCatalogOptions = {}): Promise<SessionCatalogPage> {
@@ -496,11 +500,16 @@ export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
   });
 }
 
-export function resumeCommand(entry: Pick<HistoryEntry, 'source' | 'sessionId'>): string | null {
+export function resumeCommand(entry: Pick<HistoryEntry, 'source' | 'sessionId' | 'project'>): string | null {
   if (!entry.sessionId) return null;
-  if (entry.source === 'claude') return `claude --resume ${shellQuote(entry.sessionId)}`;
-  if (entry.source === 'codex') return `codex resume ${shellQuote(entry.sessionId)}`;
-  return null;
+  const resume = (() => {
+    if (entry.source === 'claude') return `claude --resume ${shellQuote(entry.sessionId)}`;
+    if (entry.source === 'codex') return `codex resume ${shellQuote(entry.sessionId)}`;
+    if (entry.source === 'cursor') return `cursor-agent --resume=${shellQuote(entry.sessionId)}`;
+    if (entry.source === 'grok') return `grok resume ${shellQuote(entry.sessionId)}`;
+    return null;
+  })();
+  return resume && entry.project ? `cd ${shellQuote(entry.project)} && ${resume}` : resume;
 }
 
 function shellQuote(value: string): string {

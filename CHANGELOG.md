@@ -16,8 +16,6 @@ Notable changes to the native `ai-hist` CLI are documented here.
   catalog listing, and explicit sync operations with contract version 2.
 - Add deterministic bounded event pagination using `(ts_ms, id)`.
 
-### Added
-
 - Add `ai-hist sessions list` and `ai-hist sessions discover`: a shallow session
   catalog over every provider. `discover` enumerates candidates cheaply, orders
   them globally by recency, and reads only bounded head/tail slices of the

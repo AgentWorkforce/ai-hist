@@ -274,6 +274,28 @@ fn claude_identity_is_stable_and_an_unchanged_rescan_reparses_nothing() {
 }
 
 #[test]
+fn discovery_emits_rows_only_outside_write_transactions() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+
+    for expected_cached in [false, true] {
+        let env = env_at(&conn, home.path());
+        let mut rows = Vec::new();
+        discover_sessions_with_env(&env, &only(&["claude"]), |row| {
+            assert!(
+                conn.is_autocommit(),
+                "callbacks must observe committed catalog rows"
+            );
+            rows.push(row.clone());
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].from_cache, expected_cached);
+    }
+}
+
+#[test]
 fn claude_append_updates_the_existing_row_without_duplicating_it() {
     let conn = catalog();
     let home = tempfile::tempdir().unwrap();
