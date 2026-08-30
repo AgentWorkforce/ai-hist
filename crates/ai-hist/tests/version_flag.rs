@@ -12,9 +12,11 @@ fn version_output(args: &[&str]) -> std::process::Output {
 }
 
 fn expected_version_line() -> String {
-    // Tests build without AI_HIST_RELEASE_VERSION, so the binary falls back
-    // to the crate version.
-    format!("ai-hist {}", env!("CARGO_PKG_VERSION"))
+    // Mirror CLI_VERSION: the release workflows stamp AI_HIST_RELEASE_VERSION
+    // into every build, and this test crate compiles in the same environment
+    // as the binary, so fall back to the crate version the same way it does.
+    let version = option_env!("AI_HIST_RELEASE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+    format!("ai-hist {version}")
 }
 
 #[test]

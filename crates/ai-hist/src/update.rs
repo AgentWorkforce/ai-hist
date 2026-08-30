@@ -11,6 +11,7 @@
 //! proxy, unexpected redirect target — silently skips the notice. `--version`
 //! must always print the version and exit 0.
 
+use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal;
 use std::time::Duration;
 
@@ -70,9 +71,11 @@ fn parse_release_tag(location: &str) -> Option<ReleaseTriple> {
 /// Whether the notice is suppressed by `--no-warning` or the opt-out
 /// environment variable. Argument scanning is deliberate: clap never yields
 /// parsed matches on the `--version` path, it short-circuits with
-/// `ErrorKind::DisplayVersion` instead.
-fn suppressed(mut args: impl Iterator<Item = String>, opt_out_env: Option<&str>) -> bool {
-    if args.any(|arg| arg == "--no-warning") {
+/// `ErrorKind::DisplayVersion` instead. Scans `OsString`s because
+/// `std::env::args()` panics on argv that is not valid Unicode, and
+/// `--version` must exit 0 whatever the argv looks like.
+fn suppressed(mut args: impl Iterator<Item = OsString>, opt_out_env: Option<&str>) -> bool {
+    if args.any(|arg| arg == *OsStr::new("--no-warning")) {
         return true;
     }
     matches!(opt_out_env, Some(value) if !value.is_empty() && value != "0")
@@ -98,7 +101,10 @@ pub(crate) fn maybe_print_update_notice() {
     if !std::io::stderr().is_terminal() {
         return;
     }
-    if suppressed(std::env::args(), std::env::var(OPT_OUT_ENV).ok().as_deref()) {
+    if suppressed(
+        std::env::args_os(),
+        std::env::var(OPT_OUT_ENV).ok().as_deref(),
+    ) {
         return;
     }
     let Some(current) = parse_triple(crate::CLI_VERSION) else {
@@ -168,9 +174,27 @@ mod tests {
         assert_eq!(parse_release_tag("v0.6.0"), None);
     }
 
+    /// argv containing bytes that are not valid UTF-8 must be scanned, not
+    /// panicked on: `--version` promises exit 0 for any argv.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_arguments_are_scanned_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = OsString::from_vec(vec![0xff, 0xfe]);
+        assert!(suppressed(
+            [invalid.clone(), OsString::from("--no-warning")].into_iter(),
+            None
+        ));
+        assert!(!suppressed(
+            [invalid, OsString::from("--version")].into_iter(),
+            None
+        ));
+    }
+
     #[test]
     fn no_warning_flag_and_env_opt_out_suppress() {
-        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
         assert!(suppressed(
             args(&["ai-hist", "--version", "--no-warning"]).into_iter(),
             None
