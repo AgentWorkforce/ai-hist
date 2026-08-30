@@ -7,7 +7,7 @@ name: Publish ai-hist-native (napi)
 # in-process. See docs/reflex-zero-setup.md.
 #
 # Linux is built for BOTH glibc (gnu) and musl so the loader resolves on Ubuntu
-# etc. (gnu) and Alpine (musl). Cross targets use zig via napi --cross-compile.
+# etc. (gnu) and Alpine (musl). Cross targets use zig via `napi build --zig`.
 # NOTE: napi cross-compilation can need tuning per runner image; validate a dry
 # run before the first real publish.
 
