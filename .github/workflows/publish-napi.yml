@@ -9,7 +9,16 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to publish (e.g. 0.4.1). Blank = use package.json.'
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+      custom_version:
+        description: 'Custom version (optional, overrides version bump type)'
         required: false
         type: string
       dry_run:
@@ -135,14 +144,21 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
       - name: Install deps
         run: npm ci
-      - name: Set version
+      - name: Resolve release version
+        id: version
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION_TYPE: ${{ inputs.version }}
+          CUSTOM_VERSION: ${{ inputs.custom_version }}
         run: |
           set -euo pipefail
-          if [ -n "$VERSION" ]; then
-            npm version "$VERSION" --no-git-tag-version --allow-same-version
+          if [ -n "$CUSTOM_VERSION" ]; then
+            npm version "$CUSTOM_VERSION" --no-git-tag-version --allow-same-version
+          else
+            npm version "$VERSION_TYPE" --no-git-tag-version
           fi
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing version $VERSION"
       - uses: actions/download-artifact@v4
         with:
           path: crates/ai-hist-napi/artifacts
@@ -183,10 +199,9 @@ jobs:
       - name: Build SDK and CLI against the release contract
         working-directory: sdk-ts
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${VERSION:-$(node -p "require('../crates/ai-hist-napi/package.json').version")}"
           npm install --ignore-scripts
           npm run build
           node dist/cli.js sessions list --db /tmp/relayhistory-empty.db --json
@@ -201,21 +216,19 @@ jobs:
       - name: Build and publish MCP wrapper
         working-directory: mcp-package
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
-          VERSION="${VERSION:-$(node -p "require('../crates/ai-hist-napi/package.json').version")}"
           npm pkg set version="$VERSION" dependencies.ai-hist="$VERSION"
           if [ "$DRY_RUN" != "true" ]; then npm publish --access public; fi
 
       - name: Registry clean-install smoke test
         if: ${{ !inputs.dry_run }}
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${VERSION:-$(node -p "require('./package.json').version")}"
           SMOKE=$(mktemp -d)
           cd "$SMOKE"
           npm init -y
