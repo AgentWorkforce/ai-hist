@@ -13,9 +13,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
   on a persistent worker pool, and a fresh database's schema lands in a single
   transaction. The unused `idx_sessions_cwd`, `idx_sessions_branch`,
   `idx_sessions_last`, and `idx_sessions_source_last` indexes are dropped —
-  nothing queries them, and each was one more btree per catalog write. The
-  database now runs WAL with `synchronous=NORMAL`; every row is derived from
-  provider sources a rescan reproduces.
+  nothing queries them, and each was one more btree per catalog write.
+  Discovery runs commit at WAL's NORMAL durability, scoped to the run itself:
+  discovery writes only catalog rows a provider rescan reproduces, while
+  user-created records (tags, commit links) keep the database's default FULL
+  durability.
 
 ### Breaking
 

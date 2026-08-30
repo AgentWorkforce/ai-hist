@@ -483,11 +483,6 @@ pub fn open_db_readonly(path: &Path) -> Result<Connection> {
 
 pub fn init_db(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    // Every row in this database is derived from provider sources that a
-    // rescan reproduces, so WAL's NORMAL durability (safe across process
-    // crashes; an OS crash can roll back to the last checkpoint) is the right
-    // trade — FULL spent an fsync per commit protecting nothing original.
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
     // A database that already has everything runs the idempotent DDL as pure
     // no-ops without claiming the write lock, so opening beside a concurrent
     // writer stays lock-free. A fresh or outdated database — which needs the

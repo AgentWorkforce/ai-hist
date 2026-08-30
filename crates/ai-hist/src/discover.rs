@@ -1897,6 +1897,14 @@ pub fn discover_sessions_with_env(
     mut on_row: impl FnMut(&ShallowSession),
 ) -> Result<DiscoverySummary> {
     let conn = env.conn();
+    // Discovery writes only stamp-guarded `sessions` rows and
+    // `discovery_skips` markers — data a rescan of the provider sources
+    // reproduces — so its commits run at WAL's NORMAL durability instead of
+    // paying FULL's fsync per window. The relaxation is scoped to this run:
+    // the guard restores the connection's previous level on every exit, and
+    // records a rescan cannot restore (user tags, commit links) are written
+    // elsewhere at the database's default durability.
+    let _synchronous = RelaxedSynchronous::new(conn)?;
     let providers = select_providers(options)?;
     let mut summary = DiscoverySummary {
         contract_version: SESSION_CATALOG_CONTRACT_VERSION,
@@ -2264,6 +2272,33 @@ pub fn discover_sessions_with_env(
 const MAX_READ_WINDOW: usize = 256;
 /// Most worker threads a run's filesystem reads fan out across.
 const MAX_READ_WORKERS: usize = 16;
+
+/// Scoped `PRAGMA synchronous = NORMAL` for one discovery run.
+///
+/// Constructed at the start of [`discover_sessions_with_env`] and restores the
+/// connection's previous synchronous level when dropped, so only discovery's
+/// own commits — reconstructible catalog rows and skip markers — run at the
+/// relaxed durability.
+struct RelaxedSynchronous<'a> {
+    conn: &'a Connection,
+    previous: i64,
+}
+
+impl<'a> RelaxedSynchronous<'a> {
+    fn new(conn: &'a Connection) -> Result<Self> {
+        let previous = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(Self { conn, previous })
+    }
+}
+
+impl Drop for RelaxedSynchronous<'_> {
+    fn drop(&mut self) {
+        // Best effort: a connection that cannot take the pragma any more is
+        // being torn down anyway.
+        let _ = self.conn.pragma_update(None, "synchronous", self.previous);
+    }
+}
 
 /// One shallow read's outcome, keyed by the entry's index in its window.
 type ReadOutcome = (usize, Result<Option<ShallowSession>>);
