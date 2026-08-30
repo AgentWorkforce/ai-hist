@@ -68,8 +68,16 @@ pub struct SyncPushOutcome {
 /// When another process owns the sync lock the refresh is skipped — the
 /// concurrent scan is already producing the fresh data this caller wants.
 pub fn sync_local() -> Result<()> {
+    sync_local_at(&default_db_path())
+}
+
+/// Refresh local history into an explicitly selected database.
+///
+/// This is the reusable engine entry point used by the N-API boundary. The
+/// command-line parser is intentionally not involved.
+pub fn sync_local_at(db_path: &Path) -> Result<()> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    sync_exclusive(&default_db_path()).map(|_| ())
+    sync_exclusive(db_path).map(|_| ())
 }
 
 /// Sync local agent history into the DB, then push new records to
@@ -128,15 +136,22 @@ pub fn sync_and_push() -> Result<SyncPushOutcome> {
 /// over `sessions`, no provider I/O. A database that does not exist yet is an
 /// empty catalog, not an error — the caller is expected to run discovery next.
 pub fn list_sessions_local(options: &CatalogListOptions) -> Result<SessionCatalogPage> {
-    let db_path = default_db_path();
+    list_sessions_local_at(&default_db_path(), options)
+}
+
+/// Cache-only catalog listing against an explicitly selected database.
+pub fn list_sessions_local_at(
+    db_path: &Path,
+    options: &CatalogListOptions,
+) -> Result<SessionCatalogPage> {
     if !db_path.exists() {
         return Ok(SessionCatalogPage::default());
     }
-    let conn = match open_db_readonly(&db_path) {
+    let conn = match open_db_readonly(db_path) {
         Ok(conn) if schema_is_current(&conn).unwrap_or(false) => conn,
         // Missing migration (a read-only handle skips init_db) or an
         // unreadable handle: let the writable open sort it out.
-        _ => open_db(&db_path)?,
+        _ => open_db(db_path)?,
     };
     list_session_catalog_page(&conn, options)
 }
@@ -149,7 +164,15 @@ pub fn list_sessions_local(options: &CatalogListOptions) -> Result<SessionCatalo
 pub fn discover_sessions_local(
     options: &DiscoverOptions,
 ) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
-    let conn = open_db(&default_db_path())?;
+    discover_sessions_local_at(&default_db_path(), options)
+}
+
+/// Shallow discovery into an explicitly selected database.
+pub fn discover_sessions_local_at(
+    db_path: &Path,
+    options: &DiscoverOptions,
+) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
+    let conn = open_db(db_path)?;
     discover_sessions_collect(&conn, options)
 }
 
@@ -397,7 +420,7 @@ enum Command {
         /// Legacy/manual: RelayAuth/Agent Relay token (device-flow JWT). Prefer Cloud login.
         #[arg(long)]
         token: Option<String>,
-        #[arg(long, default_value = "ai-hist-cli")]
+        #[arg(long, default_value = "ai-hist-engine")]
         label: String,
     },
     /// Dev-only: mint a local `rth_at_` token via /v1/admin/mint (needs ADMIN_MINT_SECRET).

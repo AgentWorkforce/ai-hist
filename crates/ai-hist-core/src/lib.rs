@@ -899,6 +899,23 @@ pub struct SessionEvent {
     pub event_uid: String,
 }
 
+/// Stable continuation for normalized session events.
+///
+/// Event timestamps are not unique, so `id` is part of the cursor. The query
+/// order is `(ts_ms ASC, id ASC)` and a page never needs to materialize the
+/// rest of a large transcript.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionEventCursor {
+    pub ts_ms: i64,
+    pub id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionEventPage {
+    pub events: Vec<SessionEvent>,
+    pub next_cursor: Option<SessionEventCursor>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionToolCall {
     pub id: i64,
@@ -963,6 +980,73 @@ pub fn session_events(
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// One bounded page of normalized events for a session, oldest first.
+pub fn session_events_page(
+    conn: &Connection,
+    session_id: &str,
+    source: Option<&str>,
+    limit: i64,
+    after: Option<&SessionEventCursor>,
+) -> Result<SessionEventPage> {
+    let limit = limit.clamp(1, 1_000);
+    let mut sql =
+        "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id, \
+                          ts_ms, role, kind, text, model, token_json, event_uid \
+                   FROM session_events WHERE session_id = ?"
+            .to_string();
+    let mut params_vec = vec![session_id.to_string()];
+    if let Some(source) = source {
+        sql.push_str(" AND source = ?");
+        params_vec.push(source.to_string());
+    }
+    if let Some(cursor) = after {
+        sql.push_str(" AND (ts_ms > ? OR (ts_ms = ? AND id > ?))");
+        params_vec.push(cursor.ts_ms.to_string());
+        params_vec.push(cursor.ts_ms.to_string());
+        params_vec.push(cursor.id.to_string());
+    }
+    sql.push_str(" ORDER BY ts_ms ASC, id ASC LIMIT ?");
+    params_vec.push((limit + 1).to_string());
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+        Ok(SessionEvent {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            session_id: row.get(2)?,
+            project: row.get(3)?,
+            cwd: row.get(4)?,
+            git_branch: row.get(5)?,
+            message_id: row.get(6)?,
+            parent_id: row.get(7)?,
+            ts_ms: row.get(8)?,
+            role: row.get(9)?,
+            kind: row.get(10)?,
+            text: row.get(11)?,
+            model: row.get(12)?,
+            token_json: row.get(13)?,
+            event_uid: row.get(14)?,
+        })
+    })?;
+    let mut events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_more = events.len() > limit as usize;
+    if has_more {
+        events.truncate(limit as usize);
+    }
+    let next_cursor = has_more && !events.is_empty();
+    let next_cursor = next_cursor.then(|| {
+        let last = events.last().expect("non-empty page");
+        SessionEventCursor {
+            ts_ms: last.ts_ms,
+            id: last.id,
+        }
+    });
+    Ok(SessionEventPage {
+        events,
+        next_cursor,
+    })
 }
 
 pub fn session_tool_calls(
@@ -1976,5 +2060,42 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(columns(&fresh), columns(&migrated));
+    }
+
+    #[test]
+    fn event_pages_are_bounded_and_do_not_skip_timestamp_ties() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(&dir.path().join("events.db")).unwrap();
+        for index in 0..5 {
+            conn.execute(
+                "INSERT INTO session_events
+                 (source, session_id, ts_ms, role, kind, text, event_uid)
+                 VALUES ('codex', 'tied', 42, 'assistant', 'text', ?, ?)",
+                params![format!("event-{index}"), format!("uid-{index}")],
+            )
+            .unwrap();
+        }
+
+        let first = session_events_page(&conn, "tied", Some("codex"), 2, None).unwrap();
+        assert_eq!(first.events.len(), 2);
+        let second =
+            session_events_page(&conn, "tied", Some("codex"), 2, first.next_cursor.as_ref())
+                .unwrap();
+        assert_eq!(second.events.len(), 2);
+        let third =
+            session_events_page(&conn, "tied", Some("codex"), 2, second.next_cursor.as_ref())
+                .unwrap();
+        assert_eq!(third.events.len(), 1);
+        assert!(third.next_cursor.is_none());
+
+        let ids = first
+            .events
+            .into_iter()
+            .chain(second.events)
+            .chain(third.events)
+            .map(|event| event.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 5);
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }

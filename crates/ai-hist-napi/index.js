@@ -310,9 +310,17 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { syncLocal, syncAndPush, listSessions, discoverSessions } = nativeBinding
+const { nativeContractVersion, search, recent, getSession, getSessionEventsPage, stats, listSessionCatalogPage, listSessionCatalog, discoverSessions, sync, syncLocal, syncAndPush } = nativeBinding
 
+module.exports.nativeContractVersion = nativeContractVersion
+module.exports.search = search
+module.exports.recent = recent
+module.exports.getSession = getSession
+module.exports.getSessionEventsPage = getSessionEventsPage
+module.exports.stats = stats
+module.exports.listSessionCatalogPage = listSessionCatalogPage
+module.exports.listSessionCatalog = listSessionCatalog
+module.exports.discoverSessions = discoverSessions
+module.exports.sync = sync
 module.exports.syncLocal = syncLocal
 module.exports.syncAndPush = syncAndPush
-module.exports.listSessions = listSessions
-module.exports.discoverSessions = discoverSessions

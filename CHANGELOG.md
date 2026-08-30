@@ -4,6 +4,18 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+### Breaking
+
+- Retire standalone Rust CLI release assets and the curl/source installer.
+  npm now distributes the public TypeScript SDK, Node CLI, MCP server, and
+  mandatory Node-API engine.
+
+### Added
+
+- Add native search, recent, session, paged events, statistics, discovery,
+  catalog listing, and explicit sync operations with contract version 2.
+- Add deterministic bounded event pagination using `(ts_ms, id)`.
+
 ### Added
 
 - Add `ai-hist sessions list` and `ai-hist sessions discover`: a shallow session

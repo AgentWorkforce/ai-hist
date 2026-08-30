@@ -1,59 +1,33 @@
 /**
- * TypeScript SDK for reading the ai-hist SQLite database.
+ * RelayHistory's public TypeScript API.
  *
- * Backed by sql.js (WASM SQLite) so the package has zero native build
- * requirements — works in Electron, Node, and browser contexts without
- * needing electron-rebuild. The SDK reads the same ai-hist SQLite database
- * that `ai-hist sync` writes (default
- * `~/.local/share/ai-hist/ai-history.db`, or `$AI_HIST_DB`).
- *
- * Trade-off vs better-sqlite3: sql.js loads the whole DB file into
- * memory. Fine for the ai-hist scale (tens of thousands of rows, MBs
- * of data); revisit if anyone hits millions.
+ * Every production operation crosses one mandatory Node-API boundary into the
+ * Rust engine. This module owns only input defaults, object normalization,
+ * pagination ergonomics, and stable JavaScript errors.
  */
 
-import initSqlJs, { type Database, type SqlJsStatic } from 'sql.js';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
-import { writeFileSync } from 'node:fs';
-import { execFile } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { promisify } from 'node:util';
-import { scanLocalSources, LOCAL_SOURCE_PATHS } from './jsonl-sources.js';
-import {
-  scanLocalTrajectories,
-  trajectoryRootDescription,
-  type TrajectoryDecision,
-  type TrajectoryRetrospective,
-} from './trajectory-sources.js';
-import {
-  catalogSessionFromJson,
-  type CatalogSession,
-  type ListCatalogOptions,
-  type SessionCatalogPage,
-} from './session-catalog.js';
 
-export {
-  SESSION_CATALOG_CONTRACT_VERSION,
-  DiscoveryError,
-  discoverSessions,
-  type CatalogSession,
-  type CatalogCursor,
-  type SessionCatalogPage,
-  type ListCatalogOptions,
-  type DiscoverSessionsOptions,
-  type DiscoverResult,
-  type DiscoverySummary,
-  type DiscoveryDiagnostic,
-  type DiscoveryCounters,
-  type ProviderDiscoverySummary,
-  type SourceExemption,
-} from './session-catalog.js';
-
-const execFileAsync = promisify(execFile);
+export const NATIVE_CONTRACT_VERSION = 2;
+export const SESSION_CATALOG_CONTRACT_VERSION = 1;
 
 export type Source = 'claude' | 'codex' | 'cursor' | 'grok' | 'relay' | 'trajectory' | 'opencode';
+export type CatalogSource = Exclude<Source, 'trajectory'>;
+
+export class RelayHistoryError extends Error {
+  constructor(message: string, readonly code: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = new.target.name;
+  }
+}
+
+export class UnsupportedPlatformError extends RelayHistoryError {}
+export class NativePackageMissingError extends RelayHistoryError {}
+export class NativeLoadError extends RelayHistoryError {}
+export class NativeContractMismatchError extends RelayHistoryError {}
+export class DatabaseOpenError extends RelayHistoryError {}
+export class InvalidArgumentError extends RelayHistoryError {}
 
 export interface HistoryEntry {
   id: number;
@@ -62,78 +36,109 @@ export interface HistoryEntry {
   project: string | null;
   prompt: string;
   timestampMs: number;
-  gitBranch: string | null;
 }
 
-/**
- * The pre-catalog `sessions` row shape, kept for backward compatibility.
- * New code wants {@link CatalogSession} (via `listSessionCatalog`), which
- * covers the whole catalog row: first prompt, models, originator, repo
- * identity, and discovery state.
- */
-export interface SessionMeta {
+export interface ListOptions {
+  dbPath?: string;
+  source?: Source;
+  project?: string;
+  tag?: string;
+  beforeMs?: number;
+  limit?: number;
+}
+
+export interface SearchOptions extends ListOptions {
+  rawFts?: boolean;
+}
+
+export interface SessionOptions {
+  dbPath?: string;
+  source?: Source;
+  tag?: string;
+}
+
+export interface CatalogCursor {
+  lastActivityMs: number | null;
+  source: string;
   sessionId: string;
-  source: Source;
+}
+
+export interface CatalogSession {
+  source: CatalogSource;
+  sessionId: string;
   cwd: string | null;
   gitBranch: string | null;
   firstActivityMs: number | null;
   lastActivityMs: number | null;
+  firstPrompt: string | null;
   lastAssistantText: string | null;
+  models: string[];
+  originator: string | null;
+  agentVersion: string | null;
+  repoUrl: string | null;
+  initialCommit: string | null;
+  workspaceRoots: string[];
   rawPath: string | null;
+  sourceStamp: string | null;
+  discoveryState: 'shallow' | 'full';
+  fromCache: boolean;
 }
 
-export interface HandoffCandidate {
-  sessionId: string;
-  source: Source;
-  cwd: string | null;
-  gitBranch: string | null;
-  firstActivityMs: number | null;
-  lastActivityMs: number | null;
-  promptCount: number;
-  goal: string;
-  lastState: string;
-  lastAssistantText: string | null;
-  filesTouched: string[];
-  resumeCommand: string | null;
-  warmStartCommand: string;
-  confidence: number;
+export interface ListCatalogOptions {
+  dbPath?: string;
+  sources?: CatalogSource[];
+  limit?: number;
+  beforeMs?: number;
+  after?: CatalogCursor;
 }
 
-export interface Tag {
-  name: string;
-  displayName: string;
-  color: string | null;
-  sessionCount: number;
-  firstTaggedMs: number | null;
-  lastTaggedMs: number | null;
+export interface SessionCatalogPage {
+  contractVersion: number;
+  sessions: CatalogSession[];
+  nextCursor: CatalogCursor | null;
 }
 
-export interface TaggedSession {
-  source: Source;
-  sessionId: string;
-  project: string | null;
-  entryCount: number;
-  lastActivityMs: number | null;
+export interface DiscoveryDiagnostic {
+  source: string;
+  locator: string | null;
+  error: string;
 }
 
-export interface SessionSummary {
-  sessionId: string;
-  source: Source;
-  project: string | null;
-  firstPrompt: string;
-  lastActivityMs: number;
-  firstActivityMs: number;
-  promptCount: number;
+export interface ProviderDiscoverySummary {
+  source: string;
+  candidates: number;
+  discovered: number;
+  skippedUnchanged: number;
+  failed: boolean;
 }
 
-/**
- * One normalized transcript event from the `session_events` table: user and
- * assistant text, thinking, tool calls, and tool results, in order.
- * `tokenUsage` is the parsed `token_json` blob — Claude's per-message
- * `usage` shape, or a Codex per-request delta (`input_tokens` inclusive of
- * `cached_input_tokens`). Claude repeats the same usage on every content
- * block of a message, so sum per distinct `messageId`, not per row.
- */
+export interface DiscoveryCounters {
+  candidatesEnumerated: number;
+  shallowReads: number;
+  skippedUnchanged: number;
+  filesOpened: number;
+  bytesRead: number;
+}
+
+export interface SourceExemption { source: string; reason: string }
+
+export interface DiscoverSessionsOptions {
+  dbPath?: string;
+  sources?: CatalogSource[];
+  limit?: number;
+}
+
+export interface DiscoverResult {
+  contractVersion: number;
+  sessions: CatalogSession[];
+  discovered: number;
+  skippedUnchanged: number;
+  providers: ProviderDiscoverySummary[];
+  exemptSources: SourceExemption[];
+  diagnostics: DiscoveryDiagnostic[];
+  counters: DiscoveryCounters;
+}
+
 export interface SessionEvent {
   id: number;
   source: Source;
@@ -152,34 +157,19 @@ export interface SessionEvent {
   eventUid: string;
 }
 
-/** One tool invocation from the `tool_calls` table. */
-export interface SessionToolCall {
-  id: number;
-  source: Source;
-  sessionId: string;
-  messageId: string | null;
-  toolUseId: string;
-  name: string;
-  target: string | null;
-  argsJson: string | null;
-  isError: boolean | null;
-  tsMs: number | null;
-}
+export interface EventCursor { tsMs: number; id: number }
 
-export interface ListOptions {
+export interface EventsPageOptions {
+  dbPath?: string;
   source?: Source;
-  project?: string;
-  tag?: string;
-  /** Default 50. */
   limit?: number;
-  /**
-   * Paginate older than this timestamp (exclusive). Use the
-   * `lastActivityMs` / `timestampMs` of the last item from the previous page.
-   */
-  beforeMs?: number;
+  after?: EventCursor;
 }
 
-export type SearchOptions = ListOptions;
+export interface SessionEventsPage {
+  events: SessionEvent[];
+  nextCursor: EventCursor | null;
+}
 
 export interface Stats {
   total: number;
@@ -189,1578 +179,320 @@ export interface Stats {
   lastTimestampMs: number | null;
 }
 
-export interface TrajectoryEntry {
-  id: string;
-  version: number | null;
-  personaId: string | null;
-  projectId: string | null;
-  task: {
-    title: string | null;
-    description: string | null;
-  };
-  status: string | null;
-  startedAt: string | null;
-  completedAt: string | null;
-  decisions: TrajectoryDecision[];
-  retrospective: TrajectoryRetrospective;
-  searchText: string;
-  path: string | null;
-  updatedMs: number;
-  timestampMs: number;
+export interface StatsOptions { dbPath?: string; tag?: string }
+export interface SyncOptions { dbPath?: string }
+export interface SyncResult { databasePath: string; completed: boolean }
+
+type UnknownRecord = Record<string, unknown>;
+
+interface NativeBinding {
+  nativeContractVersion(): number;
+  search(query: string, options?: object): Promise<UnknownRecord[]>;
+  recent(options?: object): Promise<UnknownRecord[]>;
+  getSession(sessionId: string, options?: object): Promise<UnknownRecord[]>;
+  getSessionEventsPage(sessionId: string, options?: object): Promise<UnknownRecord>;
+  stats(options?: object): Promise<UnknownRecord>;
+  listSessionCatalog(options?: object): Promise<UnknownRecord[]>;
+  listSessionCatalogPage(options?: object): Promise<UnknownRecord>;
+  discoverSessions(options?: object): Promise<UnknownRecord>;
+  sync(options?: object): Promise<UnknownRecord>;
 }
 
-export interface TrajectorySearchOptions {
-  /** Default 20. */
-  limit?: number;
-  /** Filter to a trajectory projectId or path. */
-  project?: string;
+const SUPPORTED_PLATFORMS = new Set([
+  'darwin-arm64', 'darwin-x64',
+  'linux-arm64-gnu', 'linux-arm64-musl',
+  'linux-x64-gnu', 'linux-x64-musl',
+  'win32-x64-msvc',
+]);
+
+function linuxLibc(): 'gnu' | 'musl' {
+  const report = process.report?.getReport() as { header?: { glibcVersionRuntime?: string } } | undefined;
+  return report?.header?.glibcVersionRuntime ? 'gnu' : 'musl';
 }
 
-export interface GetHandoffOptions {
-  /** Substring match against session cwd. */
-  repo?: string;
-  /** Substring match against git_branch. */
-  branch?: string;
-  /** Filter to a specific CLI source. */
-  source?: 'claude' | 'codex';
-  /** Max candidates to return. Default 3. */
-  limit?: number;
+export function runtimePlatform(): string {
+  if (process.platform === 'linux') return `linux-${process.arch}-${linuxLibc()}`;
+  if (process.platform === 'win32') return `win32-${process.arch}-msvc`;
+  return `${process.platform}-${process.arch}`;
 }
 
-/** Resolve the SQLite path that ai-hist writes to. */
-export function defaultDbPath(): string {
-  const fromEnv = process.env.AI_HIST_DB;
-  if (fromEnv && fromEnv.trim().length > 0) return fromEnv;
-  return join(homedir(), '.local', 'share', 'ai-hist', 'ai-history.db');
-}
+let nativePromise: Promise<NativeBinding> | null = null;
 
-function defaultOpenCodeDbPath(): string {
-  return process.env.OPENCODE_DB && process.env.OPENCODE_DB.trim().length > 0
-    ? process.env.OPENCODE_DB
-    : join(homedir(), '.local', 'share', 'opencode', 'opencode.db');
-}
-
-let _sqlPromise: Promise<SqlJsStatic> | null = null;
-function getSqlJs(): Promise<SqlJsStatic> {
-  if (!_sqlPromise) {
-    _sqlPromise = initSqlJs();
-  }
-  return _sqlPromise;
-}
-
-/**
- * Every non-key column of the session catalog, in the order the native schema
- * declares them. Used both to create the table and to backfill it column by
- * column on a database snapshot written before the catalog existed.
- */
-const SESSION_CATALOG_COLUMNS: ReadonlyArray<readonly [string, string]> = [
-  ['cwd', 'TEXT'],
-  ['git_branch', 'TEXT'],
-  ['first_activity_ms', 'INTEGER'],
-  ['last_activity_ms', 'INTEGER'],
-  ['last_assistant_text', 'TEXT'],
-  ['raw_path', 'TEXT'],
-  ['parser_version', 'INTEGER NOT NULL DEFAULT 1'],
-  ['first_prompt', 'TEXT'],
-  ['models_json', 'TEXT'],
-  ['originator', 'TEXT'],
-  ['agent_version', 'TEXT'],
-  ['repo_url', 'TEXT'],
-  ['initial_commit', 'TEXT'],
-  ['workspace_roots_json', 'TEXT'],
-  ['source_stamp', 'TEXT'],
-  ['discovery_state', 'TEXT'],
-];
-
-/** Run a statement whose only expected failure is "already there". */
-function tryRun(db: Database, sql: string): void {
-  try {
-    db.run(sql);
-  } catch {
-    /* column/index already exists, or the table shape rules it out */
-  }
-}
-
-/**
- * Ensure the in-memory copy has the current `sessions` shape.
- *
- * The catalog columns (`first_prompt`, `models_json`, `discovery_state`, …)
- * were added after 0.5.0, so a database file written by an older CLI has the
- * old nine-column table. `CREATE TABLE IF NOT EXISTS` would leave that table
- * untouched and every catalog read would fail with `no such column`, so each
- * column is also added best-effort with `ALTER TABLE` — the same trick used for
- * `history.git_branch` in `openAiHist`. The writes land only in the in-memory
- * copy sql.js holds; the file on disk is untouched and the missing columns
- * simply read as `NULL`.
- */
-function ensureSessionsSchema(db: Database): void {
-  db.run(`CREATE TABLE IF NOT EXISTS sessions (
-    session_id TEXT NOT NULL,
-    source TEXT NOT NULL,
-    cwd TEXT,
-    git_branch TEXT,
-    first_activity_ms INTEGER,
-    last_activity_ms INTEGER,
-    last_assistant_text TEXT,
-    raw_path TEXT,
-    parser_version INTEGER NOT NULL DEFAULT 1,
-    first_prompt TEXT,
-    models_json TEXT,
-    originator TEXT,
-    agent_version TEXT,
-    repo_url TEXT,
-    initial_commit TEXT,
-    workspace_roots_json TEXT,
-    source_stamp TEXT,
-    discovery_state TEXT,
-    PRIMARY KEY (session_id, source)
-  )`);
-  for (const [name, decl] of SESSION_CATALOG_COLUMNS) {
-    tryRun(db, `ALTER TABLE sessions ADD COLUMN ${name} ${decl}`);
-  }
-  tryRun(db, 'CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd)');
-  tryRun(db, 'CREATE INDEX IF NOT EXISTS idx_sessions_branch ON sessions(git_branch)');
-  tryRun(db, 'CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_activity_ms DESC)');
-  tryRun(
-    db,
-    'CREATE INDEX IF NOT EXISTS idx_sessions_source_last ON sessions(source, last_activity_ms DESC)',
-  );
-  // The catalog's total order is (last_activity_ms DESC, source, session_id) —
-  // recency alone ties constantly, since one discovery pass can stamp many
-  // sessions with the same mtime-derived millisecond. These two carry the whole
-  // ORDER BY, so the listing is answered without a sort here as it is natively.
-  tryRun(
-    db,
-    'CREATE INDEX IF NOT EXISTS idx_sessions_recency ON sessions(last_activity_ms DESC, source, session_id)',
-  );
-  tryRun(
-    db,
-    'CREATE INDEX IF NOT EXISTS idx_sessions_source_recency ON sessions(source, last_activity_ms DESC, session_id)',
-  );
-  tryRun(db, 'CREATE INDEX IF NOT EXISTS idx_sessions_raw_path ON sessions(source, raw_path)');
-}
-
-/**
- * Mirror the discovery bookkeeping table.
- *
- * Shallow discovery records here that a given source was examined at a given
- * stamp and found not to be a session (a subagent sidecar, say), so a rescan
- * costs a primary-key lookup instead of a re-read. The SDK never reads it; the
- * table is created so an in-memory copy has the same shape as the file the
- * native tool writes.
- */
-function ensureDiscoverySkipsSchema(db: Database): void {
-  db.run(`CREATE TABLE IF NOT EXISTS discovery_skips (
-    source TEXT NOT NULL,
-    locator TEXT NOT NULL,
-    stamp TEXT NOT NULL,
-    reason TEXT,
-    updated_ms INTEGER,
-    PRIMARY KEY (source, locator)
-  )`);
-}
-
-function ensureTrajectorySchema(db: Database): void {
-  db.run(`CREATE TABLE IF NOT EXISTS trajectories (
-    id TEXT PRIMARY KEY,
-    version INTEGER,
-    persona_id TEXT,
-    project_id TEXT,
-    task_title TEXT,
-    task_description TEXT,
-    status TEXT,
-    started_at TEXT,
-    completed_at TEXT,
-    decisions_json TEXT NOT NULL,
-    retrospective_json TEXT NOT NULL,
-    search_text TEXT NOT NULL,
-    path TEXT,
-    updated_ms INTEGER NOT NULL,
-    timestamp_ms INTEGER NOT NULL
-  )`);
-  db.run('CREATE INDEX IF NOT EXISTS idx_trajectories_timestamp ON trajectories(timestamp_ms DESC)');
-  db.run('CREATE INDEX IF NOT EXISTS idx_trajectories_project ON trajectories(project_id)');
-}
-
-function ensureTagSchema(db: Database): void {
-  db.run(`CREATE TABLE IF NOT EXISTS tags (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    display_name TEXT NOT NULL,
-    color TEXT,
-    created_ms INTEGER NOT NULL,
-    updated_ms INTEGER NOT NULL
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS session_tags (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-    created_ms INTEGER NOT NULL,
-    UNIQUE(source, session_id, tag_id)
-  )`);
-  db.run('CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name)');
-  db.run('CREATE INDEX IF NOT EXISTS idx_session_tags_session ON session_tags(source, session_id)');
-  db.run('CREATE INDEX IF NOT EXISTS idx_session_tags_tag ON session_tags(tag_id)');
-}
-
-export interface OpenOptions {
-  /** Override the SQLite path (default: `$AI_HIST_DB` or `~/.local/share/ai-hist/ai-history.db`). */
-  dbPath?: string;
-  /**
-   * Restrict all reads to one project directory/path. Exact matches and
-   * child paths are included, so a scope of `/repo` also includes `/repo/pkg`.
-   */
-  projectScope?: string;
-  /**
-   * What to do when the SQLite DB is missing:
-   *   - `'jsonl'` (default): scan local Claude/Codex/Cursor/Grok history files
-   *     directly into an in-memory SQLite — works without the native
-   *     `ai-hist` CLI installed.
-   *   - `'error'`: throw with an install hint (legacy 0.1.x behavior).
-   */
-  fallback?: 'jsonl' | 'error';
-}
-
-export interface OpenSourceInfo {
-  /** `'sqlite'` when the on-disk DB was used, `'jsonl'` when the fallback scan was. */
-  kind: 'sqlite' | 'jsonl';
-  /** SQLite DB path or, in jsonl mode, the paths that were scanned. */
-  path: string;
-}
-
-/**
- * Open an `AiHist` reader. Async because sql.js initializes its WASM
- * runtime lazily and the DB file is read asynchronously so the host
- * process's event loop isn't blocked.
- *
- * Each call snapshots the data; to pick up later writes, call `reload()`
- * (or open a fresh instance).
- */
-export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
-  const dbPath = opts.dbPath ?? defaultDbPath();
-  const fallback = opts.fallback ?? 'jsonl';
-
-  const SQL = await getSqlJs();
-
-  // Fast path: SQLite written by `ai-hist sync`.
-  if (await pathExists(dbPath)) {
-    const fileBuffer = await readFile(dbPath);
-    const db = new SQL.Database(fileBuffer);
-    ensureTrajectorySchema(db);
-    ensureTagSchema(db);
-    ensureSessionsSchema(db);
-    ensureDiscoverySkipsSchema(db);
-    // Add git_branch to history if missing (pre-handoff DBs lack this column).
-    try { db.run('ALTER TABLE history ADD COLUMN git_branch TEXT'); } catch { /* already exists */ }
-    // Older database schemas don't contain `idx_history_session` or
-    // `idx_history_timestamp`. Without them, listSessions degrades to
-    // an O(sessions × rows) full table scan and freezes the WASM
-    // single-threaded JS engine for tens of seconds on real-sized DBs.
-    // The DB is opened read-only over a buffer, but sql.js still lets
-    // us run `CREATE INDEX` against the in-memory copy — the index
-    // lives only for this session's lifetime and is rebuilt each
-    // `openAiHist` call. Fast (~30ms on 35K rows).
-    db.run('CREATE INDEX IF NOT EXISTS idx_history_session ON history(session_id)');
-    db.run('CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp_ms DESC)');
-    return new AiHist(db, { kind: 'sqlite', path: dbPath }, { projectScope: opts.projectScope });
-  }
-
-  if (fallback === 'error') {
-    throw new Error(
-      `ai-hist database not found at ${dbPath}. Run \`ai-hist sync\` first ` +
-        `(see https://github.com/AgentWorkforce/ai-hist).`,
+export function validateNativeContract(actual: number): void {
+  if (actual !== NATIVE_CONTRACT_VERSION) {
+    throw new NativeContractMismatchError(
+      `ai-hist requires native contract ${NATIVE_CONTRACT_VERSION}, but ai-hist-native provides ${actual}. Reinstall matching versions.`,
+      'NATIVE_CONTRACT_MISMATCH',
     );
   }
-
-  // Fallback: scan local source files (Claude/Codex/Cursor/Grok) directly.
-  // Uses TypeScript implementations of the source parsers. Yields control to
-  // the event loop between sources so a
-  // large local history doesn't freeze the host.
-  const db = new SQL.Database();
-  db.run(`CREATE TABLE history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,
-    session_id TEXT,
-    project TEXT,
-    prompt TEXT NOT NULL,
-    timestamp_ms INTEGER NOT NULL,
-    git_branch TEXT,
-    UNIQUE(source, timestamp_ms, prompt)
-  )`);
-  db.run('CREATE INDEX idx_history_timestamp ON history (timestamp_ms DESC)');
-  db.run('CREATE INDEX idx_history_session ON history (session_id)');
-  ensureTrajectorySchema(db);
-  ensureTagSchema(db);
-  ensureSessionsSchema(db);
-  ensureDiscoverySkipsSchema(db);
-
-  // scanLocalSources is async with yields between sources so the event
-  // loop stays responsive while we scan many MB of JSONL.
-  const rows = await scanLocalSources();
-  const openCodeRows = await scanOpenCode(SQL);
-  const trajectories = await scanLocalTrajectories();
-
-  const insert = db.prepare(
-    'INSERT OR IGNORE INTO history (source, session_id, project, prompt, timestamp_ms, git_branch) VALUES (?, ?, ?, ?, ?, ?)',
-  );
-  const insertTrajectory = db.prepare(
-    `INSERT OR REPLACE INTO trajectories
-     (id, version, persona_id, project_id, task_title, task_description, status,
-      started_at, completed_at, decisions_json, retrospective_json, search_text,
-      path, updated_ms, timestamp_ms)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-  try {
-    db.exec('BEGIN');
-    for (const row of rows) {
-      insert.run([row.source, row.sessionId, row.project, row.prompt, row.timestampMs, row.gitBranch]);
-    }
-    for (const row of openCodeRows) {
-      insert.run(['opencode', row.sessionId, row.project, row.prompt, row.timestampMs, null]);
-    }
-    for (const trajectory of trajectories) {
-      insertTrajectory.run([
-        trajectory.id,
-        trajectory.version,
-        trajectory.personaId,
-        trajectory.projectId,
-        trajectory.task.title,
-        trajectory.task.description,
-        trajectory.status,
-        trajectory.startedAt,
-        trajectory.completedAt,
-        JSON.stringify(trajectory.decisions),
-        JSON.stringify(trajectory.retrospective),
-        trajectory.searchText,
-        trajectory.path,
-        trajectory.updatedMs,
-        trajectory.timestampMs,
-      ]);
-      insert.run([
-        'trajectory',
-        trajectory.id,
-        trajectory.projectId,
-        trajectory.searchText,
-        trajectory.timestampMs,
-        null,
-      ]);
-    }
-    db.exec('COMMIT');
-  } finally {
-    insert.free();
-    insertTrajectory.free();
-  }
-  const scannedPaths = `${LOCAL_SOURCE_PATHS.claude}, ${LOCAL_SOURCE_PATHS.codex}, ${LOCAL_SOURCE_PATHS.cursorRoot}, ${LOCAL_SOURCE_PATHS.grokSessionsRoot}, ${trajectoryRootDescription()}`;
-  return new AiHist(db, { kind: 'jsonl', path: scannedPaths }, { projectScope: opts.projectScope });
 }
 
-async function pathExists(p: string): Promise<boolean> {
-  try {
-    await stat(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function readSqliteSnapshot(dbPath: string): Promise<Buffer> {
-  const hasWal = await pathExists(`${dbPath}-wal`);
-  const hasShm = await pathExists(`${dbPath}-shm`);
-  if (!hasWal && !hasShm) {
-    return readFile(dbPath);
-  }
-
-  const dir = await mkdtemp(join(tmpdir(), 'ai-hist-sqlite-snapshot-'));
-  const snapshot = join(dir, 'snapshot.db');
-  try {
-    await execFileAsync('sqlite3', [dbPath, `.backup '${snapshot.replace(/'/g, "''")}'`], {
-      timeout: 30_000,
-      maxBuffer: 1024 * 1024,
-    });
-    return await readFile(snapshot);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-}
-
-type ScannedOpenCodeRow = {
-  sessionId: string | null;
-  project: string | null;
-  prompt: string;
-  timestampMs: number;
-};
-
-async function scanOpenCode(SQL: SqlJsStatic): Promise<ScannedOpenCodeRow[]> {
-  const dbPath = defaultOpenCodeDbPath();
-  if (!(await pathExists(dbPath))) return [];
-  try {
-    const fileBuffer = await readSqliteSnapshot(dbPath);
-    const db = new SQL.Database(fileBuffer);
-    try {
-      const rows = runQuery<{
-        session_id: string;
-        project: string | null;
-        data: string;
-        timestamp_ms: number;
-      }>(
-        db,
-        `SELECT s.id AS session_id, s.directory AS project, p.data,
-                COALESCE(p.time_created, m.time_created, s.time_created) AS timestamp_ms
-         FROM part p
-         JOIN message m ON m.id = p.message_id
-         JOIN session s ON s.id = p.session_id
-         WHERE json_extract(m.data, '$.role') = 'user'
-           AND json_extract(p.data, '$.type') = 'text'
-         ORDER BY p.time_created ASC`,
-        [],
+async function loadNative(): Promise<NativeBinding> {
+  if (nativePromise) return nativePromise;
+  nativePromise = (async () => {
+    const platform = runtimePlatform();
+    if (!SUPPORTED_PLATFORMS.has(platform)) {
+      throw new UnsupportedPlatformError(
+        `RelayHistory has no native build for ${platform}. Supported platforms: ${[...SUPPORTED_PLATFORMS].join(', ')}.`,
+        'UNSUPPORTED_PLATFORM',
       );
-      const scanned: ScannedOpenCodeRow[] = [];
-      for (const row of rows) {
-        const data = parseJson<{ type?: string; text?: unknown }>(row.data, {});
-        const prompt = typeof data.text === 'string' ? data.text.trim() : '';
-        if (!prompt) continue;
-        scanned.push({
-          sessionId: row.session_id,
-          project: row.project,
-          prompt,
-          timestampMs: row.timestamp_ms ?? 0,
-        });
-      }
-      return scanned;
-    } finally {
-      db.close();
     }
-  } catch {
-    return [];
-  }
+    let loaded: unknown;
+    try {
+      // Kept as a variable so TypeScript does not require native build-time
+      // declarations; npm installs this mandatory production dependency.
+      const packageName = 'ai-hist-native';
+      loaded = await import(packageName);
+    } catch (cause) {
+      const error = cause as NodeJS.ErrnoException;
+      if (error.code === 'ERR_MODULE_NOT_FOUND' || error.code === 'MODULE_NOT_FOUND') {
+        throw new NativePackageMissingError(
+          `RelayHistory supports ${platform}, but its native package is missing. Reinstall ai-hist with optional dependencies enabled.`,
+          'NATIVE_PACKAGE_MISSING',
+          { cause },
+        );
+      }
+      throw new NativeLoadError(
+        `RelayHistory's native package for ${platform} failed to load: ${error.message}`,
+        'NATIVE_LOAD_FAILED',
+        { cause },
+      );
+    }
+    const binding = ((loaded as { default?: unknown }).default ?? loaded) as NativeBinding;
+    if (typeof binding.nativeContractVersion !== 'function') {
+      throw new NativeContractMismatchError(
+        'The installed ai-hist-native package does not expose a contract version. Reinstall matching ai-hist packages.',
+        'NATIVE_CONTRACT_MISMATCH',
+      );
+    }
+    validateNativeContract(binding.nativeContractVersion());
+    return binding;
+  })();
+  return nativePromise.catch((error) => {
+    nativePromise = null;
+    throw error;
+  });
 }
 
-interface RawHistoryRow {
-  id: number;
-  source: string;
-  session_id: string | null;
-  project: string | null;
-  prompt: string;
-  timestamp_ms: number;
-  git_branch: string | null;
+function nativeMessage(error: unknown): { code: string; message: string } | null {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = message.match(/RELAYHISTORY_NATIVE::([A-Z_]+)::([\s\S]*)/);
+  return match ? { code: match[1], message: match[2] } : null;
 }
 
-interface RawSessionRow {
-  session_id: string;
-  source: string;
-  cwd: string | null;
-  git_branch: string | null;
-  first_activity_ms: number | null;
-  last_activity_ms: number | null;
-  last_assistant_text: string | null;
-  raw_path: string | null;
-}
-
-interface RawTrajectoryRow {
-  id: string;
-  version: number | null;
-  persona_id: string | null;
-  project_id: string | null;
-  task_title: string | null;
-  task_description: string | null;
-  status: string | null;
-  started_at: string | null;
-  completed_at: string | null;
-  decisions_json: string;
-  retrospective_json: string;
-  search_text: string;
-  path: string | null;
-  updated_ms: number;
-  timestamp_ms: number;
-}
-
-function rowToEntry(row: RawHistoryRow): HistoryEntry {
-  return {
-    id: row.id,
-    source: row.source as Source,
-    sessionId: row.session_id,
-    project: row.project,
-    prompt: row.prompt,
-    timestampMs: row.timestamp_ms,
-    gitBranch: row.git_branch ?? null,
-  };
-}
-
-function parseJson<T>(raw: string, fallback: T): T {
+async function nativeCall<T>(call: (binding: NativeBinding) => Promise<T>): Promise<T> {
   try {
-    return JSON.parse(raw) as T;
-  } catch {
-    return fallback;
+    return await call(await loadNative());
+  } catch (error) {
+    if (error instanceof RelayHistoryError) throw error;
+    const native = nativeMessage(error);
+    if (!native) throw new NativeLoadError(String(error), 'NATIVE_CALL_FAILED', { cause: error });
+    if (native.code === 'DATABASE_OPEN_FAILED') {
+      throw new DatabaseOpenError(native.message, native.code, { cause: error });
+    }
+    if (native.code === 'INVALID_ARGUMENT') {
+      throw new InvalidArgumentError(native.message, native.code, { cause: error });
+    }
+    throw new RelayHistoryError(native.message, native.code, { cause: error });
   }
 }
 
-function rowToTrajectory(row: RawTrajectoryRow): TrajectoryEntry {
+function nullableString(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+function historyEntry(value: UnknownRecord): HistoryEntry {
   return {
-    id: row.id,
-    version: row.version,
-    personaId: row.persona_id,
-    projectId: row.project_id,
-    task: {
-      title: row.task_title,
-      description: row.task_description,
-    },
-    status: row.status,
-    startedAt: row.started_at,
-    completedAt: row.completed_at,
-    decisions: parseJson<TrajectoryDecision[]>(row.decisions_json, []),
-    retrospective: parseJson<TrajectoryRetrospective>(row.retrospective_json, {
-      summary: null,
-      approach: null,
-      learnings: [],
-      confidence: null,
-    }),
-    searchText: row.search_text,
-    path: row.path,
-    updatedMs: row.updated_ms,
-    timestampMs: row.timestamp_ms,
+    id: Number(value.id),
+    source: String(value.source) as Source,
+    sessionId: nullableString(value.sessionId),
+    project: nullableString(value.project),
+    prompt: String(value.prompt),
+    timestampMs: Number(value.timestampMs),
   };
 }
 
-function normalizeProjectScope(project: string | undefined): string | undefined {
-  const trimmed = project?.trim();
-  if (!trimmed) return undefined;
-  return trimmed.replace(/[\\/]+$/, '') || trimmed;
-}
-
-function escapeLike(value: string): string {
-  return value.replace(/\|/g, '||').replace(/%/g, '|%').replace(/_/g, '|_');
-}
-
-function scopedPathClause(column: string, project: string): { sql: string; params: unknown[] } {
-  const normalized = normalizeProjectScope(project) ?? project;
-  const escaped = escapeLike(normalized);
-  const slashChildPattern = normalized === '/' ? '/%' : `${escaped}/%`;
-  const backslashChildPattern = normalized === '\\' ? '\\%' : `${escaped}\\%`;
+function catalogCursor(value: unknown): CatalogCursor | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as UnknownRecord;
   return {
-    sql: `(${column} = ? OR ${column} LIKE ? ESCAPE '|' OR ${column} LIKE ? ESCAPE '|')`,
-    params: [normalized, slashChildPattern, backslashChildPattern],
+    lastActivityMs: typeof row.lastActivityMs === 'number' ? row.lastActivityMs : null,
+    source: String(row.source),
+    sessionId: String(row.sessionId),
   };
 }
 
-function scopedTrajectoryClause(project: string): { sql: string; params: unknown[] } {
-  const normalized = normalizeProjectScope(project) ?? project;
-  const pathScope = scopedPathClause('path', normalized);
+function catalogSession(value: UnknownRecord): CatalogSession {
   return {
-    sql: `(project_id = ? OR ${pathScope.sql})`,
-    params: [normalized, ...pathScope.params],
+    source: String(value.source) as CatalogSource,
+    sessionId: String(value.sessionId),
+    cwd: nullableString(value.cwd),
+    gitBranch: nullableString(value.gitBranch),
+    firstActivityMs: typeof value.firstActivityMs === 'number' ? value.firstActivityMs : null,
+    lastActivityMs: typeof value.lastActivityMs === 'number' ? value.lastActivityMs : null,
+    firstPrompt: nullableString(value.firstPrompt),
+    lastAssistantText: nullableString(value.lastAssistantText),
+    models: Array.isArray(value.models) ? value.models.map(String) : [],
+    originator: nullableString(value.originator),
+    agentVersion: nullableString(value.agentVersion),
+    repoUrl: nullableString(value.repoUrl),
+    initialCommit: nullableString(value.initialCommit),
+    workspaceRoots: Array.isArray(value.workspaceRoots) ? value.workspaceRoots.map(String) : [],
+    rawPath: nullableString(value.rawPath),
+    sourceStamp: nullableString(value.sourceStamp),
+    discoveryState: value.discoveryState === 'shallow' ? 'shallow' : 'full',
+    fromCache: value.fromCache === true,
   };
 }
 
-function appendProjectFilter(
-  clauses: string[],
-  params: unknown[],
-  project: string | undefined,
-  projectScope: string | undefined,
-): void {
-  if (projectScope) {
-    const scope = scopedPathClause('project', projectScope);
-    clauses.push(scope.sql);
-    params.push(...scope.params);
-  }
-  if (project) {
-    clauses.push('project = ?');
-    params.push(project);
+function assertCatalogContract(value: number): void {
+  if (value !== SESSION_CATALOG_CONTRACT_VERSION) {
+    throw new NativeContractMismatchError(
+      `ai-hist expects catalog contract ${SESSION_CATALOG_CONTRACT_VERSION}, but native returned ${value}.`,
+      'CATALOG_CONTRACT_MISMATCH',
+    );
   }
 }
 
-function normalizeTagName(tag: string): string {
-  return tag.trim().toLowerCase().replace(/\s+/g, ' ');
-}
-
-function appendTagFilter(clauses: string[], params: unknown[], tag: string | undefined, alias = 'history'): void {
-  const normalized = tag ? normalizeTagName(tag) : '';
-  if (!normalized) return;
-  clauses.push(
-    `EXISTS (
-      SELECT 1 FROM session_tags st
-      JOIN tags t ON t.id = st.tag_id
-      WHERE st.source = ${alias}.source
-        AND st.session_id = ${alias}.session_id
-        AND t.name = ?
-    )`,
-  );
-  params.push(normalized);
-}
-
-function buildFilters(opts: ListOptions, projectScope?: string): { sql: string; params: unknown[] } {
-  const clauses: string[] = [];
-  const params: unknown[] = [];
-  if (opts.source) {
-    clauses.push('source = ?');
-    params.push(opts.source);
-  }
-  appendProjectFilter(clauses, params, opts.project, projectScope);
-  appendTagFilter(clauses, params, opts.tag, 'history');
-  if (typeof opts.beforeMs === 'number') {
-    clauses.push('timestamp_ms < ?');
-    params.push(opts.beforeMs);
-  }
-  return {
-    sql: clauses.length > 0 ? ` AND ${clauses.join(' AND ')}` : '',
-    params,
-  };
-}
-
-function tableExists(db: Database, name: string): boolean {
-  return (
-    runQuery<{ c: number }>(
-      db,
-      "SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'table' AND name = ?",
-      [name],
-    )[0]?.c > 0
-  );
-}
-
-function parseTokenJson(raw: string | null): Record<string, unknown> | null {
-  if (!raw) return null;
+function tokenUsage(raw: unknown): Record<string, unknown> | null {
+  if (typeof raw !== 'string') return null;
   try {
-    const parsed: unknown = JSON.parse(raw);
-    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : null;
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
   } catch {
     return null;
   }
 }
 
-function runQuery<T>(db: Database, sql: string, params: unknown[]): T[] {
-  const stmt = db.prepare(sql);
-  try {
-    stmt.bind(params as never[]);
-    const rows: T[] = [];
-    while (stmt.step()) {
-      rows.push(stmt.getAsObject() as T);
-    }
-    return rows;
-  } finally {
-    stmt.free();
-  }
+function sessionEvent(value: UnknownRecord): SessionEvent {
+  return {
+    id: Number(value.id), source: String(value.source) as Source, sessionId: String(value.sessionId),
+    project: nullableString(value.project), cwd: nullableString(value.cwd), gitBranch: nullableString(value.gitBranch),
+    messageId: nullableString(value.messageId), parentId: nullableString(value.parentId), tsMs: Number(value.tsMs),
+    role: String(value.role) as SessionEvent['role'], kind: String(value.kind) as SessionEvent['kind'],
+    text: nullableString(value.text), model: nullableString(value.model), tokenUsage: tokenUsage(value.tokenJson),
+    eventUid: String(value.eventUid),
+  };
 }
 
-export class AiHist {
-  private readonly db: Database;
-  private readonly _source: OpenSourceInfo;
-  private readonly _projectScope: string | undefined;
-  private closed = false;
+export function defaultDbPath(): string {
+  return process.env.AI_HIST_DB?.trim() || join(homedir(), '.local', 'share', 'ai-hist', 'ai-history.db');
+}
 
-  /** @internal — use `openAiHist(...)` to construct. */
-  constructor(db: Database, source: OpenSourceInfo, opts: Pick<OpenOptions, 'projectScope'> = {}) {
-    this.db = db;
-    this._source = source;
-    this._projectScope = normalizeProjectScope(opts.projectScope);
-  }
+export async function search(query: string, options: SearchOptions = {}): Promise<HistoryEntry[]> {
+  return nativeCall(async (native) => (await native.search(query, options)).map(historyEntry));
+}
 
-  /**
-   * Path the data came from. SQLite mode: the .db path. JSONL fallback
-   * mode: a comma-separated list of the scanned source paths.
-   */
-  get dbPath(): string {
-    return this._source.path;
-  }
+export async function recent(options: ListOptions = {}): Promise<HistoryEntry[]> {
+  return nativeCall(async (native) => (await native.recent(options)).map(historyEntry));
+}
 
-  /** Which data path was used: `'sqlite'` (on-disk SQLite database) or `'jsonl'` (fallback). */
-  get sourceKind(): 'sqlite' | 'jsonl' {
-    return this._source.kind;
-  }
+export async function getSession(sessionId: string, options: SessionOptions = {}): Promise<HistoryEntry[]> {
+  return nativeCall(async (native) => (await native.getSession(sessionId, options)).map(historyEntry));
+}
 
-  /** Server/client-wide project scope applied to every read, if configured. */
-  get projectScope(): string | undefined {
-    return this._projectScope;
-  }
+export async function listSessionCatalog(options: ListCatalogOptions = {}): Promise<CatalogSession[]> {
+  return nativeCall(async (native) => (await native.listSessionCatalog(options)).map(catalogSession));
+}
 
-  close(): void {
-    if (this.closed) return;
-    this.db.close();
-    this.closed = true;
-  }
-
-  private persistIfWritable(): void {
-    if (this._source.kind !== 'sqlite') return;
-    writeFileSync(this._source.path, Buffer.from(this.db.export()));
-  }
-
-  private ensureTag(name: string, color?: string | null): number {
-    const normalized = normalizeTagName(name);
-    if (!normalized) throw new Error('tag name cannot be empty');
-    const displayName = name.trim();
-    const now = Date.now();
-    this.db.run(
-      `INSERT INTO tags (name, display_name, color, created_ms, updated_ms)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(name) DO UPDATE SET
-         display_name = excluded.display_name,
-         color = COALESCE(excluded.color, tags.color),
-         updated_ms = excluded.updated_ms`,
-      [normalized, displayName, color ?? null, now, now],
-    );
-    return runQuery<{ id: number }>(this.db, 'SELECT id FROM tags WHERE name = ?', [normalized])[0].id;
-  }
-
-  private matchingSessions(sessionId: string, source?: Source): TaggedSession[] {
-    const clauses = ['session_id = ?'];
-    const params: unknown[] = [sessionId];
-    if (source) {
-      clauses.push('source = ?');
-      params.push(source);
-    }
-    appendProjectFilter(clauses, params, undefined, this._projectScope);
-    return runQuery<{
-      source: string;
-      session_id: string;
-      project: string | null;
-      entry_count: number;
-      last_activity_ms: number | null;
-    }>(
-      this.db,
-      `SELECT source, session_id, MIN(project) AS project, COUNT(*) AS entry_count,
-              MAX(timestamp_ms) AS last_activity_ms
-       FROM history
-       WHERE ${clauses.join(' AND ')}
-       GROUP BY source, session_id
-       ORDER BY source`,
-      params,
-    ).map((row) => ({
-      source: row.source as Source,
-      sessionId: row.session_id,
-      project: row.project,
-      entryCount: row.entry_count,
-      lastActivityMs: row.last_activity_ms,
-    }));
-  }
-
-  tagSession(sessionId: string, tagName: string, opts: { source?: Source; color?: string | null } = {}): TaggedSession[] {
-    const sessions = this.matchingSessions(sessionId, opts.source);
-    if (sessions.length === 0) return [];
-    const tagId = this.ensureTag(tagName, opts.color);
-    const now = Date.now();
-    const insert = this.db.prepare(
-      'INSERT OR IGNORE INTO session_tags (source, session_id, tag_id, created_ms) VALUES (?, ?, ?, ?)',
-    );
-    try {
-      for (const session of sessions) {
-        insert.run([session.source, session.sessionId, tagId, now]);
-      }
-    } finally {
-      insert.free();
-    }
-    this.persistIfWritable();
-    return sessions;
-  }
-
-  untagSession(sessionId: string, tagName: string, opts: { source?: Source } = {}): number {
-    const normalized = normalizeTagName(tagName);
-    const sessions = this.matchingSessions(sessionId, opts.source);
-    let removed = 0;
-    for (const session of sessions) {
-      this.db.run(
-        `DELETE FROM session_tags
-         WHERE source = ? AND session_id = ?
-           AND tag_id IN (SELECT id FROM tags WHERE name = ?)`,
-        [session.source, session.sessionId, normalized],
-      );
-      removed += this.db.getRowsModified();
-    }
-    this.persistIfWritable();
-    return removed;
-  }
-
-  listTags(opts: { tag?: string; includeSessions?: boolean } = {}): Array<Tag & { sessions?: TaggedSession[] }> {
-    const clauses: string[] = [];
-    const params: unknown[] = [];
-    if (opts.tag) {
-      clauses.push('t.name = ?');
-      params.push(normalizeTagName(opts.tag));
-    }
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-    let scopedSessionSql = 'SELECT st.tag_id, st.id, st.created_ms FROM session_tags st';
-    const scopedSessionParams: unknown[] = [];
-    if (this._projectScope) {
-      const scope = scopedPathClause('h.project', this._projectScope);
-      scopedSessionSql = `SELECT st.tag_id, st.id, st.created_ms
-        FROM session_tags st
-        WHERE EXISTS (
-          SELECT 1 FROM history h
-          WHERE h.source = st.source
-            AND h.session_id = st.session_id
-            AND ${scope.sql}
-        )`;
-      scopedSessionParams.push(...scope.params);
-    }
-    return runQuery<{
-      name: string;
-      display_name: string;
-      color: string | null;
-      session_count: number;
-      first_tagged_ms: number | null;
-      last_tagged_ms: number | null;
-    }>(
-      this.db,
-      `SELECT t.name, t.display_name, t.color, COUNT(st.id) AS session_count,
-              MIN(st.created_ms) AS first_tagged_ms, MAX(st.created_ms) AS last_tagged_ms
-       FROM tags t
-       LEFT JOIN (${scopedSessionSql}) st ON st.tag_id = t.id
-       ${where}
-       GROUP BY t.id, t.name, t.display_name, t.color
-       ORDER BY t.name`,
-      [...scopedSessionParams, ...params],
-    ).map((row) => {
-      const tag: Tag & { sessions?: TaggedSession[] } = {
-        name: row.name,
-        displayName: row.display_name,
-        color: row.color,
-        sessionCount: row.session_count,
-        firstTaggedMs: row.first_tagged_ms,
-        lastTaggedMs: row.last_tagged_ms,
-      };
-      if (opts.includeSessions) {
-        tag.sessions = this.sessionsByTag(row.name);
-      }
-      return tag;
-    });
-  }
-
-  sessionsByTag(tagName: string): TaggedSession[] {
-    const clauses = ['t.name = ?'];
-    const params: unknown[] = [normalizeTagName(tagName)];
-    if (this._projectScope) {
-      const scope = scopedPathClause('h.project', this._projectScope);
-      clauses.push(scope.sql);
-      params.push(...scope.params);
-    }
-    return runQuery<{
-      source: string;
-      session_id: string;
-      project: string | null;
-      entry_count: number;
-      last_activity_ms: number | null;
-    }>(
-      this.db,
-      `SELECT st.source, st.session_id, MIN(h.project) AS project, COUNT(h.id) AS entry_count,
-              MAX(h.timestamp_ms) AS last_activity_ms
-       FROM session_tags st
-       JOIN tags t ON t.id = st.tag_id
-       JOIN history h ON h.source = st.source AND h.session_id = st.session_id
-       WHERE ${clauses.join(' AND ')}
-       GROUP BY st.source, st.session_id
-       ORDER BY MAX(h.timestamp_ms) DESC`,
-      params,
-    ).map((row) => ({
-      source: row.source as Source,
-      sessionId: row.session_id,
-      project: row.project,
-      entryCount: row.entry_count,
-      lastActivityMs: row.last_activity_ms,
-    }));
-  }
-
-  searchByTag(tagName: string, opts: Omit<SearchOptions, 'tag'> = {}): HistoryEntry[] {
-    return this.recent({ ...opts, tag: tagName });
-  }
-
-  /** Most recent prompts, newest first. */
-  recent(opts: ListOptions = {}): HistoryEntry[] {
-    const limit = opts.limit ?? 50;
-    const { sql, params } = buildFilters(opts, this._projectScope);
-    return runQuery<RawHistoryRow>(
-      this.db,
-      `SELECT id, source, session_id, project, prompt, timestamp_ms, git_branch
-       FROM history
-       WHERE 1=1${sql}
-       ORDER BY timestamp_ms DESC
-       LIMIT ?`,
-      [...params, limit],
-    ).map(rowToEntry);
-  }
-
-  /**
-   * Group history into sessions, ordered by last activity (newest first).
-   * Sessions without a `session_id` are skipped.
-   *
-   * This derives sessions from the `history` table, so it only ever sees
-   * sessions a full `ai-hist sync` has ingested, and it pays a window-function
-   * pass over history to do it. For the fast and complete path — every session
-   * the catalog knows, including ones only shallow discovery has seen, with
-   * cwd, branch, models, originator and repo identity attached — use
-   * {@link AiHist.listSessionCatalog}. This method stays as-is for callers
-   * that want prompt counts and the project-derived grouping.
-   *
-   * Implementation note: this used to use a correlated scalar subquery
-   * to pick `first_prompt`, which ran in O(sessions × rows) — ~19s on a
-   * 35K-row DB. Switched to `ROW_NUMBER() OVER (PARTITION BY session_id
-   * ORDER BY timestamp_ms)` so first-prompt picking is a single pass
-   * over the table (~300ms on the same DB). Plus the index ensure step
-   * in `openAiHist` keeps it fast even when the DB was written by an
-   * older CLI that didn't create `idx_history_session`.
-   */
-  listSessions(opts: ListOptions = {}): SessionSummary[] {
-    const limit = opts.limit ?? 50;
-    const { sql, params } = buildFilters(opts, this._projectScope);
-    const rows = runQuery<{
-      session_id: string;
-      source: string;
-      project: string | null;
-      first_prompt: string;
-      first_activity_ms: number;
-      last_activity_ms: number;
-      prompt_count: number;
-    }>(
-      this.db,
-      `WITH filtered AS (
-        SELECT id, source, session_id, project, prompt, timestamp_ms
-        FROM history
-        WHERE session_id IS NOT NULL AND session_id != ''${sql}
-      ),
-      ranked AS (
-        SELECT
-          session_id,
-          source,
-          project,
-          prompt,
-          timestamp_ms,
-          ROW_NUMBER() OVER (
-            PARTITION BY session_id, source, project
-            ORDER BY timestamp_ms ASC, id ASC
-          ) AS rn_first,
-          COUNT(*) OVER (PARTITION BY session_id, source, project) AS prompt_count,
-          MIN(timestamp_ms) OVER (PARTITION BY session_id, source, project) AS first_activity_ms,
-          MAX(timestamp_ms) OVER (PARTITION BY session_id, source, project) AS last_activity_ms
-        FROM filtered
-      )
-      SELECT
-        session_id,
-        source,
-        project,
-        prompt AS first_prompt,
-        first_activity_ms,
-        last_activity_ms,
-        prompt_count
-      FROM ranked
-      WHERE rn_first = 1
-      ORDER BY last_activity_ms DESC
-      LIMIT ?`,
-      [...params, limit],
-    );
-    return rows.map((row) => ({
-      sessionId: row.session_id,
-      source: row.source as Source,
-      project: row.project,
-      firstPrompt: row.first_prompt,
-      lastActivityMs: row.last_activity_ms,
-      firstActivityMs: row.first_activity_ms,
-      promptCount: row.prompt_count,
-    }));
-  }
-
-  /**
-   * The session catalog, newest first — one indexed query over `sessions` and
-   * nothing else.
-   *
-   * No provider transcript is opened and neither `history` nor
-   * `session_events` is touched, so this stays fast on first paint even with
-   * thousands of historical sessions. It is the read side of the native
-   * `ai-hist sessions list`; populate the catalog with `discoverSessions()`
-   * (or a full `ai-hist sync`).
-   *
-   * Details worth knowing:
-   *   - `trajectory` rows are excluded defensively — trajectories are derived
-   *     records, not sessions, and must never appear in a session list.
-   *   - The catalog's total order is
-   *     `(last_activity_ms DESC, source ASC, session_id ASC)`. SQLite sorts
-   *     NULL lowest, so rows of unknown recency land last under `DESC` without
-   *     a helper expression. Recency alone is not a key: one discovery pass can
-   *     stamp many sessions with the same mtime-derived millisecond, which is
-   *     why the identity columns are part of the order.
-   *   - To page, use {@link AiHist.listSessionCatalogPage} and follow its
-   *     `nextCursor`. `beforeMs` is only a *coarse* cutoff ("anything before
-   *     last Tuesday"): it cannot separate rows sharing a millisecond, so a
-   *     walk built on it drops every row tied with a page boundary. It is
-   *     ignored when `after` is set.
-   *   - A configured `projectScope` constrains rows by `cwd`, like
-   *     `getHandoff`. Sources with no working directory (relay) therefore drop
-   *     out of a scoped listing.
-   *   - In JSONL fallback mode (no SQLite database) the catalog is empty and
-   *     this returns `[]`: the fallback scan builds `history` rows only, and
-   *     only the native discovery engine writes the catalog.
-   */
-  listSessionCatalog(opts: ListCatalogOptions = {}): CatalogSession[] {
-    if (!tableExists(this.db, 'sessions')) return [];
-    // SQLite reads a negative LIMIT as "unlimited", so a negative cap would
-    // quietly dump the whole catalog. The native CLI rejects it; so do we.
-    if (typeof opts.limit === 'number' && opts.limit < 0) {
-      throw new RangeError(`limit must not be negative (got ${opts.limit})`);
-    }
-    const limit = opts.limit ?? 50;
-    const clauses: string[] = ["source != 'trajectory'"];
-    const params: unknown[] = [];
-
-    const sources = [...(opts.sources ?? [])].map((source) => String(source));
-    if (sources.length > 0) {
-      clauses.push(`source IN (${sources.map(() => '?').join(', ')})`);
-      params.push(...sources);
-    }
-    if (opts.after) {
-      // Everything strictly after the cursor in the catalog's total order.
-      // Undated rows sort last, so a dated cursor must still reach them.
-      const { lastActivityMs, source, sessionId } = opts.after;
-      // A timestamp alone is not a cursor: without the identity columns the
-      // predicate cannot separate rows sharing a millisecond, and silently
-      // dropping the cursor would restart the walk at page one. The native CLI
-      // rejects the same half-cursor; so does this, rather than looping.
-      if (typeof source !== 'string' || source.length === 0 || typeof sessionId !== 'string' || sessionId.length === 0) {
-        throw new TypeError(
-          'after must carry both source and sessionId — pass the whole nextCursor object from the previous page',
-        );
-      }
-      if (typeof lastActivityMs === 'number') {
-        clauses.push(
-          `(last_activity_ms IS NULL OR last_activity_ms < ?
-             OR (last_activity_ms = ?
-                 AND (source > ? OR (source = ? AND session_id > ?))))`,
-        );
-        params.push(lastActivityMs, lastActivityMs, source, source, sessionId);
-      } else {
-        clauses.push(
-          `last_activity_ms IS NULL AND (source > ? OR (source = ? AND session_id > ?))`,
-        );
-        params.push(source, source, sessionId);
-      }
-    } else if (typeof opts.beforeMs === 'number') {
-      clauses.push('last_activity_ms < ?');
-      params.push(opts.beforeMs);
-    }
-    if (this._projectScope) {
-      const scope = scopedPathClause('cwd', this._projectScope);
-      clauses.push(scope.sql);
-      params.push(...scope.params);
-    }
-
-    return runQuery<Record<string, unknown>>(
-      this.db,
-      `SELECT source, session_id, cwd, git_branch, first_activity_ms, last_activity_ms,
-              first_prompt, last_assistant_text, models_json, originator, agent_version,
-              repo_url, initial_commit, workspace_roots_json, raw_path, source_stamp,
-              discovery_state, parser_version
-       FROM sessions
-       WHERE ${clauses.join(' AND ')}
-       ORDER BY last_activity_ms DESC, source ASC, session_id ASC
-       LIMIT ?`,
-      [...params, limit],
-    ).map((row) => catalogSessionFromJson({ ...row, from_cache: true }));
-  }
-
-  /**
-   * {@link AiHist.listSessionCatalog} plus the cursor that continues it.
-   *
-   * Follow `nextCursor` until it comes back `null` to walk the whole catalog:
-   * no skipped and no duplicated rows, even when a whole page shares one
-   * millisecond, and the undated tail stays reachable from a dated cursor.
-   * `nextCursor` is non-null only when the page filled its limit, mirroring
-   * the native `list_session_catalog_page` and the CLI's `next_cursor`.
-   */
-  listSessionCatalogPage(opts: ListCatalogOptions = {}): SessionCatalogPage {
-    const sessions = this.listSessionCatalog(opts);
-    const limit = opts.limit ?? 50;
-    const last = sessions[sessions.length - 1];
-    const nextCursor =
-      limit > 0 && sessions.length >= limit && last
-        ? { lastActivityMs: last.lastActivityMs, source: last.source, sessionId: last.sessionId }
-        : null;
-    return { sessions, nextCursor };
-  }
-
-  /** All prompts in a session, ordered oldest → newest. */
-  getSession(sessionId: string, opts: Pick<ListOptions, 'source' | 'tag'> = {}): HistoryEntry[] {
-    const clauses = ['session_id = ?'];
-    const params: unknown[] = [sessionId];
-    if (opts.source) {
-      clauses.push('source = ?');
-      params.push(opts.source);
-    }
-    appendProjectFilter(clauses, params, undefined, this._projectScope);
-    appendTagFilter(clauses, params, opts.tag, 'history');
-    return runQuery<RawHistoryRow>(
-      this.db,
-      `SELECT id, source, session_id, project, prompt, timestamp_ms, git_branch
-       FROM history
-       WHERE ${clauses.join(' AND ')}
-       ORDER BY timestamp_ms ASC`,
-      params,
-    ).map(rowToEntry);
-  }
-
-  /**
-   * All normalized events for a session, oldest first — messages, thinking,
-   * tool calls, and tool results with per-event token usage where the
-   * transcript provides it. Returns `[]` when the database predates the
-   * `session_events` table (or in JSONL fallback mode, which has no events).
-   *
-   * Size caveat: this SDK loads the whole database file into memory, so on
-   * large event-bearing databases prefer streaming from the native CLI
-   * (`ai-hist events <session-id> --json`).
-   */
-  getSessionEvents(sessionId: string, opts: { source?: Source } = {}): SessionEvent[] {
-    if (!tableExists(this.db, 'session_events')) return [];
-    const clauses = ['session_id = ?'];
-    const params: unknown[] = [sessionId];
-    if (opts.source) {
-      clauses.push('source = ?');
-      params.push(opts.source);
-    }
-    appendProjectFilter(clauses, params, undefined, this._projectScope);
-    interface RawEventRow {
-      id: number;
-      source: Source;
-      session_id: string;
-      project: string | null;
-      cwd: string | null;
-      git_branch: string | null;
-      message_id: string | null;
-      parent_id: string | null;
-      ts_ms: number;
-      role: SessionEvent['role'];
-      kind: SessionEvent['kind'];
-      text: string | null;
-      model: string | null;
-      token_json: string | null;
-      event_uid: string;
-    }
-    return runQuery<RawEventRow>(
-      this.db,
-      `SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id,
-              ts_ms, role, kind, text, model, token_json, event_uid
-       FROM session_events
-       WHERE ${clauses.join(' AND ')}
-       ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC`,
-      params,
-    ).map((row) => ({
-      id: row.id,
-      source: row.source,
-      sessionId: row.session_id,
-      project: row.project,
-      cwd: row.cwd,
-      gitBranch: row.git_branch,
-      messageId: row.message_id,
-      parentId: row.parent_id,
-      tsMs: row.ts_ms,
-      role: row.role,
-      kind: row.kind,
-      text: row.text,
-      model: row.model,
-      tokenUsage: parseTokenJson(row.token_json),
-      eventUid: row.event_uid,
-    }));
-  }
-
-  /** All tool calls for a session, oldest first; `[]` on pre-events databases. */
-  getToolCalls(sessionId: string, opts: { source?: Source } = {}): SessionToolCall[] {
-    if (!tableExists(this.db, 'tool_calls')) return [];
-    const clauses = ['session_id = ?'];
-    const params: unknown[] = [sessionId];
-    if (opts.source) {
-      clauses.push('source = ?');
-      params.push(opts.source);
-    }
-    // tool_calls has no project column; the configured scope constrains
-    // through the session's events. Without that table the scoped answer is
-    // unknowable — fail closed rather than throw.
-    if (this._projectScope) {
-      if (!tableExists(this.db, 'session_events')) return [];
-      const scope = scopedPathClause('e.project', this._projectScope);
-      clauses.push(
-        `EXISTS (SELECT 1 FROM session_events e
-                 WHERE e.source = tool_calls.source AND e.session_id = tool_calls.session_id
-                   AND ${scope.sql})`,
-      );
-      params.push(...scope.params);
-    }
-    interface RawToolCallRow {
-      id: number;
-      source: Source;
-      session_id: string;
-      message_id: string | null;
-      tool_use_id: string;
-      name: string;
-      target: string | null;
-      args_json: string | null;
-      is_error: number | null;
-      ts_ms: number | null;
-    }
-    return runQuery<RawToolCallRow>(
-      this.db,
-      `SELECT id, source, session_id, message_id, tool_use_id, name, target, args_json, is_error, ts_ms
-       FROM tool_calls
-       WHERE ${clauses.join(' AND ')}
-       ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC`,
-      params,
-    ).map((row) => ({
-      id: row.id,
-      source: row.source,
-      sessionId: row.session_id,
-      messageId: row.message_id,
-      toolUseId: row.tool_use_id,
-      name: row.name,
-      target: row.target,
-      argsJson: row.args_json,
-      isError: row.is_error === null ? null : row.is_error !== 0,
-      tsMs: row.ts_ms,
-    }));
-  }
-
-  /**
-   * Substring search across prompt + project, case-insensitive, recent
-   * matches first. The native CLI uses FTS5; this SDK uses LIKE because
-   * sql.js's default WASM build doesn't ship the FTS5 module. Plenty fast
-   * for the ai-hist scale (~tens of thousands of rows); revisit if a
-   * future consumer needs phrase/boolean queries.
-   *
-   * The query is matched literally — `%` and `_` are escaped so users can
-   * search for them. Empty queries return recent entries matching the filters.
-   */
-  search(query: string, opts: SearchOptions = {}): HistoryEntry[] {
-    const trimmed = query.trim();
-    const limit = opts.limit ?? 50;
-    const clauses: string[] = [];
-    const params: unknown[] = [];
-    if (trimmed) {
-      const escaped = trimmed.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
-      const pattern = `%${escaped}%`;
-      clauses.push(`(LOWER(prompt) LIKE LOWER(?) ESCAPE '\\' OR LOWER(COALESCE(project, '')) LIKE LOWER(?) ESCAPE '\\')`);
-      params.push(pattern, pattern);
-    }
-    if (opts.source) {
-      clauses.push('source = ?');
-      params.push(opts.source);
-    }
-    appendProjectFilter(clauses, params, opts.project, this._projectScope);
-    appendTagFilter(clauses, params, opts.tag, 'history');
-    if (typeof opts.beforeMs === 'number') {
-      clauses.push('timestamp_ms < ?');
-      params.push(opts.beforeMs);
-    }
-    return runQuery<RawHistoryRow>(
-      this.db,
-      `SELECT id, source, session_id, project, prompt, timestamp_ms, git_branch
-       FROM history
-       WHERE ${clauses.length > 0 ? clauses.join(' AND ') : '1=1'}
-       ORDER BY timestamp_ms DESC
-       LIMIT ?`,
-      [...params, limit],
-    ).map(rowToEntry);
-  }
-
-  /** Search compacted per-run trajectory WHY: decisions and retrospectives. */
-  searchTrajectories(query: string, opts: TrajectorySearchOptions = {}): TrajectoryEntry[] {
-    const trimmed = query.trim();
-    if (!trimmed) return [];
-    const limit = opts.limit ?? 20;
-    const escaped = trimmed.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
-    const pattern = `%${escaped}%`;
-    const clauses: string[] = [
-      `(LOWER(search_text) LIKE LOWER(?) ESCAPE '\\'
-          OR LOWER(COALESCE(task_title, '')) LIKE LOWER(?) ESCAPE '\\'
-          OR LOWER(COALESCE(task_description, '')) LIKE LOWER(?) ESCAPE '\\'
-          OR LOWER(COALESCE(persona_id, '')) LIKE LOWER(?) ESCAPE '\\'
-          OR LOWER(COALESCE(project_id, '')) LIKE LOWER(?) ESCAPE '\\')`,
-    ];
-    const params: unknown[] = [pattern, pattern, pattern, pattern, pattern];
-    for (const project of [this._projectScope, opts.project]) {
-      if (!project) continue;
-      const scope = scopedTrajectoryClause(project);
-      clauses.push(scope.sql);
-      params.push(...scope.params);
-    }
-    return runQuery<RawTrajectoryRow>(
-      this.db,
-      `SELECT id, version, persona_id, project_id, task_title, task_description, status,
-              started_at, completed_at, decisions_json, retrospective_json, search_text,
-              path, updated_ms, timestamp_ms
-       FROM trajectories
-       WHERE ${clauses.join(' AND ')}
-       ORDER BY timestamp_ms DESC
-       LIMIT ?`,
-      [...params, limit],
-    ).map(rowToTrajectory);
-  }
-
-  /** Best-matching per-run trajectory for a task query, or `null` if none match. */
-  whyForTask(query: string): TrajectoryEntry | null {
-    return this.searchTrajectories(query, { limit: 1 })[0] ?? null;
-  }
-
-  /** Single entry by id, or `null` if not found. */
-  getEntry(id: number): HistoryEntry | null {
-    const clauses = ['id = ?'];
-    const params: unknown[] = [id];
-    appendProjectFilter(clauses, params, undefined, this._projectScope);
-    const rows = runQuery<RawHistoryRow>(
-      this.db,
-      `SELECT id, source, session_id, project, prompt, timestamp_ms, git_branch
-       FROM history WHERE ${clauses.join(' AND ')}`,
-      params,
-    );
-    return rows.length > 0 ? rowToEntry(rows[0]) : null;
-  }
-
-  /**
-   * All entries whose timestamp falls within [timestampMs - windowMs,
-   * timestampMs + windowMs], ordered oldest first. Used by get_context.
-   */
-  getInTimeWindow(timestampMs: number, windowMs: number): HistoryEntry[] {
-    const clauses = ['timestamp_ms BETWEEN ? AND ?'];
-    const params: unknown[] = [timestampMs - windowMs, timestampMs + windowMs];
-    appendProjectFilter(clauses, params, undefined, this._projectScope);
-    return runQuery<RawHistoryRow>(
-      this.db,
-      `SELECT id, source, session_id, project, prompt, timestamp_ms, git_branch
-       FROM history
-       WHERE ${clauses.join(' AND ')}
-       ORDER BY timestamp_ms ASC`,
-      params,
-    ).map(rowToEntry);
-  }
-
-  /**
-   * Find sessions matching the given repo/branch/source and return ranked
-   * handoff candidates with a warm-start command for the target CLI.
-   *
-   * Queries the `sessions` table (populated by `ai-hist sync`) for objective
-   * metadata, then joins the last N user prompts from `history` to generate
-   * a brief on demand — no pre-computed summaries.
-   */
-  getHandoff(opts: GetHandoffOptions = {}): HandoffCandidate[] {
-    const limit = opts.limit ?? 3;
-    const clauses: string[] = [];
-    const params: unknown[] = [];
-
-    if (this._projectScope) {
-      const escaped = this._projectScope.replace(/\|/g, '||').replace(/%/g, '|%').replace(/_/g, '|_');
-      clauses.push("cwd LIKE ? ESCAPE '|'");
-      params.push(`${escaped}%`);
-    }
-    if (opts.source) {
-      clauses.push('source = ?');
-      params.push(opts.source);
-    }
-    if (opts.repo) {
-      const escaped = opts.repo.replace(/\|/g, '||').replace(/%/g, '|%').replace(/_/g, '|_');
-      clauses.push("cwd LIKE ? ESCAPE '|'");
-      params.push(`%${escaped}%`);
-    }
-    if (opts.branch) {
-      const escaped = opts.branch.replace(/\|/g, '||').replace(/%/g, '|%').replace(/_/g, '|_');
-      clauses.push("git_branch LIKE ? ESCAPE '|'");
-      params.push(`%${escaped}%`);
-    }
-
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-    // Over-fetch sessions because many (old or sub-agent) sessions have no
-    // matching `history` prompts and get skipped below. Fetching exactly
-    // `limit` could starve the result to empty even when good candidates exist
-    // just past the cutoff. We stop scanning once we've collected `limit`.
-    const fetchCount = Math.min(Math.max(limit * 5, limit), 100);
-    const sessionRows = runQuery<RawSessionRow>(
-      this.db,
-      `SELECT session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms,
-              last_assistant_text, raw_path
-       FROM sessions
-       ${where}
-       ORDER BY last_activity_ms DESC
-       LIMIT ?`,
-      [...params, fetchCount],
-    );
-
-    const candidates: HandoffCandidate[] = [];
-    for (const session of sessionRows) {
-      if (candidates.length >= limit) break;
-      // Filter by both session_id AND source to prevent cross-source prompt mixing
-      // when two CLIs happen to use the same session ID (rare but possible).
-      const prompts = runQuery<RawHistoryRow>(
-        this.db,
-        `SELECT id, source, session_id, project, prompt, timestamp_ms, git_branch
-         FROM history
-         WHERE session_id = ? AND source = ?
-         ORDER BY timestamp_ms ASC`,
-        [session.session_id, session.source],
-      ).map(rowToEntry);
-      if (prompts.length === 0) continue;
-
-      const filesTouched = extractFilePaths(prompts.map((p) => p.prompt).join('\n'));
-      // The first prompt is often injected boilerplate (system-reminder /
-      // command wrappers), especially for relay-driven sessions. Prefer the
-      // first prompt that looks like a real user instruction for the goal.
-      const goalPrompt = prompts.find((p) => !isBoilerplatePrompt(p.prompt)) ?? prompts[0];
-      const goal = goalPrompt.prompt.slice(0, 300).replace(/\n/g, ' ');
-      const lastState = prompts[prompts.length - 1].prompt.slice(0, 300).replace(/\n/g, ' ');
-
-      const resume = resumeCommand({
-        source: session.source as Source,
-        sessionId: session.session_id,
-        project: session.cwd,
-      });
-
-      const targetSource = session.source === 'claude' ? 'codex' : 'claude';
-      const warmStart = buildWarmStartCommand(
-        targetSource,
-        goal,
-        filesTouched,
-        lastState,
-        session.last_assistant_text ?? null,
-        session.cwd,
-      );
-
-      let confidence = Math.min(0.6, 0.2 + prompts.length * 0.02);
-      if (opts.branch && session.git_branch?.includes(opts.branch)) confidence += 0.25;
-      if (opts.repo && session.cwd?.includes(opts.repo)) confidence += 0.15;
-      confidence = Math.min(1.0, confidence);
-
-      candidates.push({
-        sessionId: session.session_id,
-        source: session.source as Source,
-        cwd: session.cwd,
-        gitBranch: session.git_branch,
-        firstActivityMs: session.first_activity_ms,
-        lastActivityMs: session.last_activity_ms,
-        promptCount: prompts.length,
-        goal,
-        lastState,
-        lastAssistantText: session.last_assistant_text ?? null,
-        filesTouched,
-        resumeCommand: resume,
-        warmStartCommand: warmStart,
-        confidence,
-      });
-    }
-
-    return candidates.sort((a, b) => b.confidence - a.confidence);
-  }
-
-  /** Counts + date range, mirroring `ai-hist stats`. */
-  stats(): Stats {
-    const scopeClauses: string[] = [];
-    const scopeParams: unknown[] = [];
-    appendProjectFilter(scopeClauses, scopeParams, undefined, this._projectScope);
-    const where = scopeClauses.length > 0 ? ` WHERE ${scopeClauses.join(' AND ')}` : '';
-    const andScope = scopeClauses.length > 0 ? ` AND ${scopeClauses.join(' AND ')}` : '';
-    const total =
-      runQuery<{ c: number }>(this.db, `SELECT COUNT(*) AS c FROM history${where}`, scopeParams)[0]?.c ?? 0;
-    const bySourceRows = runQuery<{ source: string; c: number }>(
-      this.db,
-      `SELECT source, COUNT(*) AS c FROM history${where} GROUP BY source`,
-      scopeParams,
-    );
-    const bySource: Partial<Record<Source, number>> = {};
-    for (const row of bySourceRows) {
-      bySource[row.source as Source] = row.c;
-    }
-    const byProject = runQuery<{ project: string; c: number }>(
-      this.db,
-      `SELECT project, COUNT(*) AS c FROM history
-       WHERE project IS NOT NULL AND project != ''${andScope}
-       GROUP BY project ORDER BY c DESC LIMIT 10`,
-      scopeParams,
-    ).map((row) => ({ project: row.project, count: row.c }));
-    const range = runQuery<{ mn: number | null; mx: number | null }>(
-      this.db,
-      `SELECT MIN(timestamp_ms) AS mn, MAX(timestamp_ms) AS mx FROM history${where}`,
-      scopeParams,
-    )[0];
+export async function listSessionCatalogPage(options: ListCatalogOptions = {}): Promise<SessionCatalogPage> {
+  return nativeCall(async (native) => {
+    const page = await native.listSessionCatalogPage({ ...options, after: options.after ? {
+      ...options.after,
+      lastActivityMs: options.after.lastActivityMs ?? undefined,
+    } : undefined });
+    const contractVersion = Number(page.contractVersion);
+    assertCatalogContract(contractVersion);
     return {
-      total,
-      bySource,
-      byProject,
-      firstTimestampMs: range?.mn ?? null,
-      lastTimestampMs: range?.mx ?? null,
+      contractVersion,
+      sessions: Array.isArray(page.sessions) ? (page.sessions as UnknownRecord[]).map(catalogSession) : [],
+      nextCursor: catalogCursor(page.nextCursor),
     };
-  }
+  });
 }
 
-/**
- * Heuristic: does a prompt look like injected boilerplate rather than a real
- * user instruction? Relay/agent sessions often open with a system-reminder or
- * command wrapper that makes a poor "goal" summary.
- */
-function isBoilerplatePrompt(prompt: string): boolean {
-  const t = prompt.trimStart();
-  return (
-    t.startsWith('<system-reminder') ||
-    t.startsWith('<command-') ||
-    t.startsWith('Caveat:') ||
-    t.startsWith('[Request interrupted')
-  );
+export async function discoverSessions(options: DiscoverSessionsOptions = {}): Promise<DiscoverResult> {
+  return nativeCall(async (native) => {
+    const result = await native.discoverSessions(options);
+    const contractVersion = Number(result.contractVersion);
+    assertCatalogContract(contractVersion);
+    return {
+      contractVersion,
+      sessions: Array.isArray(result.sessions) ? (result.sessions as UnknownRecord[]).map(catalogSession) : [],
+      discovered: Number(result.discovered),
+      skippedUnchanged: Number(result.skippedUnchanged),
+      providers: (result.providers as ProviderDiscoverySummary[]) ?? [],
+      exemptSources: (result.exemptSources as SourceExemption[]) ?? [],
+      diagnostics: Array.isArray(result.diagnostics) ? (result.diagnostics as UnknownRecord[]).map((item) => ({
+        source: String(item.source), locator: nullableString(item.locator), error: String(item.error),
+      })) : [],
+      counters: result.counters as unknown as DiscoveryCounters,
+    };
+  });
 }
 
-/**
- * Extract file paths with recognizable extensions from a block of text.
- * Heuristic — used to populate filesTouched in HandoffCandidate.
- */
-function extractFilePaths(text: string): string[] {
-  const exts = 'ts|tsx|js|jsx|mjs|cjs|py|go|rs|rb|java|cs|cpp|cc|c|h|json|yaml|yml|toml|md|sh|sql|css|scss|html|svelte|vue';
-  const regex = new RegExp(
-    `(?:^|[\\s,\`'"(])([~./][\\w./-]*\\.(?:${exts})|-?[\\w/-]+\\.(?:${exts}))\\b`,
-    'gm',
-  );
-  const seen = new Set<string>();
-  let m: RegExpExecArray | null;
-  while ((m = regex.exec(text)) !== null) {
-    const p = m[1].trim();
-    if (p.length > 2 && p.length < 200) seen.add(p);
-  }
-  return Array.from(seen).slice(0, 20);
+export async function discoverAndList(options: DiscoverSessionsOptions & ListCatalogOptions = {}): Promise<SessionCatalogPage> {
+  await discoverSessions(options);
+  return listSessionCatalogPage(options);
 }
 
-/**
- * Build a warm-start command for the target CLI, injecting context from a
- * prior session so the new agent can pick up mid-task.
- */
-function buildWarmStartCommand(
-  targetSource: string,
-  goal: string,
-  files: string[],
-  lastState: string,
-  lastAssistant: string | null,
-  cwd: string | null,
-): string {
-  const filesLine = files.length > 0 ? ` Files touched: ${files.slice(0, 10).join(', ')}.` : '';
-  const assistantLine = lastAssistant
-    ? ` Last assistant state: ${lastAssistant.replace(/\n/g, ' ').slice(0, 200)}`
-    : '';
-  const context =
-    `Picking up from previous session. Goal: ${goal}.${filesLine} Last user prompt: ${lastState}.${assistantLine}`;
-  const cdPart = cwd ? `cd ${shellQuote(cwd)} && ` : '';
-  return `${cdPart}${targetSource} ${shellQuote(context)}`;
+export async function getSessionEventsPage(sessionId: string, options: EventsPageOptions = {}): Promise<SessionEventsPage> {
+  return nativeCall(async (native) => {
+    const page = await native.getSessionEventsPage(sessionId, options);
+    return {
+      events: Array.isArray(page.events) ? (page.events as UnknownRecord[]).map(sessionEvent) : [],
+      nextCursor: page.nextCursor && typeof page.nextCursor === 'object'
+        ? { tsMs: Number((page.nextCursor as UnknownRecord).tsMs), id: Number((page.nextCursor as UnknownRecord).id) }
+        : null,
+    };
+  });
 }
 
-/**
- * Resume command for an entry/session, matching what `ai-hist show` prints.
- * Returns `null` for sources that don't have a resume affordance (relay).
- */
-export function resumeCommand(
-  entry: Pick<HistoryEntry, 'source' | 'sessionId' | 'project'>,
-): string | null {
+export async function* sessionEvents(sessionId: string, options: Omit<EventsPageOptions, 'after'> = {}): AsyncGenerator<SessionEvent> {
+  let after: EventCursor | undefined;
+  do {
+    const page = await getSessionEventsPage(sessionId, { ...options, after });
+    for (const event of page.events) yield event;
+    after = page.nextCursor ?? undefined;
+  } while (after);
+}
+
+export async function getSessionEvents(sessionId: string, options: Omit<EventsPageOptions, 'after'> = {}): Promise<SessionEvent[]> {
+  const events: SessionEvent[] = [];
+  for await (const event of sessionEvents(sessionId, options)) events.push(event);
+  return events;
+}
+
+export async function stats(options: StatsOptions = {}): Promise<Stats> {
+  return nativeCall(async (native) => {
+    const result = await native.stats(options);
+    const bySource: Partial<Record<Source, number>> = {};
+    for (const item of (result.bySource as UnknownRecord[] | undefined) ?? []) {
+      bySource[String(item.source) as Source] = Number(item.count);
+    }
+    return {
+      total: Number(result.total), bySource,
+      byProject: ((result.byProject as UnknownRecord[] | undefined) ?? []).map((item) => ({ project: String(item.project), count: Number(item.count) })),
+      firstTimestampMs: typeof result.firstTimestampMs === 'number' ? result.firstTimestampMs : null,
+      lastTimestampMs: typeof result.lastTimestampMs === 'number' ? result.lastTimestampMs : null,
+    };
+  });
+}
+
+export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
+  return nativeCall(async (native) => {
+    const result = await native.sync(options);
+    return { databasePath: String(result.databasePath), completed: result.completed === true };
+  });
+}
+
+export function resumeCommand(entry: Pick<HistoryEntry, 'source' | 'sessionId'>): string | null {
   if (!entry.sessionId) return null;
-  switch (entry.source) {
-    case 'claude':
-      return entry.project
-        ? `cd ${shellQuote(entry.project)} && claude --resume ${shellQuote(entry.sessionId)}`
-        : `claude --resume ${shellQuote(entry.sessionId)}`;
-    case 'codex':
-      return `codex resume ${shellQuote(entry.sessionId)}`;
-    case 'cursor':
-      return entry.project
-        ? `cd ${shellQuote(entry.project)} && cursor-agent --resume=${shellQuote(entry.sessionId)}`
-        : `cursor-agent --resume=${shellQuote(entry.sessionId)}`;
-    case 'relay':
-      return null;
-    default:
-      return null;
-  }
+  if (entry.source === 'claude') return `claude --resume ${shellQuote(entry.sessionId)}`;
+  if (entry.source === 'codex') return `codex resume ${shellQuote(entry.sessionId)}`;
+  return null;
 }
 
 function shellQuote(value: string): string {
-  if (/^[A-Za-z0-9_\-./]+$/.test(value)) return value;
-  return `'${value.replace(/'/g, `'\\''`)}'`;
+  return /^[A-Za-z0-9._:/-]+$/.test(value) ? value : `'${value.replace(/'/g, `'"'"'`)}'`;
 }

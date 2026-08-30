@@ -1,15 +1,9 @@
-name: Publish ai-hist-native (napi)
+name: Publish RelayHistory npm packages
 
-# Builds the `ai-hist-native` napi addon for each platform and publishes it —
-# the main `ai-hist-native` package (JS loader) plus one
-# `ai-hist-native-<platform>-<arch>` package per target carrying the `.node`.
-# agent-relay depends on `ai-hist-native` (optional) and calls `syncAndPush()`
-# in-process. See docs/reflex-zero-setup.md.
-#
-# Linux is built for BOTH glibc (gnu) and musl so the loader resolves on Ubuntu
-# etc. (gnu) and Alpine (musl). Cross targets use zig via napi --cross-compile.
-# NOTE: napi cross-compilation can need tuning per runner image; validate a dry
-# run before the first real publish.
+# Builds and tests native artifacts, publishes platform packages first, then
+# the native root, SDK/CLI, and MCP packages. The public SDK is deliberately
+# last so npm can never select a release whose mandatory native engine is not
+# available yet.
 
 on:
   workflow_dispatch:
@@ -36,27 +30,37 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
-          - os: macos-latest
+            test_native: true
+          - os: macos-15-intel
             target: x86_64-apple-darwin
+            test_native: true
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+            test_native: true
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            cross: true
+            test_native: true
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true
-          - os: ubuntu-latest
+            test_musl: true
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             cross: true
+            test_musl: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            test_native: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -88,6 +92,7 @@ jobs:
         run: npm ci
 
       - name: Build addon
+        shell: bash
         run: |
           set -euo pipefail
           if [ "${{ matrix.cross }}" = "true" ]; then
@@ -95,6 +100,16 @@ jobs:
           else
             npx napi build --platform --release --target "${{ matrix.target }}"
           fi
+
+      - name: Execute native contract smoke test
+        if: matrix.test_native
+        shell: bash
+        run: node -e "const n=require('./index.js'); if(n.nativeContractVersion()!==2) process.exit(1)"
+
+      - name: Execute musl native contract smoke test
+        if: matrix.test_musl
+        shell: bash
+        run: docker run --rm -v "$PWD:/work" -w /work node:22-alpine node -e "const n=require('./index.js'); if(n.nativeContractVersion()!==2) process.exit(1)"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -164,3 +179,63 @@ jobs:
             npx napi prepublish -t npm --skip-gh-release
             npm publish --access public
           fi
+
+      - name: Build SDK and CLI against the release contract
+        working-directory: sdk-ts
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION:-$(node -p "require('../crates/ai-hist-napi/package.json').version")}"
+          npm install --ignore-scripts
+          npm run build
+          node dist/cli.js sessions list --db /tmp/relayhistory-empty.db --json
+          npm pkg set version="$VERSION" dependencies.ai-hist-native="$VERSION"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then npm pack --dry-run; fi
+
+      - name: Publish SDK and CLI
+        if: ${{ !inputs.dry_run }}
+        working-directory: sdk-ts
+        run: npm publish --access public
+
+      - name: Build and publish MCP wrapper
+        working-directory: mcp-package
+        env:
+          VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION:-$(node -p "require('../crates/ai-hist-napi/package.json').version")}"
+          npm pkg set version="$VERSION" dependencies.ai-hist="$VERSION"
+          if [ "$DRY_RUN" != "true" ]; then npm publish --access public; fi
+
+      - name: Registry clean-install smoke test
+        if: ${{ !inputs.dry_run }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION:-$(node -p "require('./package.json').version")}"
+          SMOKE=$(mktemp -d)
+          cd "$SMOKE"
+          npm init -y
+          npm install "ai-hist@$VERSION" "ai-hist-mcp@$VERSION"
+          ./node_modules/.bin/ai-hist sessions list --db "$SMOKE/empty.db" --json
+          timeout 2 ./node_modules/.bin/ai-hist-mcp </dev/null || test $? -eq 124
+
+          NO_OPTIONAL=$(mktemp -d)
+          cd "$NO_OPTIONAL"
+          npm init -y
+          npm install --omit=optional "ai-hist@$VERSION"
+          node --input-type=module -e '
+            import("ai-hist").then((sdk) => sdk.recent()).then(
+              () => process.exit(1),
+              (error) => {
+                if (error.code !== "NATIVE_PACKAGE_MISSING") {
+                  console.error(error);
+                  process.exit(1);
+                }
+                console.log(error.message);
+              },
+            );
+          '

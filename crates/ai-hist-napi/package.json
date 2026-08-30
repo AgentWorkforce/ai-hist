@@ -1,7 +1,7 @@
 {
   "name": "ai-hist-native",
-  "version": "0.4.3",
-  "description": "Native (napi) binding for ai-hist \u2014 in-process sync + cloud push.",
+  "version": "1.0.0",
+  "description": "Mandatory Node-API engine for RelayHistory.",
   "main": "index.js",
   "types": "index.d.ts",
   "license": "MIT",
@@ -20,16 +20,18 @@
         "x86_64-unknown-linux-gnu",
         "aarch64-unknown-linux-gnu",
         "x86_64-unknown-linux-musl",
-        "aarch64-unknown-linux-musl"
+        "aarch64-unknown-linux-musl",
+        "x86_64-pc-windows-msvc"
       ]
     }
   },
   "files": [
     "index.js",
-    "index.d.ts"
+    "index.d.ts",
+    "npm"
   ],
   "engines": {
-    "node": ">= 18"
+    "node": ">=20"
   },
   "publishConfig": {
     "access": "public"

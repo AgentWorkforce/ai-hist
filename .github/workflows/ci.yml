@@ -24,11 +24,6 @@ jobs:
           cache: npm
           cache-dependency-path: sdk-ts/package-lock.json
 
-      - name: Install SQLite CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y sqlite3
-
       - name: Rust formatting
         run: cargo fmt --all -- --check
 
@@ -38,11 +33,12 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace
 
-      - name: Build Rust CLI for wrapper tests
-        run: cargo build -q -p ai-hist-cli
-
-      - name: Installer verification
-        run: ./scripts/verify-install.sh
+      - name: Native binding contract
+        working-directory: crates/ai-hist-napi
+        run: |
+          npm ci
+          npm run build:debug
+          git diff --exit-code -- index.d.ts
 
       - name: TypeScript tests
         working-directory: sdk-ts
@@ -51,15 +47,30 @@ jobs:
           npm run lint
           npm test
 
-      - name: Native binding contract
-        working-directory: crates/ai-hist-napi
+      - name: Installed SDK and CLI smoke test
+        working-directory: sdk-ts
         run: |
-          npm ci
-          npm run build:debug
-          git diff --exit-code -- index.d.ts
+          npm pack --json >/tmp/ai-hist-pack.json
+          node dist/cli.js sessions list --db /tmp/relayhistory-missing.db --json
 
-      - name: End-to-end wrapper verification
-        run: AI_HIST_RUST_BIN="$PWD/target/debug/ai-hist" ./scripts/verify-e2e.sh
+  node-22-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            crates/ai-hist-napi/package-lock.json
+            sdk-ts/package-lock.json
+      - name: Build native addon
+        working-directory: crates/ai-hist-napi
+        run: npm ci && npm run build:debug
+      - name: Test SDK on Node 22
+        working-directory: sdk-ts
+        run: npm ci && npm test
 
   windows-state-replacement:
     runs-on: windows-latest
@@ -69,4 +80,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Verify repeated private-state replacement
-        run: cargo test -p ai-hist-cli write_private_replaces_existing_state
+        run: cargo test -p ai-hist-engine write_private_replaces_existing_state

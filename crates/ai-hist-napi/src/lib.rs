@@ -1,54 +1,405 @@
-//! Native (napi) binding for driving ai-hist in-process — no CLI shell-out.
+//! Mandatory Node-API boundary for RelayHistory.
 //!
-//! Exposes local-only `syncLocal()` and cloud-enabled `syncAndPush()` to Node,
-//! plus the session catalog: `listSessions()` (cache-only) and
-//! `discoverSessions()` (shallow provider scan).
+//! This crate maps typed JavaScript requests to reusable Rust operations. It
+//! contains no SQL, provider parsing, migration, or query semantics of its own.
 #![deny(clippy::all)]
 
+use std::path::{Path, PathBuf};
+
+use ai_hist_core::{
+    default_db_path, open_db, open_db_readonly, recent as core_recent, schema_is_current,
+    search as core_search, session as core_session,
+    session_events_page as core_session_events_page, stats as core_stats, HistoryEntry,
+    QueryFilter, SessionEvent as CoreSessionEvent, SessionEventCursor as CoreEventCursor,
+};
 use napi_derive::napi;
 
-/// Result of one in-process sync+push.
+/// Bump whenever native object shapes or semantics require an SDK change.
+pub const NATIVE_CONTRACT_VERSION: u32 = 2;
+const DEFAULT_LIMIT: i64 = 50;
+const DEFAULT_EVENT_LIMIT: i64 = 200;
+
+fn db_path(path: Option<String>) -> PathBuf {
+    path.map(PathBuf::from).unwrap_or_else(default_db_path)
+}
+
+fn native_error(code: &str, error: impl std::fmt::Display) -> napi::Error {
+    napi::Error::from_reason(format!("RELAYHISTORY_NATIVE::{code}::{error}"))
+}
+
+fn worker_error(error: impl std::fmt::Display) -> napi::Error {
+    native_error("WORKER_FAILED", error)
+}
+
+fn database_error(path: &Path, error: impl std::fmt::Display) -> napi::Error {
+    native_error(
+        "DATABASE_OPEN_FAILED",
+        format!("could not open {}: {error}", path.display()),
+    )
+}
+
+fn validate_limit(limit: Option<i64>, default: i64, max: i64) -> napi::Result<i64> {
+    let limit = limit.unwrap_or(default);
+    if !(1..=max).contains(&limit) {
+        return Err(native_error(
+            "INVALID_ARGUMENT",
+            format!("limit must be between 1 and {max} (got {limit})"),
+        ));
+    }
+    Ok(limit)
+}
+
+/// Contract version implemented by this native addon.
+#[napi]
+pub fn native_contract_version() -> u32 {
+    NATIVE_CONTRACT_VERSION
+}
+
 #[napi(object)]
-pub struct SyncPushResult {
-    pub sent: u32,
-    pub accepted: u32,
-    /// `false` when there's no stored relayhistory auth yet (a no-op, not an error).
-    pub authenticated: bool,
-    /// `true` when another process owned the history scan; existing rows were still pushed.
-    pub sync_skipped: bool,
+pub struct HistoryQueryOptions {
+    pub db_path: Option<String>,
+    pub source: Option<String>,
+    pub project: Option<String>,
+    pub tag: Option<String>,
+    pub before_ms: Option<i64>,
+    pub limit: Option<i64>,
 }
 
-/// Refresh local history without reading auth or pushing to cloud.
-#[napi]
-pub async fn sync_local() -> napi::Result<()> {
-    napi::tokio::task::spawn_blocking(ai_hist_cli::sync_local)
-        .await
-        .map_err(|e| napi::Error::from_reason(format!("worker thread panicked: {e}")))?
-        .map_err(|e| napi::Error::from_reason(format!("{e:#}")))
+impl HistoryQueryOptions {
+    fn filter(&self, limit: i64) -> QueryFilter {
+        QueryFilter {
+            source: self.source.clone(),
+            project: self.project.clone(),
+            tag: self.tag.clone(),
+            before_ms: self.before_ms,
+            limit,
+        }
+    }
 }
 
-/// Sync local agent history into the ai-hist DB, then push new records to
-/// relayhistory-cloud. The blocking work (file/SQLite/HTTP) runs on a worker
-/// thread so the Node event loop is never blocked.
-#[napi]
-pub async fn sync_and_push() -> napi::Result<SyncPushResult> {
-    let outcome = napi::tokio::task::spawn_blocking(ai_hist_cli::sync_and_push)
-        .await
-        .map_err(|e| napi::Error::from_reason(format!("worker thread panicked: {e}")))?
-        .map_err(|e| napi::Error::from_reason(format!("{e:#}")))?;
-    Ok(SyncPushResult {
-        sent: outcome.sent as u32,
-        accepted: outcome.accepted as u32,
-        authenticated: outcome.authenticated,
-        sync_skipped: outcome.sync_skipped,
+#[napi(object)]
+pub struct SearchOptions {
+    pub db_path: Option<String>,
+    pub source: Option<String>,
+    pub project: Option<String>,
+    pub tag: Option<String>,
+    pub before_ms: Option<i64>,
+    pub limit: Option<i64>,
+    pub raw_fts: Option<bool>,
+}
+
+#[napi(object)]
+pub struct SessionOptions {
+    pub db_path: Option<String>,
+    pub source: Option<String>,
+    pub tag: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeHistoryEntry {
+    pub id: i64,
+    pub source: String,
+    pub session_id: Option<String>,
+    pub project: Option<String>,
+    pub prompt: String,
+    pub timestamp_ms: i64,
+}
+
+impl From<HistoryEntry> for NativeHistoryEntry {
+    fn from(entry: HistoryEntry) -> Self {
+        Self {
+            id: entry.id,
+            source: entry.source,
+            session_id: entry.session_id,
+            project: entry.project,
+            prompt: entry.prompt,
+            timestamp_ms: entry.timestamp_ms,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct NativeSessionEvent {
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    pub project: Option<String>,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub message_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub ts_ms: i64,
+    pub role: String,
+    pub kind: String,
+    pub text: Option<String>,
+    pub model: Option<String>,
+    pub token_json: Option<String>,
+    pub event_uid: String,
+}
+
+impl From<CoreSessionEvent> for NativeSessionEvent {
+    fn from(event: CoreSessionEvent) -> Self {
+        Self {
+            id: event.id,
+            source: event.source,
+            session_id: event.session_id,
+            project: event.project,
+            cwd: event.cwd,
+            git_branch: event.git_branch,
+            message_id: event.message_id,
+            parent_id: event.parent_id,
+            ts_ms: event.ts_ms,
+            role: event.role,
+            kind: event.kind,
+            text: event.text,
+            model: event.model,
+            token_json: event.token_json,
+            event_uid: event.event_uid,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct EventCursor {
+    pub ts_ms: i64,
+    pub id: i64,
+}
+
+#[napi(object)]
+pub struct EventsPageOptions {
+    pub db_path: Option<String>,
+    pub source: Option<String>,
+    pub limit: Option<i64>,
+    pub after: Option<EventCursor>,
+}
+
+#[napi(object)]
+pub struct SessionEventsPage {
+    pub events: Vec<NativeSessionEvent>,
+    pub next_cursor: Option<EventCursor>,
+}
+
+#[napi(object)]
+pub struct SourceCount {
+    pub source: String,
+    pub count: i64,
+}
+
+#[napi(object)]
+pub struct ProjectCount {
+    pub project: String,
+    pub count: i64,
+}
+
+#[napi(object)]
+pub struct NativeStats {
+    pub total: i64,
+    pub by_source: Vec<SourceCount>,
+    pub by_project: Vec<ProjectCount>,
+    pub first_timestamp_ms: Option<i64>,
+    pub last_timestamp_ms: Option<i64>,
+}
+
+#[napi(object)]
+pub struct StatsOptions {
+    pub db_path: Option<String>,
+    pub tag: Option<String>,
+}
+
+async fn read_database<T, F>(path: PathBuf, empty: T, operation: F) -> napi::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
+{
+    napi::tokio::task::spawn_blocking(move || {
+        if !path.exists() {
+            return Ok(empty);
+        }
+        let conn = match open_db_readonly(&path) {
+            Ok(conn) if schema_is_current(&conn).unwrap_or(false) => conn,
+            _ => open_db(&path).map_err(|error| database_error(&path, format!("{error:#}")))?,
+        };
+        operation(&conn)
+            .map_err(|error| native_error("DATABASE_QUERY_FAILED", format!("{error:#}")))
     })
+    .await
+    .map_err(worker_error)?
 }
 
-/// One coding-agent session as the shallow catalog knows it.
-///
-/// `firstPrompt` is derived by RelayHistory (a bounded excerpt of the first
-/// substantive human turn); everything else is observed in provider data, and
-/// anything the provider does not record stays null rather than being invented.
+/// Full-text search of indexed history. Never discovers or syncs implicitly.
+#[napi]
+pub async fn search(
+    query: String,
+    options: Option<SearchOptions>,
+) -> napi::Result<Vec<NativeHistoryEntry>> {
+    let options = options.unwrap_or(SearchOptions {
+        db_path: None,
+        source: None,
+        project: None,
+        tag: None,
+        before_ms: None,
+        limit: None,
+        raw_fts: None,
+    });
+    let limit = validate_limit(options.limit, 20, 1_000)?;
+    let path = db_path(options.db_path.clone());
+    let filter = QueryFilter {
+        source: options.source,
+        project: options.project,
+        tag: options.tag,
+        before_ms: options.before_ms,
+        limit,
+    };
+    let terms = query
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let raw_fts = options.raw_fts.unwrap_or(false);
+    read_database(path, Vec::new(), move |conn| {
+        Ok(core_search(conn, &terms, raw_fts, &filter)?
+            .into_iter()
+            .map(NativeHistoryEntry::from)
+            .collect())
+    })
+    .await
+}
+
+/// Recent indexed history. Never discovers or syncs implicitly.
+#[napi]
+pub async fn recent(options: Option<HistoryQueryOptions>) -> napi::Result<Vec<NativeHistoryEntry>> {
+    let options = options.unwrap_or(HistoryQueryOptions {
+        db_path: None,
+        source: None,
+        project: None,
+        tag: None,
+        before_ms: None,
+        limit: None,
+    });
+    let limit = validate_limit(options.limit, 20, 1_000)?;
+    let path = db_path(options.db_path.clone());
+    let filter = options.filter(limit);
+    read_database(path, Vec::new(), move |conn| {
+        Ok(core_recent(conn, &filter)?
+            .into_iter()
+            .map(NativeHistoryEntry::from)
+            .collect())
+    })
+    .await
+}
+
+/// Indexed prompts for one session. Event payloads are separately paginated.
+#[napi]
+pub async fn get_session(
+    session_id: String,
+    options: Option<SessionOptions>,
+) -> napi::Result<Vec<NativeHistoryEntry>> {
+    let options = options.unwrap_or(SessionOptions {
+        db_path: None,
+        source: None,
+        tag: None,
+    });
+    let path = db_path(options.db_path);
+    read_database(path, Vec::new(), move |conn| {
+        Ok(core_session(
+            conn,
+            &session_id,
+            options.source.as_deref(),
+            options.tag.as_deref(),
+        )?
+        .into_iter()
+        .map(NativeHistoryEntry::from)
+        .collect())
+    })
+    .await
+}
+
+/// One bounded page of normalized events for a session.
+#[napi]
+pub async fn get_session_events_page(
+    session_id: String,
+    options: Option<EventsPageOptions>,
+) -> napi::Result<SessionEventsPage> {
+    let options = options.unwrap_or(EventsPageOptions {
+        db_path: None,
+        source: None,
+        limit: None,
+        after: None,
+    });
+    let limit = validate_limit(options.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
+    let path = db_path(options.db_path);
+    let after = options.after.map(|cursor| CoreEventCursor {
+        ts_ms: cursor.ts_ms,
+        id: cursor.id,
+    });
+    read_database(
+        path,
+        SessionEventsPage {
+            events: Vec::new(),
+            next_cursor: None,
+        },
+        move |conn| {
+            let page = core_session_events_page(
+                conn,
+                &session_id,
+                options.source.as_deref(),
+                limit,
+                after.as_ref(),
+            )?;
+            Ok(SessionEventsPage {
+                events: page
+                    .events
+                    .into_iter()
+                    .map(NativeSessionEvent::from)
+                    .collect(),
+                next_cursor: page.next_cursor.map(|cursor| EventCursor {
+                    ts_ms: cursor.ts_ms,
+                    id: cursor.id,
+                }),
+            })
+        },
+    )
+    .await
+}
+
+/// Database statistics over already-indexed data.
+#[napi]
+pub async fn stats(options: Option<StatsOptions>) -> napi::Result<NativeStats> {
+    let options = options.unwrap_or(StatsOptions {
+        db_path: None,
+        tag: None,
+    });
+    let path = db_path(options.db_path);
+    read_database(
+        path,
+        NativeStats {
+            total: 0,
+            by_source: Vec::new(),
+            by_project: Vec::new(),
+            first_timestamp_ms: None,
+            last_timestamp_ms: None,
+        },
+        move |conn| {
+            let result = core_stats(conn, options.tag.as_deref())?;
+            Ok(NativeStats {
+                total: result.total,
+                by_source: result
+                    .by_source
+                    .into_iter()
+                    .map(|(source, count)| SourceCount { source, count })
+                    .collect(),
+                by_project: result
+                    .by_project
+                    .into_iter()
+                    .map(|(project, count)| ProjectCount { project, count })
+                    .collect(),
+                first_timestamp_ms: result.first_timestamp_ms,
+                last_timestamp_ms: result.last_timestamp_ms,
+            })
+        },
+    )
+    .await
+}
+
 #[napi(object)]
 pub struct CatalogSession {
     pub source: String,
@@ -67,15 +418,12 @@ pub struct CatalogSession {
     pub workspace_roots: Vec<String>,
     pub raw_path: Option<String>,
     pub source_stamp: Option<String>,
-    /// `"shallow"` (catalog row only) or `"full"` (full evidence ingested).
     pub discovery_state: String,
-    /// `true` when the row was served from the catalog without re-reading the
-    /// provider source.
     pub from_cache: bool,
 }
 
-impl From<ai_hist_cli::ShallowSession> for CatalogSession {
-    fn from(session: ai_hist_cli::ShallowSession) -> Self {
+impl From<ai_hist_engine::ShallowSession> for CatalogSession {
+    fn from(session: ai_hist_engine::ShallowSession) -> Self {
         Self {
             source: session.source,
             session_id: session.session_id,
@@ -99,12 +447,6 @@ impl From<ai_hist_cli::ShallowSession> for CatalogSession {
     }
 }
 
-/// A precise continuation point in the catalog's total order,
-/// `(lastActivityMs DESC, source ASC, sessionId ASC)`.
-///
-/// Recency alone is not a key -- one discovery pass can stamp many sessions
-/// with the same millisecond -- so the identity columns make the cursor total.
-/// `lastActivityMs` is null for the tail of rows whose recency is unknown.
 #[napi(object)]
 pub struct CatalogCursor {
     pub last_activity_ms: Option<i64>,
@@ -112,43 +454,82 @@ pub struct CatalogCursor {
     pub session_id: String,
 }
 
-/// Filters for the cache-only catalog listing.
 #[napi(object)]
-pub struct ListSessionsOptions {
-    /// Restrict to these sources. Omit for every discoverable source.
+pub struct ListCatalogOptions {
+    pub db_path: Option<String>,
     pub sources: Option<Vec<String>>,
-    /// Row cap (default 50). Must not be negative.
     pub limit: Option<i64>,
-    /// Coarse cutoff: only sessions older than this epoch-ms. Cannot separate
-    /// sessions sharing a millisecond; use `after` to walk pages. Ignored when
-    /// `after` is set.
     pub before_ms: Option<i64>,
-    /// Precise continuation: the previous page's `nextCursor`.
     pub after: Option<CatalogCursor>,
 }
 
-/// The cache-only catalog listing, the contract version it was built with, and
-/// the cursor that continues it.
 #[napi(object)]
-pub struct SessionCatalog {
+pub struct SessionCatalogPage {
     pub contract_version: u32,
     pub sessions: Vec<CatalogSession>,
-    /// Pass back as `after` for the next page; null once the catalog is
-    /// exhausted (the page came back short of its limit).
     pub next_cursor: Option<CatalogCursor>,
 }
 
-/// Filters for one shallow discovery run.
+/// Cache-only indexed catalog query. Missing databases return an empty page.
+#[napi]
+pub async fn list_session_catalog_page(
+    options: Option<ListCatalogOptions>,
+) -> napi::Result<SessionCatalogPage> {
+    let options = options.unwrap_or(ListCatalogOptions {
+        db_path: None,
+        sources: None,
+        limit: None,
+        before_ms: None,
+        after: None,
+    });
+    validate_limit(options.limit, DEFAULT_LIMIT, 1_000)?;
+    let path = db_path(options.db_path);
+    let request = ai_hist_engine::CatalogListOptions {
+        sources: options.sources.unwrap_or_default(),
+        limit: options.limit,
+        before_ms: options.before_ms,
+        after: options.after.map(|cursor| ai_hist_engine::CatalogCursor {
+            last_activity_ms: cursor.last_activity_ms,
+            source: cursor.source,
+            session_id: cursor.session_id,
+        }),
+    };
+    napi::tokio::task::spawn_blocking(move || {
+        ai_hist_engine::list_sessions_local_at(&path, &request)
+    })
+    .await
+    .map_err(worker_error)?
+    .map(|page| SessionCatalogPage {
+        contract_version: ai_hist_engine::SESSION_CATALOG_CONTRACT_VERSION,
+        sessions: page
+            .sessions
+            .into_iter()
+            .map(CatalogSession::from)
+            .collect(),
+        next_cursor: page.next_cursor.map(|cursor| CatalogCursor {
+            last_activity_ms: cursor.last_activity_ms,
+            source: cursor.source,
+            session_id: cursor.session_id,
+        }),
+    })
+    .map_err(|error| native_error("DATABASE_QUERY_FAILED", format!("{error:#}")))
+}
+
+/// Convenience first-page catalog listing with identical cache-only semantics.
+#[napi]
+pub async fn list_session_catalog(
+    options: Option<ListCatalogOptions>,
+) -> napi::Result<Vec<CatalogSession>> {
+    Ok(list_session_catalog_page(options).await?.sessions)
+}
+
 #[napi(object)]
-pub struct DiscoverSessionsOptions {
-    /// Restrict to these sources. Omit for every adapter.
+pub struct DiscoverOptions {
+    pub db_path: Option<String>,
     pub sources: Option<Vec<String>>,
-    /// Global cap across all providers, applied by recency. Omit for no cap.
     pub limit: Option<u32>,
 }
 
-/// A non-fatal failure during discovery. One provider (or one malformed
-/// session) failing never blocks the rest of the run.
 #[napi(object)]
 pub struct DiscoveryDiagnostic {
     pub source: String,
@@ -156,7 +537,6 @@ pub struct DiscoveryDiagnostic {
     pub error: String,
 }
 
-/// Per-provider tallies for one discovery run.
 #[napi(object)]
 pub struct ProviderSummary {
     pub source: String,
@@ -166,7 +546,6 @@ pub struct ProviderSummary {
     pub failed: bool,
 }
 
-/// What one discovery run actually did — bounded-work evidence, not timings.
 #[napi(object)]
 pub struct DiscoveryCounters {
     pub candidates_enumerated: i64,
@@ -176,14 +555,12 @@ pub struct DiscoveryCounters {
     pub bytes_read: i64,
 }
 
-/// A source that deliberately has no shallow adapter, and why.
 #[napi(object)]
 pub struct SourceExemption {
     pub source: String,
     pub reason: String,
 }
 
-/// Outcome of one shallow discovery run, with the rows collected.
 #[napi(object)]
 pub struct DiscoverResult {
     pub contract_version: u32,
@@ -196,83 +573,25 @@ pub struct DiscoverResult {
     pub counters: DiscoveryCounters,
 }
 
-/// List the session catalog from the local database only.
-///
-/// One indexed query over `sessions`: no provider transcript is opened and no
-/// history/event/tool-call table is scanned, so this stays fast on first paint
-/// even with thousands of historical sessions. A database that does not exist
-/// yet is an empty catalog — call `discoverSessions()` to populate it.
+/// Explicit bounded provider discovery. It updates only the session catalog.
 #[napi]
-pub async fn list_sessions(options: Option<ListSessionsOptions>) -> napi::Result<SessionCatalog> {
-    let options = options.unwrap_or(ListSessionsOptions {
-        sources: None,
-        limit: None,
-        before_ms: None,
-        after: None,
-    });
-    if let Some(limit) = options.limit {
-        // SQLite reads a negative LIMIT as "unlimited"; reject rather than
-        // silently hand back the whole catalog.
-        if limit < 0 {
-            return Err(napi::Error::from_reason(format!(
-                "limit must not be negative (got {limit})"
-            )));
-        }
-    }
-    let request = ai_hist_cli::CatalogListOptions {
-        sources: options.sources.unwrap_or_default(),
-        limit: options.limit,
-        before_ms: options.before_ms,
-        after: options.after.map(|cursor| ai_hist_cli::CatalogCursor {
-            last_activity_ms: cursor.last_activity_ms,
-            source: cursor.source,
-            session_id: cursor.session_id,
-        }),
-    };
-    let page =
-        napi::tokio::task::spawn_blocking(move || ai_hist_cli::list_sessions_local(&request))
-            .await
-            .map_err(|e| napi::Error::from_reason(format!("worker thread panicked: {e}")))?
-            .map_err(|e| napi::Error::from_reason(format!("{e:#}")))?;
-    Ok(SessionCatalog {
-        contract_version: ai_hist_cli::SESSION_CATALOG_CONTRACT_VERSION,
-        sessions: page
-            .sessions
-            .into_iter()
-            .map(CatalogSession::from)
-            .collect(),
-        next_cursor: page.next_cursor.map(|cursor| CatalogCursor {
-            last_activity_ms: cursor.last_activity_ms,
-            source: cursor.source,
-            session_id: cursor.session_id,
-        }),
-    })
-}
-
-/// Discover sessions from the known provider locations with bounded reads.
-///
-/// Candidates from every provider are merged by recency before the limit is
-/// applied, so a limit is global rather than per-provider. Sources whose bytes
-/// have not changed since the last run are served from the catalog. Rows are
-/// collected rather than streamed; use the CLI's JSONL output for progressive
-/// consumption.
-#[napi]
-pub async fn discover_sessions(
-    options: Option<DiscoverSessionsOptions>,
-) -> napi::Result<DiscoverResult> {
-    let options = options.unwrap_or(DiscoverSessionsOptions {
+pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result<DiscoverResult> {
+    let options = options.unwrap_or(DiscoverOptions {
+        db_path: None,
         sources: None,
         limit: None,
     });
-    let request = ai_hist_cli::DiscoverOptions {
+    let path = db_path(options.db_path);
+    let request = ai_hist_engine::DiscoverOptions {
         sources: options.sources.unwrap_or_default(),
         limit: options.limit.map(|limit| limit as usize),
     };
-    let (sessions, summary) =
-        napi::tokio::task::spawn_blocking(move || ai_hist_cli::discover_sessions_local(&request))
-            .await
-            .map_err(|e| napi::Error::from_reason(format!("worker thread panicked: {e}")))?
-            .map_err(|e| napi::Error::from_reason(format!("{e:#}")))?;
+    let (sessions, summary) = napi::tokio::task::spawn_blocking(move || {
+        ai_hist_engine::discover_sessions_local_at(&path, &request)
+    })
+    .await
+    .map_err(worker_error)?
+    .map_err(|error| native_error("DISCOVERY_FAILED", format!("{error:#}")))?;
     Ok(DiscoverResult {
         contract_version: summary.contract_version,
         sessions: sessions.into_iter().map(CatalogSession::from).collect(),
@@ -292,18 +611,18 @@ pub async fn discover_sessions(
         exempt_sources: summary
             .exempt_sources
             .into_iter()
-            .map(|exemption| SourceExemption {
-                source: exemption.source.to_string(),
-                reason: exemption.reason.to_string(),
+            .map(|item| SourceExemption {
+                source: item.source.to_string(),
+                reason: item.reason.to_string(),
             })
             .collect(),
         diagnostics: summary
             .diagnostics
             .into_iter()
-            .map(|diagnostic| DiscoveryDiagnostic {
-                source: diagnostic.source,
-                locator: diagnostic.locator,
-                error: diagnostic.error,
+            .map(|item| DiscoveryDiagnostic {
+                source: item.source,
+                locator: item.locator,
+                error: item.error,
             })
             .collect(),
         counters: DiscoveryCounters {
@@ -313,5 +632,60 @@ pub async fn discover_sessions(
             files_opened: summary.counters.files_opened as i64,
             bytes_read: summary.counters.bytes_read as i64,
         },
+    })
+}
+
+#[napi(object)]
+pub struct SyncOptions {
+    pub db_path: Option<String>,
+}
+
+#[napi(object)]
+pub struct SyncResult {
+    pub database_path: String,
+    pub completed: bool,
+}
+
+/// Explicit full ingestion. A read operation never calls this implicitly.
+#[napi]
+pub async fn sync(options: Option<SyncOptions>) -> napi::Result<SyncResult> {
+    let path = db_path(options.and_then(|options| options.db_path));
+    let result_path = path.display().to_string();
+    napi::tokio::task::spawn_blocking(move || ai_hist_engine::sync_local_at(&path))
+        .await
+        .map_err(worker_error)?
+        .map_err(|error| native_error("SYNC_FAILED", format!("{error:#}")))?;
+    Ok(SyncResult {
+        database_path: result_path,
+        completed: true,
+    })
+}
+
+/// Backward-compatible internal capture entry point; not used by the SDK.
+#[napi]
+pub async fn sync_local() -> napi::Result<()> {
+    sync(None).await.map(|_| ())
+}
+
+#[napi(object)]
+pub struct SyncPushResult {
+    pub sent: u32,
+    pub accepted: u32,
+    pub authenticated: bool,
+    pub sync_skipped: bool,
+}
+
+/// Cloud capture hook retained for Agent Relay integration.
+#[napi]
+pub async fn sync_and_push() -> napi::Result<SyncPushResult> {
+    let outcome = napi::tokio::task::spawn_blocking(ai_hist_engine::sync_and_push)
+        .await
+        .map_err(worker_error)?
+        .map_err(|error| native_error("SYNC_PUSH_FAILED", format!("{error:#}")))?;
+    Ok(SyncPushResult {
+        sent: outcome.sent as u32,
+        accepted: outcome.accepted as u32,
+        authenticated: outcome.authenticated,
+        sync_skipped: outcome.sync_skipped,
     })
 }
