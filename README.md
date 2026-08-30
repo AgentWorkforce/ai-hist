@@ -68,6 +68,19 @@ AI_HIST_SOURCE_REF=my-branch sh install.sh    # override source fallback ref
 The publish workflow creates the npm packages, the `sdk-ts-v<version>` GitHub
 Release, and the prebuilt Rust assets consumed by the installer.
 
+### Checking your version
+
+`ai-hist --version` prints the installed version and, when a newer GitHub
+release exists, a short update notice on stderr. The check only runs
+interactively (stderr must be a terminal), times out quickly, and stays silent
+when offline. To print just the version, pass `--no-warning` or set
+`RELAYHISTORY_NO_UPDATE_CHECK=1`:
+
+```bash
+ai-hist --version               # version + update notice when one is available
+ai-hist --version --no-warning  # version only
+```
+
 ## Usage
 
 ```bash

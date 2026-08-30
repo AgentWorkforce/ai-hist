@@ -26,6 +26,16 @@ mod cloud;
 /// listing that backs it.
 pub mod discover;
 mod learn;
+mod update;
+
+/// Version this build identifies as: the release version CI stamps in when
+/// building the binaries attached to a GitHub release (release tags follow
+/// `sdk-ts/package.json`, not the crate version), falling back to the crate
+/// version for local builds.
+pub const CLI_VERSION: &str = match option_env!("AI_HIST_RELEASE_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 pub use discover::{
     discover_sessions, discover_sessions_collect, discover_sessions_with_env, list_session_catalog,
@@ -101,7 +111,7 @@ pub fn sync_and_push() -> Result<SyncPushOutcome> {
         id: cloud::machine_id()?,
         hostname: cloud::machine_hostname(),
         os: Some(std::env::consts::OS.to_string()),
-        cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        cli_version: Some(CLI_VERSION.to_string()),
         ..Default::default()
     };
     let cursor = cloud::load_cursor(&auth.base_url)?;
@@ -157,12 +167,19 @@ pub fn discover_sessions_local(
 #[command(
     name = "ai-hist",
     bin_name = "ai-hist",
-    version,
+    version = CLI_VERSION,
     about = "Sync, search, tag, and relay AI coding agent history"
 )]
 struct Cli {
     #[arg(long)]
     db: Option<PathBuf>,
+    /// Suppress the new-version notice `--version` may print.
+    // Never read from the parsed struct: `--version` short-circuits parsing
+    // (`ErrorKind::DisplayVersion`), so the version path re-scans raw args
+    // instead. The field exists so clap accepts and documents the flag.
+    #[allow(dead_code)]
+    #[arg(long = "no-warning", global = true)]
+    no_warning: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -700,7 +717,18 @@ fn read_only_connection(command: &Command, db_path: &Path) -> Option<Connection>
 /// CLI entry point. `src/main.rs` is a thin wrapper that calls this so the same
 /// code is available as a library (for the napi binding).
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // `--version`: print the version like clap would, then (unless
+        // suppressed) check GitHub for a newer release and note it on stderr.
+        Err(err) if err.kind() == clap::error::ErrorKind::DisplayVersion => {
+            err.print()?;
+            update::maybe_print_update_notice();
+            return Ok(());
+        }
+        // Help, usage errors, …: keep clap's exact output and exit codes.
+        Err(err) => err.exit(),
+    };
     let db_path = cli.db.unwrap_or_else(default_db_path);
     // Sync commands must acquire their advisory lock before opening a writable connection.
     // Pre-dispatch them so the common connection setup below cannot initialize the schema or
@@ -1113,7 +1141,7 @@ pub fn run() -> Result<()> {
                 id: cloud::machine_id()?,
                 hostname: cloud::machine_hostname(),
                 os: Some(std::env::consts::OS.to_string()),
-                cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                cli_version: Some(CLI_VERSION.to_string()),
                 ..Default::default()
             };
             let cursor = cloud::load_cursor(&auth.base_url)?;

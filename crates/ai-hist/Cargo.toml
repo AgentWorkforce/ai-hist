@@ -1,6 +1,9 @@
 [package]
 name = "ai-hist-cli"
-version = "0.2.0"
+# Kept in lockstep with the release version (sdk-ts/package.json) by the
+# publish workflow's "Sync CLI crate version" step, so `ai-hist --version`
+# reports the release version even for source builds.
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

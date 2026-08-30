@@ -149,6 +149,36 @@ jobs:
           writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
           NODE
 
+      # The `ai-hist` binary reports the crate version (see CLI_VERSION in
+      # crates/ai-hist/src/lib.rs), so keep it in lockstep with the release
+      # version — otherwise source-built installs report a stale version and
+      # the --version update check misfires.
+      - name: Sync CLI crate version
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.bump.outputs.version }}'
+          # First `version = "..."` line in the manifest is the package's own
+          # (the lines above it are the [package] header, name, and comments).
+          sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" crates/ai-hist/Cargo.toml
+          grep -q "^version = \"$VERSION\"$" crates/ai-hist/Cargo.toml
+          # Keep Cargo.lock in step by rewriting the one line that changed,
+          # rather than running cargo: this job installs no Rust toolchain and
+          # has no registry cache, so `cargo update --offline` cannot resolve
+          # the graph, and an online `cargo update` would fold unrelated
+          # dependency upgrades into the release commit. `ai-hist-cli` is a
+          # path-only workspace member that nothing depends on by version
+          # requirement, so its own `version` is the whole delta.
+          awk -v ver="$VERSION" '
+            /^\[\[package\]\]$/ { in_pkg = 0 }
+            /^name = "ai-hist-cli"$/ { in_pkg = 1 }
+            in_pkg && /^version = / { print "version = \"" ver "\""; in_pkg = 0; next }
+            { print }
+          ' Cargo.lock > Cargo.lock.synced
+          mv Cargo.lock.synced Cargo.lock
+          LOCKED=$(awk '/^name = "ai-hist-cli"$/ { getline; print; exit }' Cargo.lock)
+          test "$LOCKED" = "version = \"$VERSION\""
+
       # CHANGELOG.md generation. If `## [Unreleased]` contains hand-curated
       # content, promote it verbatim into the new `## [x.y.z] - DATE` block.
       # Otherwise infer from git log since the last `sdk-ts-v*` tag. Skips
@@ -343,6 +373,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add sdk-ts/package.json
           git add mcp-package/package.json
+          git add crates/ai-hist/Cargo.toml Cargo.lock
           # CHANGELOG only exists once there's been at least one release with
           # Unreleased content or a prior tag — skip silently on first publish.
           if [ -f sdk-ts/CHANGELOG.md ]; then
@@ -471,6 +502,12 @@ jobs:
         uses: taiki-e/install-action@cross
 
       - name: Build binary
+        env:
+          # Stamped into the binary (see CLI_VERSION in crates/ai-hist/src/lib.rs)
+          # so `--version` reports the release version and can compare itself
+          # against the latest GitHub release. Cross.toml passes it through to
+          # the cross container.
+          AI_HIST_RELEASE_VERSION: ${{ needs.publish.outputs.version }}
         run: |
           set -euo pipefail
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
@@ -484,7 +521,11 @@ jobs:
 
       - name: Verify binary
         if: matrix.run_binary
-        run: "./${{ matrix.asset }} --version"
+        run: |
+          set -euo pipefail
+          OUT="$(./${{ matrix.asset }} --version --no-warning)"
+          echo "$OUT"
+          test "$OUT" = "ai-hist ${{ needs.publish.outputs.version }}"
 
       - name: Inspect binary
         if: ${{ !matrix.run_binary }}

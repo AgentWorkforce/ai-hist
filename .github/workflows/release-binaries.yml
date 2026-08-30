@@ -65,8 +65,16 @@ jobs:
         uses: taiki-e/install-action@cross
 
       - name: Build binary
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
+          # Stamped into the binary (see CLI_VERSION in crates/ai-hist/src/lib.rs)
+          # so `--version` reports the release version and can compare itself
+          # against the latest GitHub release. Cross.toml passes it through to
+          # the cross container.
+          AI_HIST_RELEASE_VERSION="${RELEASE_TAG#sdk-ts-v}"
+          export AI_HIST_RELEASE_VERSION
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
             RUSTFLAGS="-C target-feature=+crt-static" cross build --release --target "${{ matrix.target }}" -p ai-hist-cli
           else
@@ -78,7 +86,13 @@ jobs:
 
       - name: Verify binary
         if: matrix.run_binary
-        run: "./${{ matrix.asset }} --version"
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          OUT="$(./${{ matrix.asset }} --version --no-warning)"
+          echo "$OUT"
+          test "$OUT" = "ai-hist ${RELEASE_TAG#sdk-ts-v}"
 
       - name: Inspect binary
         if: ${{ !matrix.run_binary }}
