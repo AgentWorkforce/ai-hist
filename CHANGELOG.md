@@ -25,7 +25,7 @@ Notable changes to the native `ai-hist` CLI are documented here.
   so on stderr, with the install one-liner to update. The check is
   interactive-only (stderr must be a terminal), bounded by a 3-second timeout,
   and silent on any failure; suppress it with `--no-warning` or
-  `AI_HIST_NO_UPDATE_CHECK=1`. To make `--version` report the `sdk-ts-v*`
+  `RELAYHISTORY_NO_UPDATE_CHECK=1`. To make `--version` report the `sdk-ts-v*`
   release version instead of a stale internal crate version (released binaries
   used to report `0.2.0` regardless of release), the crate version is bumped to
   the current release and kept in lockstep by the publish workflow, and release

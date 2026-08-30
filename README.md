@@ -74,7 +74,7 @@ Release, and the prebuilt Rust assets consumed by the installer.
 release exists, a short update notice on stderr. The check only runs
 interactively (stderr must be a terminal), times out quickly, and stays silent
 when offline. To print just the version, pass `--no-warning` or set
-`AI_HIST_NO_UPDATE_CHECK=1`:
+`RELAYHISTORY_NO_UPDATE_CHECK=1`:
 
 ```bash
 ai-hist --version               # version + update notice when one is available

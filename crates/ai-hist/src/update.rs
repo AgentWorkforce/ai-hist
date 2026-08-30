@@ -22,7 +22,7 @@ const TAG_PREFIX: &str = "sdk-ts-v";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 /// Environment opt-out honored in addition to the `--no-warning` flag, for
 /// scripts that cannot change the invocation.
-const OPT_OUT_ENV: &str = "AI_HIST_NO_UPDATE_CHECK";
+const OPT_OUT_ENV: &str = "RELAYHISTORY_NO_UPDATE_CHECK";
 
 /// A release `major.minor.patch` triple, ordered numerically so `0.10.0`
 /// beats `0.9.1`.
