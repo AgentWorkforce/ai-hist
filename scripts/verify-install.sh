@@ -76,10 +76,12 @@ source_install_output=$(
 grep -q 'skipping auto-sync service install' <<<"$source_install_output"
 
 test -x "$SOURCE_BIN/ai-hist"
+test -x "$SOURCE_BIN/relayhistory"
 test -x "$SOURCE_SHARE/ai-hist-rust-bin"
 assert_legacy_removed "$SOURCE_BIN" "$SOURCE_SHARE"
 "$SOURCE_BIN/ai-hist" --help | grep -q 'Usage: ai-hist'
 "$SOURCE_BIN/ai-hist" --version | grep -q '^ai-hist '
+"$SOURCE_BIN/relayhistory" --version | grep -q '^ai-hist '
 if AI_HIST_CLI=python "$SOURCE_BIN/ai-hist" --version >"$TMP/legacy-env.out" 2>&1; then
   echo "verify-install: AI_HIST_CLI unexpectedly succeeded" >&2
   exit 1
@@ -88,6 +90,7 @@ grep -q 'AI_HIST_CLI is no longer supported' "$TMP/legacy-env.out"
 
 ln -s "$ROOT/ai-hist" "$TMP/linked-ai-hist"
 "$TMP/linked-ai-hist" --version | grep -q '^ai-hist '
+"$ROOT/relayhistory" --version | grep -q '^ai-hist '
 
 TEST_HOME="$TMP/history-home"
 mkdir -p "$TEST_HOME/.claude" "$TEST_HOME/.codex"
@@ -151,6 +154,7 @@ binary_install_output=$(
 grep -q 'skipping auto-sync service install' <<<"$binary_install_output"
 
 test "$("$BINARY_BIN/ai-hist" --version)" = "ai-hist 9.9.9"
+test "$("$BINARY_BIN/relayhistory" --version)" = "ai-hist 9.9.9"
 test "$("$BINARY_BIN/ai-hist" recent)" = "[]"
 assert_legacy_removed "$BINARY_BIN" "$BINARY_SHARE"
 

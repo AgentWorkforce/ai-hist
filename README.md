@@ -44,9 +44,9 @@ Make sure `~/.local/bin` is in your `PATH`:
 export PATH="$HOME/.local/bin:$PATH"  # add to .zshrc / .bashrc
 ```
 
-The installer installs the `ai-hist` launcher. For normal installs it downloads
-a prebuilt Rust binary from GitHub Releases, so users do not need a local Rust
-toolchain.
+The installer installs the `ai-hist` launcher, plus a `relayhistory` alias
+that runs the same binary. For normal installs it downloads a prebuilt Rust
+binary from GitHub Releases, so users do not need a local Rust toolchain.
 
 Upgrading to the Rust-only release removes installer-managed `ai-hist-python`
 and `ai-hist-rust` compatibility launchers. Unrecognized files with those names

@@ -123,7 +123,9 @@ install_binary_launchers() {
 
   mkdir -p "$BIN_DIR" "$INSTALL_DIR"
 
-  cat > "$BIN_DIR/ai-hist" <<EOF
+  # `relayhistory` is an alias for `ai-hist`; both launchers are identical.
+  for launcher in ai-hist relayhistory; do
+    cat > "$BIN_DIR/$launcher" <<EOF
 #!/usr/bin/env sh
 if [ -n "\${AI_HIST_CLI:-}" ]; then
   echo "ai-hist: AI_HIST_CLI is no longer supported; the Python CLI was removed." >&2
@@ -132,7 +134,8 @@ fi
 exec "\${AI_HIST_RUST_BIN:-$rust_bin}" "\$@"
 EOF
 
-  chmod 755 "$BIN_DIR/ai-hist"
+    chmod 755 "$BIN_DIR/$launcher"
+  done
 }
 
 remove_if_legacy() {
@@ -291,6 +294,7 @@ ai-hist installed.
 
 Commands:
   $BIN_DIR/ai-hist
+  $BIN_DIR/relayhistory (alias)
 
 Add this to your shell profile if needed:
   export PATH="$BIN_DIR:\$PATH"
