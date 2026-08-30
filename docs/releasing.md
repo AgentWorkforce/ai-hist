@@ -18,6 +18,13 @@ The `Publish RelayHistory npm packages` workflow:
 The SDK root is never published before required platform artifacts. This is
 important because npm multi-package publication is not atomic.
 
+When manually dispatching the workflow, choose `patch`, `minor`, or `major`.
+The workflow computes the next version from `crates/ai-hist-napi/package.json`
+and applies that exact version to the native root, every platform package, the
+SDK/CLI, and the MCP wrapper. `custom_version` is available for an explicit
+version and overrides the selected bump type. Leave `dry_run` enabled to build
+and validate the release without publishing it.
+
 ## Supported matrix
 
 - Node.js: minimum 20; tested 20 and 22.
