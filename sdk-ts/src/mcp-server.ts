@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 /** Thin MCP adapters over the public `ai-hist` TypeScript SDK. */
+import { readFileSync } from 'node:fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -13,7 +14,14 @@ const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } 
 const WRITE = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
 const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode']);
 const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode']);
-const server = new McpServer({ name: 'ai-hist', version: '1.0.0' }, { capabilities: { tools: {} } });
+const packageVersion = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+).version as string;
+
+const server = new McpServer(
+  { name: 'ai-hist', version: packageVersion },
+  { capabilities: { tools: {} } },
+);
 
 function result(value: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }] };

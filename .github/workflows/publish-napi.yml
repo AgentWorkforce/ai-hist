@@ -31,6 +31,11 @@ on:
 permissions:
   contents: read
 
+# A release publishes several packages that must share one exact version.
+concurrency:
+  group: publish-relayhistory
+  cancel-in-progress: false
+
 defaults:
   run:
     working-directory: crates/ai-hist-napi
@@ -137,7 +142,7 @@ jobs:
     runs-on: ubuntu-latest
     # Only the publish job mints OIDC tokens (npm provenance).
     permissions:
-      contents: read
+      contents: write
       id-token: write
     steps:
       - uses: actions/checkout@v4
@@ -157,13 +162,67 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "$CUSTOM_VERSION" ]; then
-            npm version "$CUSTOM_VERSION" --no-git-tag-version --allow-same-version
+            VERSION="$CUSTOM_VERSION"
           else
-            npm version "$VERSION_TYPE" --no-git-tag-version
+            # The registry is the durable source of truth between manual runs;
+            # package.json is kept at the latest checked-in release baseline.
+            CURRENT_VERSION=$(npm view ai-hist version)
+            VERSION=$(node -e '
+              const [current, bump] = process.argv.slice(1);
+              const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(current);
+              if (!match) throw new Error("Expected a stable semver, received " + current);
+              let [, major, minor, patch] = match.map(Number);
+              if (bump === "major") [major, minor, patch] = [major + 1, 0, 0];
+              else if (bump === "minor") [minor, patch] = [minor + 1, 0];
+              else if (bump === "patch") patch += 1;
+              else throw new Error("Unsupported version bump: " + bump);
+              process.stdout.write([major, minor, patch].join("."));
+            ' "$CURRENT_VERSION" "$VERSION_TYPE")
           fi
-          VERSION=$(node -p "require('./package.json').version")
+          node -e '
+            const version = process.argv[1];
+            if (!/^\d+\.\d+\.\d+$/.test(version)) {
+              throw new Error("Version must be a stable semver: " + version);
+            }
+          ' "$VERSION"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          (
+            cd ../../sdk-ts
+            npm version "$VERSION" --no-git-tag-version --allow-same-version
+          )
+          (
+            cd ../../mcp-package
+            npm version "$VERSION" --no-git-tag-version --allow-same-version
+            npm pkg set dependencies.ai-hist="$VERSION"
+          )
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing version $VERSION"
+
+      - name: Verify package versions are aligned
+        working-directory: .
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const manifests = [
+              "crates/ai-hist-napi/package.json",
+              "sdk-ts/package.json",
+              "mcp-package/package.json",
+            ].map((path) => [path, JSON.parse(fs.readFileSync(path, "utf8"))]);
+            for (const [path, manifest] of manifests) {
+              if (manifest.version !== process.env.VERSION) {
+                throw new Error(path + " has version " + manifest.version);
+              }
+            }
+            if (manifests[1][1].dependencies["ai-hist-native"] !== "file:../crates/ai-hist-napi") {
+              throw new Error("ai-hist must keep its local native dependency while building");
+            }
+            if (manifests[2][1].dependencies["ai-hist"] !== process.env.VERSION) {
+              throw new Error("ai-hist-mcp must pin ai-hist at the release version");
+            }
+            console.log("All packages aligned at " + process.env.VERSION);
+          '
       - uses: actions/download-artifact@v4
         with:
           path: crates/ai-hist-napi/artifacts
@@ -186,8 +245,8 @@ jobs:
           NPM_CONFIG_PROVENANCE: 'true'
         run: |
           set -euo pipefail
-          # --skip-gh-release: we ship npm packages only (a GitHub release needs
-          # contents:write + a token this job doesn't have).
+          # GitHub release creation is handled after all registry smoke tests,
+          # so napi must not create one while packages are still publishing.
           if [ "$DRY_RUN" = "true" ]; then
             echo "Dry run — skipping publish. Prepared packages:"
             npx napi prepublish -t npm --dry-run --skip-gh-release || true
@@ -210,7 +269,18 @@ jobs:
           npm install --ignore-scripts
           npm run build
           node dist/cli.js sessions list --db /tmp/relayhistory-empty.db --json
-          npm pkg set version="$VERSION" dependencies.ai-hist-native="$VERSION"
+          # Keep the local native package available through validation, then
+          # rewrite only the manifest that will be packed and published.
+          npm pkg set dependencies.ai-hist-native="$VERSION"
+          node -e '
+            const manifest = require("./package.json");
+            if (manifest.version !== process.env.VERSION) {
+              throw new Error("ai-hist version is not aligned");
+            }
+            if (manifest.dependencies["ai-hist-native"] !== process.env.VERSION) {
+              throw new Error("ai-hist-native publish dependency is not aligned");
+            }
+          '
           if [ "${{ inputs.dry_run }}" = "true" ]; then npm pack --dry-run; fi
 
       - name: Publish SDK and CLI
@@ -221,11 +291,9 @@ jobs:
       - name: Build and publish MCP wrapper
         working-directory: mcp-package
         env:
-          VERSION: ${{ steps.version.outputs.version }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
-          npm pkg set version="$VERSION" dependencies.ai-hist="$VERSION"
           if [ "$DRY_RUN" != "true" ]; then npm publish --access public; fi
 
       - name: Registry clean-install smoke test
@@ -257,3 +325,15 @@ jobs:
               },
             );
           '
+
+      - name: Create GitHub Release and tag
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "sdk-ts-v$VERSION" \
+            --target "$GITHUB_SHA" \
+            --title "ai-hist@$VERSION" \
+            --generate-notes

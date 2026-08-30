@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "ai-hist-napi"
-version = "1.0.0"
+version = "0.6.0"
 dependencies = [
  "ai-hist-core",
  "ai-hist-engine",
