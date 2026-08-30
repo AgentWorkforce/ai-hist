@@ -21,6 +21,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
   databases migrate in place on the next open.
 - Expose `listSessions` and `discoverSessions` from the napi binding, so a Node
   host can drive the catalog in-process instead of shelling out.
+- `ai-hist --version` now notices when a newer GitHub release exists and says
+  so on stderr, with the install one-liner to update. The check is
+  interactive-only (stderr must be a terminal), bounded by a 3-second timeout,
+  and silent on any failure; suppress it with `--no-warning` or
+  `AI_HIST_NO_UPDATE_CHECK=1`. Release workflows now stamp the release version
+  into the binaries (`AI_HIST_RELEASE_VERSION`), so `--version` reports the
+  `sdk-ts-v*` release version instead of the internal crate version.
 
 ### Breaking
 
