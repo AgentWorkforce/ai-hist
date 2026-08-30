@@ -189,7 +189,6 @@ jobs:
           (
             cd ../../sdk-ts
             npm version "$VERSION" --no-git-tag-version --allow-same-version
-            npm pkg set dependencies.ai-hist-native="$VERSION"
           )
           (
             cd ../../mcp-package
@@ -216,8 +215,8 @@ jobs:
                 throw new Error(path + " has version " + manifest.version);
               }
             }
-            if (manifests[1][1].dependencies["ai-hist-native"] !== process.env.VERSION) {
-              throw new Error("ai-hist must pin ai-hist-native at the release version");
+            if (manifests[1][1].dependencies["ai-hist-native"] !== "file:../crates/ai-hist-napi") {
+              throw new Error("ai-hist must keep its local native dependency while building");
             }
             if (manifests[2][1].dependencies["ai-hist"] !== process.env.VERSION) {
               throw new Error("ai-hist-mcp must pin ai-hist at the release version");
@@ -263,11 +262,25 @@ jobs:
 
       - name: Build SDK and CLI against the release contract
         working-directory: sdk-ts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           npm install --ignore-scripts
           npm run build
           node dist/cli.js sessions list --db /tmp/relayhistory-empty.db --json
+          # Keep the local native package available through validation, then
+          # rewrite only the manifest that will be packed and published.
+          npm pkg set dependencies.ai-hist-native="$VERSION"
+          node -e '
+            const manifest = require("./package.json");
+            if (manifest.version !== process.env.VERSION) {
+              throw new Error("ai-hist version is not aligned");
+            }
+            if (manifest.dependencies["ai-hist-native"] !== process.env.VERSION) {
+              throw new Error("ai-hist-native publish dependency is not aligned");
+            }
+          '
           if [ "${{ inputs.dry_run }}" = "true" ]; then npm pack --dry-run; fi
 
       - name: Publish SDK and CLI
