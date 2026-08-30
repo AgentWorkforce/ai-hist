@@ -434,8 +434,8 @@ export interface OpenSourceInfo {
  * runtime lazily and the DB file is read asynchronously so the host
  * process's event loop isn't blocked.
  *
- * Each call snapshots the data; to pick up later writes, call `reload()`
- * (or open a fresh instance).
+ * Each call snapshots the data; to pick up later writes, open a fresh
+ * instance.
  */
 export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
   const dbPath = opts.dbPath ?? defaultDbPath();

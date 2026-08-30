@@ -513,8 +513,8 @@ jobs:
         run: |
           set -euo pipefail
           VERSION='${{ needs.publish.outputs.version }}'
-          # Fall back to reading sdk-ts/package.json on the just-pushed HEAD
-          # if the publish job's output is empty (e.g. version=none re-runs).
+          # Fail loudly if the publish job reported no version: every later
+          # step derives the tag from it, so an empty value would tag garbage.
           if [ -z "$VERSION" ]; then
             echo "::error::publish job did not report a version"
             exit 1

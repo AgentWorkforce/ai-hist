@@ -152,7 +152,7 @@ ai-hist supports these sources:
 | Codex CLI | Local JSONL (`~/.codex/history.jsonl`) | `text`, `ts`, `session_id` | first `session_meta` line of `rollout-*.jsonl` (richest metadata) |
 | Cursor | Per-session JSONL (`~/.cursor/projects/<encoded-path>/agent-transcripts/<uuid>/<uuid>.jsonl`) | `role`, `message.content[].text` (user prompts wrapped in `<user_query>...`) | same files; no provider timestamps, so recency is file mtime |
 | Grok | Per-session JSONL (`~/.grok/sessions/<encoded-path>/<session-id>/chat_history.jsonl`) plus `summary.json` | `type`, `content[].text`, `info.cwd`, `head_branch` | `summary.json` + head of `chat_history.jsonl` |
-| [Agent Relay](https://github.com/AgentWorkforce/relay) | API (`https://api.relaycast.dev/v1`) | `sender`, `content`, `channel`, `timestamp` | already-synced local rows only — never the network |
+| [Agent Relay](https://github.com/AgentWorkforce/relay) | API (`https://api.relaycast.dev/v1`) | `from_name`, `text`, `thread_id`, `created_at` | already-synced local rows only — never the network |
 | Trajectories | Compacted per-run JSON (`$TRAJECTORY_ROOT/**/compacted/*.json`) | `personaId`, `projectId`, `task`, `decisions`, `retrospective` | exempt — derived records, not agent sessions |
 | OpenCode | Local SQLite (`$OPENCODE_DB` or `~/.local/share/opencode/opencode.db`) | user text parts joined to sessions | `session` table on a WAL-safe snapshot |
 

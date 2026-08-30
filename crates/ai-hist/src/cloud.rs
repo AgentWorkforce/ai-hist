@@ -1780,7 +1780,7 @@ mod tests {
 
             // Four rows from each source emit eight records. Halving the emitted count would
             // leave the per-source limit at four and retry those same eight forever; the retry
-            // must lower it to three and make progress.
+            // must lower it to two and make progress.
             assert_eq!(*client.attempted_record_counts.borrow(), vec![8, 4]);
             assert_eq!(report.batch_limit, 2);
             assert_eq!(report.attempts, 2);
