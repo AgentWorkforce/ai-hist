@@ -22,7 +22,19 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod cloud;
+/// Fast, shallow coding-agent session discovery and the cache-only catalog
+/// listing that backs it.
+pub mod discover;
 mod learn;
+
+pub use discover::{
+    discover_sessions, discover_sessions_collect, discover_sessions_with_env, list_session_catalog,
+    list_session_catalog_page, shallow_providers, AllProvidersFailed, Candidate, CatalogCursor,
+    CatalogListOptions, DiscoverOptions, DiscoveryCounters, DiscoveryDiagnostic, DiscoveryEnv,
+    DiscoverySummary, ProviderSummary, SessionCatalogPage, ShallowSession, ShallowSessionProvider,
+    SourceExemption, DEFAULT_CATALOG_LIMIT, DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION,
+    SHALLOW_SCANNER_VERSION,
+};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
@@ -108,6 +120,37 @@ pub fn sync_and_push() -> Result<SyncPushOutcome> {
         authenticated: true,
         sync_skipped,
     })
+}
+
+/// Cache-only session catalog listing against the default database.
+///
+/// The in-process equivalent of `ai-hist sessions list`: one indexed query
+/// over `sessions`, no provider I/O. A database that does not exist yet is an
+/// empty catalog, not an error — the caller is expected to run discovery next.
+pub fn list_sessions_local(options: &CatalogListOptions) -> Result<SessionCatalogPage> {
+    let db_path = default_db_path();
+    if !db_path.exists() {
+        return Ok(SessionCatalogPage::default());
+    }
+    let conn = match open_db_readonly(&db_path) {
+        Ok(conn) if schema_is_current(&conn).unwrap_or(false) => conn,
+        // Missing migration (a read-only handle skips init_db) or an
+        // unreadable handle: let the writable open sort it out.
+        _ => open_db(&db_path)?,
+    };
+    list_session_catalog_page(&conn, options)
+}
+
+/// Shallow discovery against the default database, with the rows collected.
+///
+/// The in-process equivalent of `ai-hist sessions discover`. Upsert-only and
+/// stamp-guarded, so it does not take the sync lock and is safe to run beside
+/// `sync_local`.
+pub fn discover_sessions_local(
+    options: &DiscoverOptions,
+) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
+    let conn = open_db(&default_db_path())?;
+    discover_sessions_collect(&conn, options)
 }
 
 #[derive(Parser)]
@@ -432,6 +475,71 @@ enum Command {
         #[command(subcommand)]
         action: LearnAction,
     },
+    /// Coding-agent session catalog — cache-only listing and shallow discovery.
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionsAction {
+    /// List the session catalog from the database only.
+    ///
+    /// Never opens a provider transcript and never scans history, events, or
+    /// tool calls: one indexed query over `sessions`. Run `sessions discover`
+    /// first to populate a fresh database.
+    List {
+        /// Restrict to a source (repeatable). Defaults to every discoverable source.
+        #[arg(long)]
+        source: Vec<String>,
+        /// Maximum rows (default 50). Must not be negative.
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Coarse cutoff: only sessions older than this epoch-ms. Cannot
+        /// separate sessions that share a millisecond — pass the previous
+        /// page's `next_cursor` fields to walk pages exactly.
+        #[arg(long)]
+        before_ms: Option<i64>,
+        /// Precise continuation: `source` of the previous page's last row.
+        /// Requires --after-session-id.
+        #[arg(long, requires = "after_session_id")]
+        after_source: Option<String>,
+        /// Precise continuation: `session_id` of the previous page's last row.
+        /// Requires --after-source.
+        #[arg(long, requires = "after_source")]
+        after_session_id: Option<String>,
+        /// Precise continuation: `last_activity_ms` of the previous page's last
+        /// row. Omit (with --after-source/--after-session-id given) to continue
+        /// through the rows whose recency is unknown.
+        ///
+        /// Requires --after-source (which in turn requires --after-session-id):
+        /// a timestamp alone is not a cursor, and silently ignoring it would
+        /// restart the walk at page one instead of continuing it.
+        #[arg(long, requires = "after_source")]
+        after_ms: Option<i64>,
+        /// Emit `{"contract_version":N,"sessions":[...],"next_cursor":…}` as one
+        /// JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Discover sessions from provider locations with bounded reads.
+    ///
+    /// Enumerates every provider, orders candidates globally by recency, reads
+    /// only what the catalog needs, and upserts rows as it goes. Sources whose
+    /// bytes have not changed since the last run are served from the catalog.
+    Discover {
+        /// Restrict to a source (repeatable). Defaults to every discoverable source.
+        #[arg(long)]
+        source: Vec<String>,
+        /// Global cap across all providers, applied by recency. Unlimited when omitted.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Emit JSONL progressively: one `session`/`diagnostic` object per line,
+        /// then a final `summary`.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -560,6 +668,12 @@ fn is_read_only(command: &Command) -> bool {
             // Listing it here keeps it off the write lock, so running it does not contend
             // with the 60s `sync` service.
             | Command::Coverage { .. }
+            // `sessions list` is cache-only by construction: one indexed query
+            // over `sessions` and no provider I/O at all. `sessions discover`
+            // upserts, so it is deliberately absent.
+            | Command::Sessions {
+                action: SessionsAction::List { .. }
+            }
     )
 }
 
@@ -1175,7 +1289,206 @@ pub fn run() -> Result<()> {
                 Ok(())
             }
         },
+        Command::Sessions { action } => match action {
+            SessionsAction::List {
+                source,
+                limit,
+                before_ms,
+                after_source,
+                after_session_id,
+                after_ms,
+                json,
+            } => {
+                for source in &source {
+                    validate_source(Some(source))?;
+                }
+                // SQLite reads a negative LIMIT as "no limit", so `--limit -1`
+                // would quietly dump the entire catalog instead of erroring.
+                if let Some(limit) = limit {
+                    anyhow::ensure!(limit >= 0, "--limit must not be negative (got {limit})");
+                }
+                // clap's `requires` already pairs the two identity flags; the
+                // timestamp is optional because the rows whose recency is
+                // unknown sort last and are continued through without one.
+                let after = match (after_source, after_session_id) {
+                    (Some(source), Some(session_id)) => Some(CatalogCursor {
+                        last_activity_ms: after_ms,
+                        source,
+                        session_id,
+                    }),
+                    _ => None,
+                };
+                let page = list_session_catalog_page(
+                    &conn,
+                    &CatalogListOptions {
+                        sources: source,
+                        limit,
+                        before_ms,
+                        after,
+                    },
+                )?;
+                print_session_catalog(&page, json)
+            }
+            SessionsAction::Discover {
+                source,
+                limit,
+                json,
+            } => run_session_discovery(&conn, source, limit, json),
+        },
     }
+}
+
+/// Render `ai-hist sessions list`.
+///
+/// The JSON form is one object, not a bare array, so the contract version and
+/// the pagination cursor travel with the payload:
+/// `{"contract_version":1,"sessions":[…],"next_cursor":{…}|null}`. Feed
+/// `next_cursor` back as `--after-ms/--after-source/--after-session-id` to get
+/// the next page; it is null once the catalog is exhausted.
+fn print_session_catalog(page: &SessionCatalogPage, as_json: bool) -> Result<()> {
+    let rows = &page.sessions;
+    if as_json {
+        println!(
+            "{}",
+            json!({
+                "contract_version": SESSION_CATALOG_CONTRACT_VERSION,
+                "sessions": rows,
+                "next_cursor": page.next_cursor,
+            })
+        );
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("No sessions in the catalog. Run `ai-hist sessions discover` to populate it.");
+        return Ok(());
+    }
+    for row in rows {
+        println!("{}", fmt_session_row(row));
+    }
+    println!("  {} session(s)", rows.len());
+    if let Some(cursor) = &page.next_cursor {
+        println!(
+            "  more available: --after-source {} --after-session-id {}{}",
+            cursor.source,
+            cursor.session_id,
+            cursor
+                .last_activity_ms
+                .map(|ms| format!(" --after-ms {ms}"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn fmt_session_row(row: &ShallowSession) -> String {
+    let when = row
+        .last_activity_ms
+        .and_then(|ms| Local.timestamp_millis_opt(ms).single())
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "------ --:--".to_string());
+    let cwd = row.cwd.as_deref().unwrap_or("-");
+    let prompt = row
+        .first_prompt
+        .as_deref()
+        .map(|text| {
+            let flat = text.replace('\n', " ");
+            if flat.chars().count() > 80 {
+                format!("{}...", flat.chars().take(80).collect::<String>())
+            } else {
+                flat
+            }
+        })
+        .unwrap_or_default();
+    format!(
+        "  {when}  {:<8} {:<8} {:<38} {cwd}  {prompt}",
+        row.source, row.discovery_state, row.session_id
+    )
+}
+
+/// Render `ai-hist sessions discover`, streaming rows as they are produced.
+///
+/// JSON mode is JSONL (the `events` command's precedent): one
+/// `{"type":"session",…}` per row, `{"type":"diagnostic",…}` per failure, and a
+/// closing `{"type":"summary",…}`. Per-provider failures are reported but do
+/// not change the exit code; only an every-provider failure does.
+fn run_session_discovery(
+    conn: &Connection,
+    sources: Vec<String>,
+    limit: Option<usize>,
+    as_json: bool,
+) -> Result<()> {
+    let options = DiscoverOptions { sources, limit };
+    let mut count = 0usize;
+    let outcome = discover_sessions(conn, &options, |session| {
+        count += 1;
+        if as_json {
+            match serde_json::to_value(session) {
+                Ok(Value::Object(mut map)) => {
+                    map.insert("type".to_string(), json!("session"));
+                    println!("{}", Value::Object(map));
+                }
+                _ => eprintln!(
+                    "ai-hist: could not serialize session {}",
+                    session.session_id
+                ),
+            }
+        } else {
+            println!("{}", fmt_session_row(session));
+        }
+    });
+    // An every-provider failure is still a failure, but the diagnostics are
+    // the reason a caller ran this at all. Render the collected stream and the
+    // summary trailer first, so a JSONL consumer never sees a truncated stream
+    // followed by an opaque exit code.
+    let (summary, failure) = match outcome {
+        Ok(summary) => (summary, None),
+        // `downcast`'s Err arm carries the original error untouched, so `?`
+        // propagates any other failure exactly as it arrived.
+        Err(error) => {
+            let failed = error.downcast::<AllProvidersFailed>()?;
+            let summary = failed.summary.clone();
+            (summary, Some(anyhow::Error::from(failed)))
+        }
+    };
+    for diagnostic in &summary.diagnostics {
+        if as_json {
+            println!(
+                "{}",
+                json!({
+                    "type": "diagnostic",
+                    "source": diagnostic.source,
+                    "locator": diagnostic.locator,
+                    "error": diagnostic.error,
+                })
+            );
+        } else {
+            let scope = diagnostic.locator.as_deref().unwrap_or("(provider)");
+            eprintln!(
+                "ai-hist: [{}] {scope}: {}",
+                diagnostic.source, diagnostic.error
+            );
+        }
+    }
+    if as_json {
+        let mut payload = serde_json::to_value(&summary)?;
+        if let Value::Object(map) = &mut payload {
+            map.insert("type".to_string(), json!("summary"));
+            map.remove("diagnostics");
+        }
+        println!("{payload}");
+    } else {
+        println!(
+            "  {count} session(s): {} discovered, {} unchanged ({} file(s) opened, {} shallow read(s))",
+            summary.discovered,
+            summary.skipped_unchanged,
+            summary.counters.files_opened,
+            summary.counters.shallow_reads
+        );
+    }
+    if let Some(failure) = failure {
+        return Err(failure);
+    }
+    Ok(())
 }
 
 /// Best-effort `git remote get-url origin` for project scoping (None if not a repo).
@@ -6152,6 +6465,10 @@ fn count_patch_text(text: &str) -> (i64, i64) {
     (added, removed)
 }
 
+/// Register a session whose full evidence (`session_events`, `tool_calls`, …)
+/// has just been ingested, so the row is marked `discovery_state = 'full'`.
+/// Shallow discovery writes through [`discover::upsert_shallow_session`]
+/// instead and never downgrades a `'full'` row.
 #[allow(clippy::too_many_arguments)]
 fn upsert_session(
     conn: &Connection,
@@ -6166,8 +6483,8 @@ fn upsert_session(
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO sessions \
-         (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, last_assistant_text, raw_path, parser_version) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1) \
+         (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, last_assistant_text, raw_path, parser_version, discovery_state) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'full') \
          ON CONFLICT(session_id, source) DO UPDATE SET \
          cwd = COALESCE(excluded.cwd, sessions.cwd), \
          git_branch = COALESCE(excluded.git_branch, sessions.git_branch), \
@@ -6175,7 +6492,8 @@ fn upsert_session(
          last_activity_ms = MAX(COALESCE(sessions.last_activity_ms, excluded.last_activity_ms), excluded.last_activity_ms), \
          last_assistant_text = COALESCE(excluded.last_assistant_text, sessions.last_assistant_text), \
          raw_path = COALESCE(excluded.raw_path, sessions.raw_path), \
-         parser_version = excluded.parser_version",
+         parser_version = excluded.parser_version, \
+         discovery_state = 'full'",
         params![
             session_id,
             source,

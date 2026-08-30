@@ -1,0 +1,484 @@
+# Session Catalog — shallow coding-agent session discovery
+
+**Answer "which coding-agent sessions exist on this machine, newest first?" in milliseconds, without indexing a single transcript.**
+
+`ai-hist sync` builds the deep index: every message, tool call, file edit and
+full-text row. That is the right thing for search, and the wrong thing for a
+session picker — it reads every transcript end to end. The **session catalog**
+is the shallow half: it enumerates provider sessions cheaply, extracts only the
+metadata needed to *identify* a session, and caches the result in the `sessions`
+table so the next listing touches no provider file at all.
+
+The two layers coexist. Discovery never blocks or downgrades a full sync, and a
+fully indexed session keeps its richer state when discovery re-reads it.
+
+---
+
+## The two operations
+
+| | `ai-hist sessions list` | `ai-hist sessions discover` |
+|---|---|---|
+| Reads | the `sessions` table only | provider locations, with bounded reads |
+| Provider I/O | none | head/tail of the newest candidates |
+| Writes | nothing (read-only handle when the schema is current) | upserts `sessions` rows |
+| Output | one JSON object | JSONL, streamed as rows are produced |
+| Use it for | every repaint of a session picker | refreshing the catalog |
+
+Use **`list`** whenever you are rendering: it is a single indexed query, it
+cannot contend with a running `sync`, and it still works when the provider
+files have been deleted.
+
+Use **`discover`** when the catalog may be stale — on app launch, on a manual
+refresh, or on a timer. It is safe to run beside `ai-hist sync`.
+
+```bash
+# Refresh the catalog from every provider, newest first.
+ai-hist sessions discover
+
+# Just the 20 most recent sessions across all providers (bounded work).
+ai-hist sessions discover --limit 20
+
+# Read back what the catalog holds — no provider file is opened.
+ai-hist sessions list
+ai-hist sessions list --limit 100 --source codex --source claude
+
+# Page backwards by recency (keyset, not OFFSET).
+ai-hist sessions list --limit 50 --before-ms 1781949900000
+
+# Machine-readable forms.
+ai-hist sessions list --json          # one JSON object
+ai-hist sessions discover --json      # JSONL: sessions, diagnostics, summary
+```
+
+---
+
+## The output contract
+
+Both operations carry `contract_version` — currently **1**
+(`SESSION_CATALOG_CONTRACT_VERSION`). It is bumped whenever the shape or the
+meaning of a row changes in a way a consumer must notice, so parse it and fail
+loudly on a version you do not know rather than guessing.
+
+### `sessions list --json`
+
+One object, never a bare array, so the version travels with the payload:
+
+```jsonc
+{
+  "contract_version": 1,
+  "sessions": [
+    {
+      "source": "codex",
+      "session_id": "0198c2ad-codex",
+      "cwd": "/Users/you/Projects/api",
+      "git_branch": "feature/retries",
+      "first_activity_ms": 1782039600000,
+      "last_activity_ms": 1782039603000,
+      "first_prompt": "make the backoff configurable",
+      "last_assistant_text": null,
+      "models": ["gpt-5-codex"],
+      "originator": "codex_cli_rs",
+      "agent_version": "0.148.0",
+      "repo_url": "git@github.com:acme/api.git",
+      "initial_commit": "abc1234def",
+      "workspace_roots": ["/Users/you/Projects/api"],
+      "raw_path": "/Users/you/.codex/sessions/2026/06/21/rollout-codex.jsonl",
+      "source_stamp": "v1:1788042670103317900:569",
+      "discovery_state": "shallow",
+      "from_cache": true
+    }
+  ],
+  "next_cursor": {
+    "last_activity_ms": 1782039603000,
+    "source": "codex",
+    "session_id": "0198c2ad-codex"
+  }
+}
+```
+
+Keys are `snake_case`. `models` and `workspace_roots` are always arrays
+(possibly empty); every other absent value is `null`, never an invented
+placeholder or an empty string.
+
+`next_cursor` is the continuation for the next page, or `null` once the catalog
+is exhausted (the page came back short of its limit). See
+[Pagination](#pagination).
+
+### `sessions discover --json`
+
+JSONL, one object per line, streamed as the run progresses (the `events`
+command's precedent). Three line types, in this order:
+
+```jsonc
+// 0..n session rows, in global recency order (newest first)
+{"type": "session", "source": "codex", "session_id": "0198c2ad-codex", "from_cache": false, /* …same fields as above… */ }
+
+// 0..n non-fatal failures — one provider or one malformed session
+{"type": "diagnostic", "source": "grok", "locator": "/Users/you/.grok/sessions/…/chat_history.jsonl", "error": "…"}
+
+// exactly one closing summary — emitted even when every provider failed,
+// so a consumer always sees the reason before the non-zero exit
+{
+  "type": "summary",
+  "contract_version": 1,
+  "discovered": 2,
+  "skipped_unchanged": 0,
+  "providers": {
+    "claude":   {"candidates": 1, "discovered": 1, "skipped_unchanged": 0, "failed": false},
+    "codex":    {"candidates": 1, "discovered": 1, "skipped_unchanged": 0, "failed": false},
+    "cursor":   {"candidates": 0, "discovered": 0, "skipped_unchanged": 0, "failed": false},
+    "grok":     {"candidates": 0, "discovered": 0, "skipped_unchanged": 0, "failed": false},
+    "opencode": {"candidates": 0, "discovered": 0, "skipped_unchanged": 0, "failed": false},
+    "relay":    {"candidates": 0, "discovered": 0, "skipped_unchanged": 0, "failed": false}
+  },
+  "exempt_sources": [
+    {"source": "trajectory", "reason": "derived trajectory records, not provider sessions"}
+  ],
+  "counters": {
+    "candidates_enumerated": 2,
+    "shallow_reads": 2,
+    "skipped_unchanged": 0,
+    "files_opened": 2,
+    "bytes_read": 978
+  }
+}
+```
+
+`counters` is the run's bill of work, and it is the honest way to check that
+discovery stayed cheap — `bytes_read` and `files_opened` are what a bounded
+request bounds, and `shallow_reads` is `0` on a rescan where nothing changed.
+
+Diagnostics are their own lines and never appear inside the `summary` object,
+so a consumer that only wants the tally can read the last line and stop. In
+human (non-`--json`) mode they go to stderr instead, leaving stdout clean:
+
+```text
+  2026-06-21 11:00  codex    shallow  0198c2ad-codex   /Users/you/Projects/api  make the backoff configurable
+  2026-06-20 10:05  claude   shallow  3f6c1b7a-claude  /Users/you/Projects/api  add a retry to the http client
+  2 session(s): 0 discovered, 2 unchanged (0 file(s) opened, 0 shallow read(s))
+```
+
+A provider that fails contributes a `diagnostic` and nothing else; the run
+continues and exits `0`. The command fails only when **every** selected
+provider failed.
+
+---
+
+## Field semantics
+
+Every value is one of three things, and the distinction is part of the
+contract:
+
+| Field | Kind | Notes |
+|---|---|---|
+| `source` | observed | `claude`, `codex`, `cursor`, `grok`, `opencode`, `relay` |
+| `session_id` | observed | provider-native; `(source, session_id)` is the primary key, so the same native id under two providers is two rows |
+| `cwd` | observed | working directory the provider recorded |
+| `git_branch` | observed | last branch the provider recorded |
+| `first_activity_ms` | observed | `null` when the provider records no timestamps at all |
+| `last_activity_ms` | observed, or filesystem-derived | file mtime for providers that record no timestamps |
+| `first_prompt` | **derived** | bounded excerpt (≤ 4096 chars) of the first *substantive* human turn; provider control/meta/sidechain turns are skipped |
+| `last_assistant_text` | observed | **only** written by full indexing — always `null` on a shallow-only row |
+| `models` | observed, best effort | model ids seen inside the bounded read; empty means "not seen cheaply", not "no model" |
+| `originator` | observed | the client that started the session (codex only) |
+| `agent_version` | observed | agent CLI version |
+| `repo_url` | observed | remote URL, when the provider records one |
+| `initial_commit` | observed | commit the session started from |
+| `workspace_roots` | observed | extra workspace roots, when the provider records them |
+| `raw_path` | observed | provider file this row came from; `null` for database- and network-backed sources |
+| `source_stamp` | internal | change marker; see [rescan behaviour](#rescans-and-source-stamps) |
+| `discovery_state` | internal | `"shallow"` or `"full"` |
+| `from_cache` | per-response | `true` when the row was served without re-reading the source |
+
+Absent metadata stays `null`. Nothing is ever invented to fill a column.
+
+### What the catalog deliberately does not have
+
+These require `ai-hist sync`, for every provider, without exception:
+
+- per-message events (`session_events`), tool calls, file edits
+- token usage and cost
+- session → commit links
+- full-text search over transcripts
+- the full transcript body, and `last_assistant_text`
+
+`discovery_state` tells you which you have: `"full"` means a full ingest has
+run for that session, `"shallow"` means catalog metadata only. Full ingest
+always wins — a shallow rescan refreshes a `full` row's metadata and stamp but
+never downgrades its state.
+
+### Product boundary
+
+Discovery reports *which sessions exist* and identifying metadata. It does not
+infer project membership, work status, health, risk or success, and it does not
+summarize outcomes.
+
+---
+
+## Per-provider capability matrix
+
+What each adapter can actually extract from a cheap read. `✓` = populated when
+the provider recorded it; `–` = the provider does not expose it to a shallow
+read.
+
+| Source | `session_id` | `cwd` | `git_branch` | `first_activity` | `last_activity` | `first_prompt` | `models` | `originator` | `agent_version` | `repo_url` | `initial_commit` | `workspace_roots` |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **claude** | ✓ | ✓ | ✓ | ✓ | ✓ (tail) | ✓ | ✓ (head) | – | ✓ (record `version`) | – | – | – |
+| **codex** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **cursor** | ✓ (dir name) | ✓ (decoded path) | – | – (never) | mtime-derived | ✓ | – | – | – | – | – | – |
+| **grok** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (if present) | – | – | – | – | – |
+| **opencode** | ✓ | ✓ (directory) | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
+| **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
+
+How each adapter works:
+
+- **claude** — `~/.claude/projects/**/*.jsonl`. Head for identity, `cwd`,
+  branch, `version`, models and the first human prompt; tail for the last
+  timestamp and the final branch. Meta rows, slash-command wrappers, bash
+  wrappers and sidechain (subagent) turns are skipped when picking
+  `first_prompt`. A subagent *sidecar* — a separate file whose records all
+  carry the parent's `sessionId` — is not a session of its own: it is detected
+  in the head read and skipped, so a session is emitted once per run and its
+  row keeps pointing at its own transcript. A transcript whose complete records
+  parse as nothing is reported as a diagnostic rather than published under its
+  file name; an empty one is simply not a session yet.
+- **codex** — `rollout-*.jsonl` under `~/.codex/sessions` and
+  `~/.codex/archived_sessions`. The first line is a `session_meta` record, which
+  makes codex the richest source: originator, `cli_version`, git remote, initial
+  commit, workspace roots and model all come from it. Subagent threads are real
+  rollouts but not user sessions, so they are excluded — exactly as the full
+  sync excludes them — and remembered in `discovery_skips` so a rescan does not
+  re-read them.
+- **cursor** — `~/.cursor/projects/<encoded-path>/agent-transcripts/<id>/<id>.jsonl`.
+  Cursor transcripts carry **no timestamps at all**, so `first_activity_ms` is
+  always `null` and `last_activity_ms` is the file mtime. `cwd` is decoded from
+  the project directory name.
+- **grok** — `~/.grok/sessions/<encoded-path>/<id>/`. Identity, `cwd`, branch and
+  both timestamps come from `summary.json`; the first prompt comes from the head
+  of `chat_history.jsonl`, skipping synthetic reminder turns.
+- **opencode** — the SQLite store at `$OPENCODE_DB` (default
+  `~/.local/share/opencode/opencode.db`). The database is snapshotted once per
+  run with SQLite's backup API, exactly as the full sync does, so an in-flight
+  WAL never yields a torn read. Enumeration is one query over `session`; the
+  shallow read adds two bounded single-row lookups for the first user text part
+  and a model id, rather than the full session/message/part join the sync does.
+- **relay** — a **network** source with no local transcript, and discovery must
+  work offline. The adapter therefore derives rows only from `history` rows a
+  previous `ai-hist sync` already stored locally; it opens no socket. If nothing
+  was ever synced it discovers nothing, which is the correct answer rather than
+  a failure. A relay thread has no working directory, so `cwd` is always `null`.
+
+---
+
+## Ordering and limits
+
+The ordering and the limit are **global**, not per provider:
+
+1. Every selected provider enumerates its candidates **cheaply** — a directory
+   walk plus `stat`, or one indexed query. No file content is read.
+2. Candidates from all providers are merged and sorted by recency hint,
+   descending. Candidates with no recency signal sort last; ties break on
+   `(source, locator)` so a run is reproducible.
+3. The global `--limit` truncates that merged list.
+4. Only the survivors get a bounded shallow read.
+
+So `--limit 3` across two providers returns the three newest sessions
+*overall*, not three from whichever provider happened to be enumerated first —
+and the cost of a limited request is set by the limit, not by the size of the
+archive.
+
+Read budgets per source, so one enormous transcript cannot dominate a run:
+
+| Budget | Value |
+|---|---|
+| head read | ≤ 256 KB and ≤ 400 complete JSONL records |
+| tail read | ≤ 64 KB |
+| text excerpt (`first_prompt`) | ≤ 4096 characters |
+
+Files inside the head budget are read once and serve as their own tail. Only
+newline-terminated records are parsed: a transcript being appended to right now
+has a partial trailing line, and that line is not yet a record.
+
+<a id="pagination"></a>
+
+`sessions list` paginates by recency instead. The catalog's total order is
+
+```sql
+ORDER BY last_activity_ms DESC, source ASC, session_id ASC
+```
+
+with rows of unknown recency (`last_activity_ms IS NULL`, e.g. a cursor session
+whose file has no mtime) last. Recency alone is not a key — one discovery pass
+stamps many sessions with the same mtime-derived millisecond — so the cursor
+carries the identity columns too:
+
+```jsonc
+{"last_activity_ms": 1782039603000, "source": "codex", "session_id": "0198c2ad-codex"}
+```
+
+Feed it back as `--after-ms` / `--after-source` / `--after-session-id` (the two
+identity flags are required together; omit `--after-ms` to continue through the
+undated tail). `--before-ms` still works as a coarse "older than" cutoff, but it
+cannot separate rows that share a millisecond, so it is not a paging key; it is
+ignored when a cursor is given.
+
+The whole order is carried by `idx_sessions_recency`, or
+`idx_sessions_source_recency` when `--source` is given, so a page is an indexed
+read with no sort.
+
+---
+
+## Rescans and source stamps
+
+Each row stores a `source_stamp` — `v{scanner version}:{provider change marker}`:
+
+| Source | Change marker |
+|---|---|
+| claude, codex, cursor | `{mtime nanoseconds}:{file length}` |
+| grok | the chat file's marker, `\|`, the `summary.json` marker |
+| opencode | `{time_created}:{time_updated}` |
+| relay | `{newest synced timestamp}:{synced row count}` |
+
+On a rescan, a candidate whose stamp matches the stored one is served straight
+from the catalog: no read, no parse, `skipped_unchanged` incremented,
+`from_cache: true` on the emitted row. In the benchmark below, a rescan of 450
+unchanged sessions performs **zero** shallow reads.
+
+The `v{N}` prefix is the *scanner* version (`SHALLOW_SCANNER_VERSION`), separate
+from `parser_version` (the full-ingest parser generation). Bumping it
+invalidates every stored stamp, so a scanner taught to extract a new field
+re-reads sources whose bytes never changed.
+
+---
+
+## Concurrency
+
+Discovery deliberately does **not** take the `sync` advisory lock, so a session
+picker refreshing itself never has to wait behind a 60-second background sync.
+
+That is safe because every write discovery performs is an idempotent,
+stamp-guarded upsert into `sessions`:
+
+- the shallow upsert never nulls a value the catalog already holds, never
+  raises `first_activity_ms` above what a fuller pass observed, and never
+  downgrades a fully indexed row to `'shallow'` — including a row from a
+  database that predates `discovery_state`, whose `NULL` readers interpret as
+  `'full'`;
+- the full-sync path only ever upgrades a row to `'full'`;
+- writes go through the normal busy-retry connection, and the opencode
+  provider reads a WAL-safe snapshot rather than the live database.
+
+A concurrent `sync` and `discover` therefore converge on the same row rather
+than fighting over it.
+
+`sessions list` is classified read-only, so it takes a read-only handle when
+the schema is current: it cannot block the writer and cannot be blocked by it.
+
+### Schema
+
+The catalog lives in the existing `sessions` table, extended with
+`first_prompt`, `models_json`, `originator`, `agent_version`, `repo_url`,
+`initial_commit`, `workspace_roots_json`, `source_stamp` and `discovery_state`,
+plus the `idx_sessions_source_last`, `idx_sessions_raw_path`,
+`idx_sessions_recency` and `idx_sessions_source_recency` indexes. A companion
+`discovery_skips` table remembers sources already examined and found not to be
+sessions (a codex subagent thread, a Claude subagent sidecar), keyed by
+`(source, locator)` with the stamp, so a rescan costs a primary-key lookup
+instead of re-reading them every run.
+Databases created by an older release are migrated in place by ignore-error
+`ALTER TABLE`s in `init_db`, and `schema_is_current` knows about the new
+columns, so a read-only handle over an old database is upgraded instead of
+failing with `no such column`.
+
+---
+
+## Adding a provider
+
+Every entry in `SOURCE_CHOICES` must be covered by **exactly one** of:
+
+- an adapter in `shallow_providers()` — implement `ShallowSessionProvider`
+  (`enumerate` may stat but not read; `read_shallow` stays inside the head/tail
+  budgets and returns `Ok(None)` for "this candidate is not a session"), or
+- an entry in `DISCOVERY_EXEMPTIONS`, which is machine-readable and carries a
+  reason.
+
+A registry test enforces the pairing, so adding a source without deciding which
+list it belongs to fails the build. Today the only exemption is `trajectory`
+("derived trajectory records, not provider sessions"). It is enforced at both
+ends: `sessions discover --source trajectory` fails with that reason, and
+`sessions list` filters `trajectory` rows out defensively, so a trajectory can
+never be presented as a session.
+
+The exemption list also travels in the `summary` line as `exempt_sources`, so a
+consumer can tell "this source has no sessions" apart from "this source is not
+discoverable".
+
+---
+
+## Programmatic access
+
+- **Native (napi)** — `listSessions(options?)` returns
+  `{contractVersion, sessions, nextCursor}`; `discoverSessions(options?)` runs a shallow
+  scan and returns the rows plus the summary (collected rather than streamed —
+  use the CLI's JSONL output when you want progressive rendering). Both run on
+  a blocking worker thread and accept `sources` / `limit`, with `beforeMs` and
+  `after` (the previous page's `nextCursor`) on the listing.
+- **TypeScript SDK** — `listSessionCatalog()` / `discoverSessions()` wrap the
+  same contract for Node consumers; see the SDK's own documentation for the
+  exact signatures.
+- **MCP** — the stdio server exposes the cache-only listing as a `list_sessions`
+  tool, so an agent can enumerate recent sessions without triggering any
+  provider I/O. See the MCP package's documentation for its arguments.
+
+Whatever the surface, `contract_version` means the same thing: check it, and
+fail loudly on a version you do not know.
+
+---
+
+## Performance validation
+
+The claims above are validated by a benchmark harness rather than by wall-clock
+assertions in the test suite:
+
+```bash
+cargo test -p ai-hist-cli --test discovery_bench -- --ignored --nocapture
+```
+
+It builds a synthetic multi-provider archive in a temp directory, runs both
+catalog operations plus a full `ai-hist sync` against it, and prints a
+measurement table. Every assertion it makes is an *operation count* — bytes
+read, files opened, shallow reads, rows returned — because those hold on any
+machine; timings are printed for the reader and never asserted.
+
+Representative numbers from one run (debug build, 450-session archive, 14.7 MB):
+
+| Measurement | Result |
+|---|---|
+| Cached listing, `--limit 20` at 1 000 catalog rows | 0.13 ms |
+| Cached listing, `--limit 20` at 20 000 catalog rows + 100 000 history/event rows | 0.13 ms |
+| Cached listing, `--limit 2000` at 20 000 rows | 8.6 ms |
+| `discover --limit 5` over a 90-session / 6.2 MB archive | 5 shallow reads, 1.6 MB read (26% of the archive) |
+| `discover --limit 5` over the same archive grown to 450 sessions / 14.7 MB | 5 shallow reads, **the same 1.6 MB** (11%) |
+| `sessions discover` (cold, whole archive) | 11.9 MB read, 450 rows, ~1.7 s |
+| `sessions discover` (rescan, nothing changed) | 0 shallow reads, 28 KB read, ~0.08 s |
+| `ai-hist sync` (full ingest, same archive) | reads all 14.7 MB, writes 62 451 history/event rows, ~46 s |
+| Cached listing after the entire archive is deleted | same 50 rows, 0.41 ms |
+
+The shape is what matters, not the absolute numbers: the cached listing tracks
+the rows you asked for and ignores both catalog size and event volume; a
+bounded request's cost is fixed by its limit; and a shallow refresh of a whole
+archive cost roughly 1/27th of a full ingest of the same archive — while a
+rescan of unchanged bytes is nearly free (the 28 KB is the one-per-run opencode
+snapshot, which enumeration always takes).
+
+Complementary structural coverage lives in the unit tests:
+`the_catalog_listing_is_served_by_an_index_not_a_table_scan` (EXPLAIN QUERY
+PLAN), `the_catalog_query_reads_only_the_sessions_table`,
+`bounded_reads_do_not_grow_with_the_size_of_the_archive`, and
+`a_head_read_stays_inside_its_budget_on_a_very_large_transcript`.
+
+---
+
+See also: [`getting-started.md`](getting-started.md) (human setup) ·
+[`agent-integration.md`](agent-integration.md) (agent-facing surfaces) ·
+the `Schema` section of the top-level `README.md`.

@@ -27,6 +27,29 @@ import {
   type TrajectoryDecision,
   type TrajectoryRetrospective,
 } from './trajectory-sources.js';
+import {
+  catalogSessionFromJson,
+  type CatalogSession,
+  type ListCatalogOptions,
+  type SessionCatalogPage,
+} from './session-catalog.js';
+
+export {
+  SESSION_CATALOG_CONTRACT_VERSION,
+  DiscoveryError,
+  discoverSessions,
+  type CatalogSession,
+  type CatalogCursor,
+  type SessionCatalogPage,
+  type ListCatalogOptions,
+  type DiscoverSessionsOptions,
+  type DiscoverResult,
+  type DiscoverySummary,
+  type DiscoveryDiagnostic,
+  type DiscoveryCounters,
+  type ProviderDiscoverySummary,
+  type SourceExemption,
+} from './session-catalog.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -42,6 +65,12 @@ export interface HistoryEntry {
   gitBranch: string | null;
 }
 
+/**
+ * The pre-catalog `sessions` row shape, kept for backward compatibility.
+ * New code wants {@link CatalogSession} (via `listSessionCatalog`), which
+ * covers the whole catalog row: first prompt, models, originator, repo
+ * identity, and discovery state.
+ */
 export interface SessionMeta {
   sessionId: string;
   source: Source;
@@ -219,6 +248,51 @@ function getSqlJs(): Promise<SqlJsStatic> {
   return _sqlPromise;
 }
 
+/**
+ * Every non-key column of the session catalog, in the order the native schema
+ * declares them. Used both to create the table and to backfill it column by
+ * column on a database snapshot written before the catalog existed.
+ */
+const SESSION_CATALOG_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ['cwd', 'TEXT'],
+  ['git_branch', 'TEXT'],
+  ['first_activity_ms', 'INTEGER'],
+  ['last_activity_ms', 'INTEGER'],
+  ['last_assistant_text', 'TEXT'],
+  ['raw_path', 'TEXT'],
+  ['parser_version', 'INTEGER NOT NULL DEFAULT 1'],
+  ['first_prompt', 'TEXT'],
+  ['models_json', 'TEXT'],
+  ['originator', 'TEXT'],
+  ['agent_version', 'TEXT'],
+  ['repo_url', 'TEXT'],
+  ['initial_commit', 'TEXT'],
+  ['workspace_roots_json', 'TEXT'],
+  ['source_stamp', 'TEXT'],
+  ['discovery_state', 'TEXT'],
+];
+
+/** Run a statement whose only expected failure is "already there". */
+function tryRun(db: Database, sql: string): void {
+  try {
+    db.run(sql);
+  } catch {
+    /* column/index already exists, or the table shape rules it out */
+  }
+}
+
+/**
+ * Ensure the in-memory copy has the current `sessions` shape.
+ *
+ * The catalog columns (`first_prompt`, `models_json`, `discovery_state`, …)
+ * were added after 0.5.0, so a database file written by an older CLI has the
+ * old nine-column table. `CREATE TABLE IF NOT EXISTS` would leave that table
+ * untouched and every catalog read would fail with `no such column`, so each
+ * column is also added best-effort with `ALTER TABLE` — the same trick used for
+ * `history.git_branch` in `openAiHist`. The writes land only in the in-memory
+ * copy sql.js holds; the file on disk is untouched and the missing columns
+ * simply read as `NULL`.
+ */
 function ensureSessionsSchema(db: Database): void {
   db.run(`CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT NOT NULL,
@@ -230,11 +304,60 @@ function ensureSessionsSchema(db: Database): void {
     last_assistant_text TEXT,
     raw_path TEXT,
     parser_version INTEGER NOT NULL DEFAULT 1,
+    first_prompt TEXT,
+    models_json TEXT,
+    originator TEXT,
+    agent_version TEXT,
+    repo_url TEXT,
+    initial_commit TEXT,
+    workspace_roots_json TEXT,
+    source_stamp TEXT,
+    discovery_state TEXT,
     PRIMARY KEY (session_id, source)
   )`);
-  db.run('CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd)');
-  db.run('CREATE INDEX IF NOT EXISTS idx_sessions_branch ON sessions(git_branch)');
-  db.run('CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_activity_ms DESC)');
+  for (const [name, decl] of SESSION_CATALOG_COLUMNS) {
+    tryRun(db, `ALTER TABLE sessions ADD COLUMN ${name} ${decl}`);
+  }
+  tryRun(db, 'CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd)');
+  tryRun(db, 'CREATE INDEX IF NOT EXISTS idx_sessions_branch ON sessions(git_branch)');
+  tryRun(db, 'CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_activity_ms DESC)');
+  tryRun(
+    db,
+    'CREATE INDEX IF NOT EXISTS idx_sessions_source_last ON sessions(source, last_activity_ms DESC)',
+  );
+  // The catalog's total order is (last_activity_ms DESC, source, session_id) —
+  // recency alone ties constantly, since one discovery pass can stamp many
+  // sessions with the same mtime-derived millisecond. These two carry the whole
+  // ORDER BY, so the listing is answered without a sort here as it is natively.
+  tryRun(
+    db,
+    'CREATE INDEX IF NOT EXISTS idx_sessions_recency ON sessions(last_activity_ms DESC, source, session_id)',
+  );
+  tryRun(
+    db,
+    'CREATE INDEX IF NOT EXISTS idx_sessions_source_recency ON sessions(source, last_activity_ms DESC, session_id)',
+  );
+  tryRun(db, 'CREATE INDEX IF NOT EXISTS idx_sessions_raw_path ON sessions(source, raw_path)');
+}
+
+/**
+ * Mirror the discovery bookkeeping table.
+ *
+ * Shallow discovery records here that a given source was examined at a given
+ * stamp and found not to be a session (a subagent sidecar, say), so a rescan
+ * costs a primary-key lookup instead of a re-read. The SDK never reads it; the
+ * table is created so an in-memory copy has the same shape as the file the
+ * native tool writes.
+ */
+function ensureDiscoverySkipsSchema(db: Database): void {
+  db.run(`CREATE TABLE IF NOT EXISTS discovery_skips (
+    source TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    stamp TEXT NOT NULL,
+    reason TEXT,
+    updated_ms INTEGER,
+    PRIMARY KEY (source, locator)
+  )`);
 }
 
 function ensureTrajectorySchema(db: Database): void {
@@ -327,6 +450,7 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
     ensureTrajectorySchema(db);
     ensureTagSchema(db);
     ensureSessionsSchema(db);
+    ensureDiscoverySkipsSchema(db);
     // Add git_branch to history if missing (pre-handoff DBs lack this column).
     try { db.run('ALTER TABLE history ADD COLUMN git_branch TEXT'); } catch { /* already exists */ }
     // Older database schemas don't contain `idx_history_session` or
@@ -369,6 +493,7 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
   ensureTrajectorySchema(db);
   ensureTagSchema(db);
   ensureSessionsSchema(db);
+  ensureDiscoverySkipsSchema(db);
 
   // scanLocalSources is async with yields between sources so the event
   // loop stays responsive while we scan many MB of JSONL.
@@ -955,6 +1080,14 @@ export class AiHist {
    * Group history into sessions, ordered by last activity (newest first).
    * Sessions without a `session_id` are skipped.
    *
+   * This derives sessions from the `history` table, so it only ever sees
+   * sessions a full `ai-hist sync` has ingested, and it pays a window-function
+   * pass over history to do it. For the fast and complete path — every session
+   * the catalog knows, including ones only shallow discovery has seen, with
+   * cwd, branch, models, originator and repo identity attached — use
+   * {@link AiHist.listSessionCatalog}. This method stays as-is for callers
+   * that want prompt counts and the project-derived grouping.
+   *
    * Implementation note: this used to use a correlated scalar subquery
    * to pick `first_prompt`, which ran in O(sessions × rows) — ~19s on a
    * 35K-row DB. Switched to `ROW_NUMBER() OVER (PARTITION BY session_id
@@ -1020,6 +1153,123 @@ export class AiHist {
       firstActivityMs: row.first_activity_ms,
       promptCount: row.prompt_count,
     }));
+  }
+
+  /**
+   * The session catalog, newest first — one indexed query over `sessions` and
+   * nothing else.
+   *
+   * No provider transcript is opened and neither `history` nor
+   * `session_events` is touched, so this stays fast on first paint even with
+   * thousands of historical sessions. It is the read side of the native
+   * `ai-hist sessions list`; populate the catalog with `discoverSessions()`
+   * (or a full `ai-hist sync`).
+   *
+   * Details worth knowing:
+   *   - `trajectory` rows are excluded defensively — trajectories are derived
+   *     records, not sessions, and must never appear in a session list.
+   *   - The catalog's total order is
+   *     `(last_activity_ms DESC, source ASC, session_id ASC)`. SQLite sorts
+   *     NULL lowest, so rows of unknown recency land last under `DESC` without
+   *     a helper expression. Recency alone is not a key: one discovery pass can
+   *     stamp many sessions with the same mtime-derived millisecond, which is
+   *     why the identity columns are part of the order.
+   *   - To page, use {@link AiHist.listSessionCatalogPage} and follow its
+   *     `nextCursor`. `beforeMs` is only a *coarse* cutoff ("anything before
+   *     last Tuesday"): it cannot separate rows sharing a millisecond, so a
+   *     walk built on it drops every row tied with a page boundary. It is
+   *     ignored when `after` is set.
+   *   - A configured `projectScope` constrains rows by `cwd`, like
+   *     `getHandoff`. Sources with no working directory (relay) therefore drop
+   *     out of a scoped listing.
+   *   - In JSONL fallback mode (no SQLite database) the catalog is empty and
+   *     this returns `[]`: the fallback scan builds `history` rows only, and
+   *     only the native discovery engine writes the catalog.
+   */
+  listSessionCatalog(opts: ListCatalogOptions = {}): CatalogSession[] {
+    if (!tableExists(this.db, 'sessions')) return [];
+    // SQLite reads a negative LIMIT as "unlimited", so a negative cap would
+    // quietly dump the whole catalog. The native CLI rejects it; so do we.
+    if (typeof opts.limit === 'number' && opts.limit < 0) {
+      throw new RangeError(`limit must not be negative (got ${opts.limit})`);
+    }
+    const limit = opts.limit ?? 50;
+    const clauses: string[] = ["source != 'trajectory'"];
+    const params: unknown[] = [];
+
+    const sources = [...(opts.sources ?? [])].map((source) => String(source));
+    if (sources.length > 0) {
+      clauses.push(`source IN (${sources.map(() => '?').join(', ')})`);
+      params.push(...sources);
+    }
+    if (opts.after) {
+      // Everything strictly after the cursor in the catalog's total order.
+      // Undated rows sort last, so a dated cursor must still reach them.
+      const { lastActivityMs, source, sessionId } = opts.after;
+      // A timestamp alone is not a cursor: without the identity columns the
+      // predicate cannot separate rows sharing a millisecond, and silently
+      // dropping the cursor would restart the walk at page one. The native CLI
+      // rejects the same half-cursor; so does this, rather than looping.
+      if (typeof source !== 'string' || source.length === 0 || typeof sessionId !== 'string' || sessionId.length === 0) {
+        throw new TypeError(
+          'after must carry both source and sessionId — pass the whole nextCursor object from the previous page',
+        );
+      }
+      if (typeof lastActivityMs === 'number') {
+        clauses.push(
+          `(last_activity_ms IS NULL OR last_activity_ms < ?
+             OR (last_activity_ms = ?
+                 AND (source > ? OR (source = ? AND session_id > ?))))`,
+        );
+        params.push(lastActivityMs, lastActivityMs, source, source, sessionId);
+      } else {
+        clauses.push(
+          `last_activity_ms IS NULL AND (source > ? OR (source = ? AND session_id > ?))`,
+        );
+        params.push(source, source, sessionId);
+      }
+    } else if (typeof opts.beforeMs === 'number') {
+      clauses.push('last_activity_ms < ?');
+      params.push(opts.beforeMs);
+    }
+    if (this._projectScope) {
+      const scope = scopedPathClause('cwd', this._projectScope);
+      clauses.push(scope.sql);
+      params.push(...scope.params);
+    }
+
+    return runQuery<Record<string, unknown>>(
+      this.db,
+      `SELECT source, session_id, cwd, git_branch, first_activity_ms, last_activity_ms,
+              first_prompt, last_assistant_text, models_json, originator, agent_version,
+              repo_url, initial_commit, workspace_roots_json, raw_path, source_stamp,
+              discovery_state, parser_version
+       FROM sessions
+       WHERE ${clauses.join(' AND ')}
+       ORDER BY last_activity_ms DESC, source ASC, session_id ASC
+       LIMIT ?`,
+      [...params, limit],
+    ).map((row) => catalogSessionFromJson({ ...row, from_cache: true }));
+  }
+
+  /**
+   * {@link AiHist.listSessionCatalog} plus the cursor that continues it.
+   *
+   * Follow `nextCursor` until it comes back `null` to walk the whole catalog:
+   * no skipped and no duplicated rows, even when a whole page shares one
+   * millisecond, and the undated tail stays reachable from a dated cursor.
+   * `nextCursor` is non-null only when the page filled its limit, mirroring
+   * the native `list_session_catalog_page` and the CLI's `next_cursor`.
+   */
+  listSessionCatalogPage(opts: ListCatalogOptions = {}): SessionCatalogPage {
+    const sessions = this.listSessionCatalog(opts);
+    const limit = opts.limit ?? 50;
+    const last = sessions[sessions.length - 1];
+    const nextCursor =
+      limit > 0 && sessions.length >= limit && last
+        ? { lastActivityMs: last.lastActivityMs, source: last.source, sessionId: last.sessionId }
+        : null;
+    return { sessions, nextCursor };
   }
 
   /** All prompts in a session, ordered oldest → newest. */

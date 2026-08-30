@@ -350,8 +350,44 @@ const REQUIRED_TABLES: &[&str] = &[
     "tags",
     "session_tags",
     "sessions",
+    "discovery_skips",
 ];
 const REQUIRED_HISTORY_COLUMNS: &[&str] = &["prompt_hash", "git_branch"];
+/// Columns [`init_db`] adds to `sessions` after the original DDL. The shallow
+/// session catalog (`ai-hist sessions list` / `discover`) reads every one of
+/// them, so a read-only handle over a database that predates them would fail
+/// with `no such column` instead of migrating.
+const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
+    "first_prompt",
+    "models_json",
+    "originator",
+    "agent_version",
+    "repo_url",
+    "initial_commit",
+    "workspace_roots_json",
+    "source_stamp",
+    "discovery_state",
+];
+
+/// Indexes the session catalog's fast paths depend on.
+///
+/// The pre-existing guard checks tables and columns only. These are listed
+/// because each one carries a promise the catalog makes: the two recency
+/// indexes make a listing an indexed, sort-free read, and `idx_sessions_raw_path`
+/// makes discovery's "has this transcript changed?" lookup a search rather than
+/// a scan of every session on every candidate. A database that somehow has the
+/// columns but not an index would otherwise be served with silently degraded
+/// plans. Missing means "not current", which routes the caller through the
+/// writable open that recreates them.
+///
+/// The older `idx_sessions_cwd` / `idx_sessions_branch` / `idx_sessions_last` /
+/// `idx_sessions_source_last` are deliberately absent: nothing in the catalog
+/// path depends on them any more.
+const REQUIRED_SESSIONS_INDEXES: &[&str] = &[
+    "idx_sessions_recency",
+    "idx_sessions_source_recency",
+    "idx_sessions_raw_path",
+];
 
 /// Whether this database already has everything [`init_db`] would add.
 ///
@@ -371,9 +407,30 @@ pub fn schema_is_current(conn: &Connection) -> Result<bool> {
         .prepare("SELECT name FROM pragma_table_info('history')")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<_>>()?;
-    Ok(REQUIRED_HISTORY_COLUMNS
+    if !REQUIRED_HISTORY_COLUMNS
         .iter()
-        .all(|needed| columns.contains(*needed)))
+        .all(|needed| columns.contains(*needed))
+    {
+        return Ok(false);
+    }
+    let session_columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('sessions')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !REQUIRED_SESSIONS_COLUMNS
+        .iter()
+        .all(|needed| session_columns.contains(*needed))
+    {
+        return Ok(false);
+    }
+    let mut index =
+        conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1")?;
+    for name in REQUIRED_SESSIONS_INDEXES {
+        if !index.exists([name])? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Open the database for reading only.
@@ -405,6 +462,14 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE history ADD COLUMN git_branch TEXT", []);
     conn.execute_batch(
         r#"
+CREATE TABLE IF NOT EXISTS discovery_skips (
+    source TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    stamp TEXT NOT NULL,
+    reason TEXT,
+    updated_ms INTEGER,
+    PRIMARY KEY (source, locator)
+);
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT NOT NULL,
     source TEXT NOT NULL,
@@ -415,10 +480,42 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_assistant_text TEXT,
     raw_path TEXT,
     parser_version INTEGER NOT NULL DEFAULT 1,
+    first_prompt TEXT,
+    models_json TEXT,
+    originator TEXT,
+    agent_version TEXT,
+    repo_url TEXT,
+    initial_commit TEXT,
+    workspace_roots_json TEXT,
+    source_stamp TEXT,
+    discovery_state TEXT,
     PRIMARY KEY (session_id, source)
 );
 "#,
     )?;
+    // `sessions` predates the shallow catalog. Databases created by an older
+    // release keep the original nine columns, so every catalog field is added
+    // here as an ignore-error ALTER; a fresh database gets the same shape from
+    // the CREATE TABLE above and these become no-ops. Both paths converge.
+    // The list is REQUIRED_SESSIONS_COLUMNS itself rather than a copy of it:
+    // three declarations of the same nine names (CREATE TABLE, this loop, the
+    // read-only guard) is two chances to drift, and every catalog column is
+    // TEXT, so the guard list is the migration list.
+    for column in REQUIRED_SESSIONS_COLUMNS {
+        // "Already there" is the expected outcome on every run after the
+        // first, and the only error worth swallowing. Anything else -- a
+        // read-only file, a corrupt page, a locked database -- means the
+        // migration did not happen, and hiding it here turns one clear failure
+        // at init into `no such column` on the user's first listing.
+        if let Err(error) = conn.execute(
+            &format!("ALTER TABLE sessions ADD COLUMN {column} TEXT"),
+            [],
+        ) {
+            if !error.to_string().contains("duplicate column name") {
+                return Err(error).with_context(|| format!("adding column sessions.{column}"));
+            }
+        }
+    }
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_history_hash ON history(prompt_hash)",
         [],
@@ -450,6 +547,31 @@ CREATE TABLE IF NOT EXISTS sessions (
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_activity_ms DESC)",
+        [],
+    )?;
+    // Source-filtered catalog listing (`sessions list --source codex`) orders by
+    // recency inside one source; without this the planner sorts the whole table.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_source_last ON sessions(source, last_activity_ms DESC)",
+        [],
+    )?;
+    // The catalog's total order is (last_activity_ms DESC, source, session_id):
+    // recency alone ties constantly, because every mtime-derived session in one
+    // scan can share a timestamp, and a keyset paginator that cannot break
+    // those ties silently drops rows between pages. These two indexes carry the
+    // whole ORDER BY so the listing is still answered without a sort.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_recency ON sessions(last_activity_ms DESC, source, session_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_source_recency ON sessions(source, last_activity_ms DESC, session_id)",
+        [],
+    )?;
+    // Shallow discovery keys its "has this file changed?" lookup on the raw
+    // path, because a transcript's session id is not known until it is read.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_raw_path ON sessions(source, raw_path)",
         [],
     )?;
     conn.execute(
@@ -1721,5 +1843,138 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sessions_exists, 1);
+    }
+
+    /// The catalog columns must reach a database that predates them, and a
+    /// read-only handle must refuse to serve that database until they do —
+    /// otherwise `sessions list` fails with `no such column` instead of
+    /// migrating.
+    #[test]
+    fn session_catalog_columns_migrate_onto_a_pre_catalog_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        {
+            let legacy = Connection::open(&db_path).unwrap();
+            legacy.execute_batch(SCHEMA).unwrap();
+            legacy
+                .execute_batch(
+                    "ALTER TABLE history ADD COLUMN git_branch TEXT;
+                     CREATE TABLE sessions (
+                         session_id TEXT NOT NULL,
+                         source TEXT NOT NULL,
+                         cwd TEXT,
+                         git_branch TEXT,
+                         first_activity_ms INTEGER,
+                         last_activity_ms INTEGER,
+                         last_assistant_text TEXT,
+                         raw_path TEXT,
+                         parser_version INTEGER NOT NULL DEFAULT 1,
+                         PRIMARY KEY (session_id, source)
+                     );
+                     INSERT INTO sessions (session_id, source, last_activity_ms)
+                     VALUES ('legacy-1', 'claude', 42);",
+                )
+                .unwrap();
+            assert!(
+                !schema_is_current(&legacy).unwrap(),
+                "a database without the catalog columns must not be served read-only"
+            );
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        let columns = conn
+            .prepare("SELECT name FROM pragma_table_info('sessions')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<HashSet<String>>>()
+            .unwrap();
+        for needed in REQUIRED_SESSIONS_COLUMNS {
+            assert!(columns.contains(*needed), "missing column {needed}");
+        }
+        // Existing rows survive the migration with the new columns null.
+        let (id, state): (String, Option<String>) = conn
+            .query_row(
+                "SELECT session_id, discovery_state FROM sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(id, "legacy-1");
+        assert_eq!(state, None);
+    }
+
+    /// The catalog listing's promise is an indexed, sort-free read. A database
+    /// that has the columns but not the indexes would be served read-only with
+    /// degraded plans, silently, so the guard covers them too.
+    #[test]
+    fn a_database_missing_a_catalog_index_is_not_served_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("indexless.db");
+        let conn = open_db(&db_path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        // Named explicitly so dropping one from the guard is a deliberate act:
+        // the recency pair carries the listing's sort-free order, and
+        // idx_sessions_raw_path carries discovery's per-candidate "has this
+        // transcript changed?" lookup.
+        for needed in [
+            "idx_sessions_recency",
+            "idx_sessions_source_recency",
+            "idx_sessions_raw_path",
+        ] {
+            assert!(
+                REQUIRED_SESSIONS_INDEXES.contains(&needed),
+                "{needed} is load-bearing and must stay in the guard"
+            );
+        }
+        for index in REQUIRED_SESSIONS_INDEXES {
+            conn.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+            assert!(
+                !schema_is_current(&conn).unwrap(),
+                "{index} is load-bearing for the catalog listing"
+            );
+            // init_db is idempotent, so the writable path heals it.
+            init_db(&conn).unwrap();
+            assert!(schema_is_current(&conn).unwrap());
+        }
+    }
+
+    /// A fresh database and a migrated one must end up with the same `sessions`
+    /// shape, or the CREATE TABLE and the ALTER TABLE list have drifted apart.
+    #[test]
+    fn fresh_and_migrated_session_tables_converge() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = open_db(&dir.path().join("fresh.db")).unwrap();
+        let legacy_path = dir.path().join("legacy.db");
+        {
+            let legacy = Connection::open(&legacy_path).unwrap();
+            legacy
+                .execute_batch(
+                    "CREATE TABLE sessions (
+                         session_id TEXT NOT NULL,
+                         source TEXT NOT NULL,
+                         cwd TEXT,
+                         git_branch TEXT,
+                         first_activity_ms INTEGER,
+                         last_activity_ms INTEGER,
+                         last_assistant_text TEXT,
+                         raw_path TEXT,
+                         parser_version INTEGER NOT NULL DEFAULT 1,
+                         PRIMARY KEY (session_id, source)
+                     );",
+                )
+                .unwrap();
+        }
+        let migrated = open_db(&legacy_path).unwrap();
+        let columns = |conn: &Connection| {
+            conn.prepare("SELECT name FROM pragma_table_info('sessions') ORDER BY name")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .unwrap()
+        };
+        assert_eq!(columns(&fresh), columns(&migrated));
     }
 }

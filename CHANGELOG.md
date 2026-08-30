@@ -4,6 +4,24 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Add `ai-hist sessions list` and `ai-hist sessions discover`: a shallow session
+  catalog over every provider. `discover` enumerates candidates cheaply, orders
+  them globally by recency, and reads only bounded head/tail slices of the
+  winners; `list` serves the cached catalog with one indexed query and no
+  provider I/O. Both emit a versioned contract (`contract_version: 1`) —
+  `list --json` as one object, `discover --json` as JSONL rows, diagnostics, and
+  a closing summary with per-provider counts and operation counters. See
+  `docs/session-catalog.md`.
+- Extend the `sessions` catalog table with `first_prompt`, `models_json`,
+  `originator`, `agent_version`, `repo_url`, `initial_commit`,
+  `workspace_roots_json`, `source_stamp`, and `discovery_state`, plus the
+  `idx_sessions_source_last` and `idx_sessions_raw_path` indexes. Existing
+  databases migrate in place on the next open.
+- Expose `listSessions` and `discoverSessions` from the napi binding, so a Node
+  host can drive the catalog in-process instead of shelling out.
+
 ### Breaking
 
 - Remove the legacy Python CLI and the public `ai-hist-python` and

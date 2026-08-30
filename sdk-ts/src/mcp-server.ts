@@ -11,9 +11,18 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { z } from "zod";
-import { openAiHist, resumeCommand, type AiHist, type TrajectoryEntry, type HandoffCandidate } from "./index.js";
+import {
+  defaultDbPath,
+  openAiHist,
+  resumeCommand,
+  SESSION_CATALOG_CONTRACT_VERSION,
+  type AiHist,
+  type TrajectoryEntry,
+  type HandoffCandidate,
+} from "./index.js";
 import { formatPairWarnings, pairCheck } from "./pair-client.js";
 
 // ---------------------------------------------------------------------------
@@ -58,6 +67,21 @@ function getHist(): Promise<AiHist> {
     });
   }
   return _histPromise;
+}
+
+/**
+ * The reader for a catalog read, or `null` when there is nothing to read.
+ *
+ * The session catalog lives only in the SQLite database: the JSONL fallback
+ * scan builds prompt history and never writes a catalog row. So when no
+ * database exists, opening the reader would walk every local provider file —
+ * seconds of I/O — only to answer with an empty catalog. Short-circuit instead,
+ * unless another tool has already paid for the reader, in which case reuse it.
+ */
+async function getCatalogHist(): Promise<AiHist | null> {
+  if (_histPromise) return getHist();
+  if (!existsSync(defaultDbPath())) return null;
+  return getHist();
 }
 
 function fmtEntry(
@@ -105,6 +129,9 @@ const READ_ONLY = { readOnlyHint: true, idempotentHint: true, openWorldHint: fal
 const WRITE_LOCAL = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
 const REMOTE_READ_ONLY = { readOnlyHint: true, idempotentHint: true, openWorldHint: true } as const;
 const SOURCE_SCHEMA = z.enum(["claude", "codex", "cursor", "grok", "relay", "trajectory", "opencode"]);
+// The session catalog holds provider sessions only: trajectories are derived
+// records and never appear in a session listing.
+const CATALOG_SOURCE_SCHEMA = z.enum(["claude", "codex", "cursor", "grok", "relay", "opencode"]);
 
 // ---------------------------------------------------------------------------
 // Server
@@ -148,6 +175,12 @@ Grok, OpenCode, Agent Relay, and trajectories — all searchable in a single ind
 
 - **recent_history** — Browse what was worked on recently across all agents, or
   filter by source and project.
+
+- **list_sessions** — List sessions from the local session catalog, newest first:
+  source, session_id, cwd, git branch, first/last activity, first prompt, models,
+  and discovery_state. Cache-only — it reads one indexed table and never opens a
+  transcript, so prefer it over recent_history when the question is "which sessions
+  exist?" rather than "which prompts mention X?".
 
 - **pack_evidence** — Assemble a concise, token-budget-aware summary of the most
   relevant past sessions before starting a new task. Each entry includes a resume
@@ -439,6 +472,114 @@ server.tool(
         lines.push(`[${dt}] #${e.id}\n${e.prompt}`);
       }
       return { content: [{ type: "text", text: lines.join("\n\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "list_sessions",
+  "List coding-agent sessions from the local session catalog, newest first. " +
+    "This is a cache-only read of the `sessions` table: it never opens a provider " +
+    "transcript and never scans prompt history, so it is the cheapest way to answer " +
+    '"what sessions exist?" or "what was I working on in this repo?". Each row carries ' +
+    "source, session_id, cwd, git branch, first/last activity, the first prompt, observed " +
+    "models, originator, agent version, repo identity, and discovery_state ('shallow' = " +
+    "catalog metadata only, 'full' = transcript ingested). Populate or refresh the catalog " +
+    "with `ai-hist sessions discover`; run `ai-hist sync` for full transcripts. Trajectories " +
+    "are not sessions and never appear here — use search_trajectories for those.",
+  {
+    sources: z
+      .array(CATALOG_SOURCE_SCHEMA)
+      .optional()
+      .describe("Restrict to these agent sources. Omit for every source in the catalog."),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(200)
+      .optional()
+      .default(20)
+      .describe("Maximum number of sessions to return. Default: 20."),
+    before_ms: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        "Coarse cutoff: only sessions whose last activity is strictly older than this epoch-ms " +
+          "value. It cannot separate sessions that share a millisecond, so use `after` to page. " +
+          "Ignored when `after` is given.",
+      ),
+    after: z
+      .object({
+        lastActivityMs: z
+          .number()
+          .int()
+          .nullable()
+          .optional()
+          .describe("Null or omitted to continue through sessions whose recency is unknown."),
+        source: z.string(),
+        sessionId: z.string(),
+      })
+      .optional()
+      .describe(
+        "Precise pagination cursor: pass back the `nextCursor` object from the previous call. " +
+          "Keep calling until nextCursor is null to walk the whole catalog with no skipped or " +
+          "repeated sessions, even when many share one timestamp.",
+      ),
+  },
+  READ_ONLY,
+  async ({ sources, limit, before_ms, after }) => {
+    try {
+      const hist = await getCatalogHist();
+      // No database yet: the catalog lives only in SQLite, so this is an empty
+      // answer rather than a reason to scan every provider file.
+      if (!hist) {
+        const dbPath = defaultDbPath();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  contractVersion: SESSION_CATALOG_CONTRACT_VERSION,
+                  sessions: [],
+                  nextCursor: null,
+                  sourceKind: "none",
+                  dbPath,
+                  note:
+                    `No ai-hist database at ${dbPath}. The session catalog is empty until ` +
+                    "`ai-hist sessions discover` (or `ai-hist sync`) writes one — the JSONL " +
+                    "fallback scan only builds prompt history, so other tools still work.",
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+      const page = hist.listSessionCatalogPage({ sources, limit, beforeMs: before_ms, after });
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                contractVersion: SESSION_CATALOG_CONTRACT_VERSION,
+                sessions: page.sessions,
+                nextCursor: page.nextCursor,
+                sourceKind: hist.sourceKind,
+                dbPath: hist.dbPath,
+                projectScope: hist.projectScope,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
     } catch (err) {
       return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
     }

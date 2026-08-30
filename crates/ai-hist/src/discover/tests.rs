@@ -1,0 +1,1538 @@
+//! Fixture-backed tests for shallow session discovery.
+//!
+//! Every fixture is written inline into a temp directory and reached through an
+//! explicit [`DiscoveryEnv`], so no test mutates process-wide environment
+//! variables and the suite stays parallel-safe.
+//!
+//! Performance claims are asserted through [`DiscoveryCounters`] rather than a
+//! wall clock: bounded reads mean a limited request opens a bounded number of
+//! files and reads a bounded number of bytes no matter how large the archive
+//! is, an unchanged rescan performs zero shallow reads, and the cache-only
+//! listing performs no file I/O at all.
+
+use super::*;
+use ai_hist_core::init_db;
+use std::fs;
+use std::time::{Duration, SystemTime};
+
+// ---------------------------------------------------------------------------
+// fixtures
+// ---------------------------------------------------------------------------
+
+fn catalog() -> Connection {
+    let conn = Connection::open_in_memory().expect("in-memory database");
+    init_db(&conn).expect("schema");
+    conn
+}
+
+fn env_at<'a>(conn: &'a Connection, home: &Path) -> DiscoveryEnv<'a> {
+    DiscoveryEnv::with_roots(conn, home.to_path_buf(), home.join("opencode.db"))
+}
+
+fn write(path: &Path, contents: &str) {
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    fs::write(path, contents).expect("write fixture");
+}
+
+/// Pin a file's mtime so recency ordering (and the change stamp) is
+/// deterministic instead of depending on how fast the test ran.
+fn set_mtime(path: &Path, ms: i64) {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open for mtime");
+    let when = SystemTime::UNIX_EPOCH + Duration::from_millis(ms as u64);
+    file.set_times(fs::FileTimes::new().set_modified(when))
+        .expect("set mtime");
+}
+
+fn claude_session(home: &Path, id: &str, body: &str, mtime_ms: i64) -> PathBuf {
+    let path = home.join(format!(".claude/projects/proj/{id}.jsonl"));
+    write(&path, body);
+    set_mtime(&path, mtime_ms);
+    path
+}
+
+fn codex_rollout(home: &Path, id: &str, body: &str, mtime_ms: i64) -> PathBuf {
+    let path = home.join(format!(".codex/sessions/2026/06/20/rollout-{id}.jsonl"));
+    write(&path, body);
+    set_mtime(&path, mtime_ms);
+    path
+}
+
+fn cursor_session(home: &Path, project: &str, id: &str, body: &str, mtime_ms: i64) -> PathBuf {
+    let path = home.join(format!(
+        ".cursor/projects/{project}/agent-transcripts/{id}/{id}.jsonl"
+    ));
+    write(&path, body);
+    set_mtime(&path, mtime_ms);
+    path
+}
+
+fn grok_session(home: &Path, project: &str, id: &str, summary: &str, chat: &str, mtime_ms: i64) {
+    let dir = home.join(format!(".grok/sessions/{project}/{id}"));
+    write(&dir.join("summary.json"), summary);
+    write(&dir.join("chat_history.jsonl"), chat);
+    set_mtime(&dir.join("summary.json"), mtime_ms);
+    set_mtime(&dir.join("chat_history.jsonl"), mtime_ms);
+}
+
+fn opencode_db(home: &Path, statements: &str) {
+    fs::create_dir_all(home).expect("mkdir");
+    let db = Connection::open(home.join("opencode.db")).expect("opencode db");
+    db.execute_batch(&format!(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER, time_updated INTEGER);
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+         CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+         {statements}"
+    ))
+    .expect("opencode fixture");
+}
+
+/// A realistic Claude transcript: a meta row, a slash-command wrapper, and a
+/// sidechain (subagent) turn all precede the first real human prompt.
+const CLAUDE_BODY: &str = concat!(
+    r#"{"sessionId":"claude-1","cwd":"/work/app","gitBranch":"main","version":"1.2.3","type":"user","isMeta":true,"message":{"role":"user","content":"session bookkeeping"},"timestamp":"2026-06-20T10:00:00.000Z"}"#,
+    "\n",
+    r#"{"sessionId":"claude-1","type":"user","message":{"role":"user","content":"<command-name>/compact</command-name>"},"timestamp":"2026-06-20T10:00:01.000Z"}"#,
+    "\n",
+    r#"{"sessionId":"claude-1","type":"user","isSidechain":true,"message":{"role":"user","content":"subagent instruction"},"timestamp":"2026-06-20T10:00:02.000Z"}"#,
+    "\n",
+    r#"{"sessionId":"claude-1","type":"user","message":{"role":"user","content":[{"type":"text","text":"the real first prompt"}]},"timestamp":"2026-06-20T10:00:03.000Z"}"#,
+    "\n",
+    r#"{"sessionId":"claude-1","type":"assistant","message":{"role":"assistant","model":"claude-opus-4","content":[{"type":"text","text":"working on it"}]},"timestamp":"2026-06-20T10:05:00.000Z"}"#,
+    "\n",
+);
+
+const CODEX_BODY: &str = concat!(
+    r#"{"timestamp":"2026-06-20T11:00:00.000Z","type":"session_meta","payload":{"id":"codex-1","cwd":"/work/api","originator":"codex_cli_rs","cli_version":"0.148.0","git":{"branch":"feature","repository_url":"git@github.com:acme/api.git","commit_hash":"abc1234"}}}"#,
+    "\n",
+    r#"{"timestamp":"2026-06-20T11:00:01.000Z","type":"turn_context","payload":{"model":"gpt-5-codex"}}"#,
+    "\n",
+    r#"{"timestamp":"2026-06-20T11:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"<environment_context>ignore me</environment_context>"}}"#,
+    "\n",
+    r#"{"timestamp":"2026-06-20T11:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"add a retry to the client"}}"#,
+    "\n",
+    r#"{"timestamp":"2026-06-20T11:09:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#,
+    "\n",
+);
+
+fn discover(conn: &Connection, home: &Path, options: &DiscoverOptions) -> DiscoveryResultForTest {
+    let env = env_at(conn, home);
+    let mut rows = Vec::new();
+    let summary =
+        discover_sessions_with_env(&env, options, |session| rows.push(session.clone())).unwrap();
+    DiscoveryResultForTest { rows, summary }
+}
+
+struct DiscoveryResultForTest {
+    rows: Vec<ShallowSession>,
+    summary: DiscoverySummary,
+}
+
+impl DiscoveryResultForTest {
+    fn ids(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .map(|row| format!("{}:{}", row.source, row.session_id))
+            .collect()
+    }
+
+    fn row(&self, session_id: &str) -> &ShallowSession {
+        self.rows
+            .iter()
+            .find(|row| row.session_id == session_id)
+            .unwrap_or_else(|| panic!("no {session_id} in {:?}", self.ids()))
+    }
+}
+
+fn only(sources: &[&str]) -> DiscoverOptions {
+    DiscoverOptions {
+        sources: sources.iter().map(|s| s.to_string()).collect(),
+        limit: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// registry
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_source_is_either_discoverable_or_explicitly_exempt() {
+    let adapters: BTreeSet<&str> = shallow_providers()
+        .iter()
+        .map(|provider| provider.source())
+        .collect();
+    let exempt: BTreeSet<&str> = DISCOVERY_EXEMPTIONS
+        .iter()
+        .map(|entry| entry.source)
+        .collect();
+    assert_eq!(
+        adapters.len(),
+        shallow_providers().len(),
+        "an adapter is registered twice"
+    );
+    for source in SOURCE_CHOICES {
+        let covered = usize::from(adapters.contains(source)) + usize::from(exempt.contains(source));
+        assert_eq!(
+            covered, 1,
+            "source '{source}' must be covered by exactly one of the adapter or exemption lists; \
+             a new provider needs a decision, not a default"
+        );
+    }
+    for source in adapters.iter().chain(exempt.iter()) {
+        assert!(
+            SOURCE_CHOICES.contains(source),
+            "'{source}' is registered but is not a known source"
+        );
+    }
+    assert!(
+        exempt.contains("trajectory"),
+        "trajectories are derived records and must stay out of session discovery"
+    );
+}
+
+#[test]
+fn discovering_an_exempt_source_is_rejected_with_its_reason() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let env = env_at(&conn, home.path());
+    let error = discover_sessions_with_env(&env, &only(&["trajectory"]), |_| {}).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("exempt"), "{message}");
+    assert!(message.contains("derived trajectory records"), "{message}");
+}
+
+#[test]
+fn discovering_an_unknown_source_is_rejected() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let env = env_at(&conn, home.path());
+    let error = discover_sessions_with_env(&env, &only(&["nope"]), |_| {}).unwrap_err();
+    assert!(format!("{error:#}").contains("invalid source"));
+}
+
+// ---------------------------------------------------------------------------
+// claude
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claude_cold_discovery_extracts_identity_and_skips_non_human_turns() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+
+    let found = discover(&conn, home.path(), &only(&["claude"]));
+    assert_eq!(found.ids(), vec!["claude:claude-1"]);
+    let row = found.row("claude-1");
+    assert_eq!(row.cwd.as_deref(), Some("/work/app"));
+    assert_eq!(row.git_branch.as_deref(), Some("main"));
+    assert_eq!(row.agent_version.as_deref(), Some("1.2.3"));
+    assert_eq!(row.models, vec!["claude-opus-4".to_string()]);
+    assert_eq!(row.discovery_state, "shallow");
+    assert!(!row.from_cache);
+    // Meta, slash-command wrapper and sidechain turns are not human prompts.
+    assert_eq!(row.first_prompt.as_deref(), Some("the real first prompt"));
+    assert_eq!(
+        row.first_activity_ms,
+        crate::parse_iso_ms("2026-06-20T10:00:00.000Z")
+    );
+    assert_eq!(
+        row.last_activity_ms,
+        crate::parse_iso_ms("2026-06-20T10:05:00.000Z")
+    );
+    assert_eq!(found.summary.discovered, 1);
+    assert_eq!(
+        found.summary.contract_version,
+        SESSION_CATALOG_CONTRACT_VERSION
+    );
+}
+
+#[test]
+fn claude_identity_is_stable_and_an_unchanged_rescan_reparses_nothing() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+
+    let first = discover(&conn, home.path(), &only(&["claude"]));
+    assert_eq!(first.summary.counters.shallow_reads, 1);
+
+    let second = discover(&conn, home.path(), &only(&["claude"]));
+    assert_eq!(second.ids(), first.ids(), "session identity must be stable");
+    assert_eq!(
+        second.summary.counters.shallow_reads, 0,
+        "an unchanged stamp must skip the read entirely"
+    );
+    assert_eq!(second.summary.skipped_unchanged, 1);
+    assert_eq!(second.summary.counters.files_opened, 0);
+    assert!(second.rows[0].from_cache);
+
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "a rescan must upsert, never duplicate");
+}
+
+#[test]
+fn claude_append_updates_the_existing_row_without_duplicating_it() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let path = claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+    discover(&conn, home.path(), &only(&["claude"]));
+
+    let mut appended = fs::read_to_string(&path).unwrap();
+    appended.push_str(
+        r#"{"sessionId":"claude-1","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"later"}]},"timestamp":"2026-06-20T12:00:00.000Z"}"#,
+    );
+    appended.push('\n');
+    fs::write(&path, appended).unwrap();
+    set_mtime(&path, 1_750_000_500_000);
+
+    let second = discover(&conn, home.path(), &only(&["claude"]));
+    assert_eq!(second.summary.counters.shallow_reads, 1);
+    assert_eq!(
+        second.row("claude-1").last_activity_ms,
+        crate::parse_iso_ms("2026-06-20T12:00:00.000Z")
+    );
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[test]
+fn an_incomplete_trailing_record_is_ignored_but_the_session_still_appears() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    // A transcript being written right now: the final record has no newline.
+    let body = format!(
+        "{CLAUDE_BODY}{}",
+        r#"{"sessionId":"claude-1","type":"user","message":{"role":"user","content":"half-written"#
+    );
+    claude_session(home.path(), "claude-1", &body, 1_750_000_000_000);
+
+    let found = discover(&conn, home.path(), &only(&["claude"]));
+    assert_eq!(found.ids(), vec!["claude:claude-1"]);
+    assert_eq!(
+        found.row("claude-1").last_activity_ms,
+        crate::parse_iso_ms("2026-06-20T10:05:00.000Z"),
+        "a partial trailing record is not yet a record"
+    );
+}
+
+/// A subagent sidecar is its own file whose records carry the *parent's*
+/// sessionId. Enumerating it as a session emitted the parent twice and let the
+/// two files fight over one row's raw_path/source_stamp, so one of them was
+/// re-read on every run forever.
+#[test]
+fn a_subagent_sidecar_is_not_a_second_copy_of_its_parent_session() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+    claude_session(
+        home.path(),
+        "agent-sub",
+        concat!(
+            r#"{"type":"user","uuid":"su1","sessionId":"claude-1","isSidechain":true,"cwd":"/work/app","timestamp":"2026-06-20T10:02:00.000Z","message":{"role":"user","content":"Research the repo."}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"sa1","sessionId":"claude-1","isSidechain":true,"cwd":"/work/app","timestamp":"2026-06-20T10:03:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Report."}]}}"#,
+            "\n"
+        ),
+        1_750_000_050_000,
+    );
+
+    let first = discover(&conn, home.path(), &only(&["claude"]));
+    assert_eq!(
+        first.ids(),
+        vec!["claude:claude-1"],
+        "the parent session must be emitted exactly once per run"
+    );
+    assert_eq!(first.summary.providers["claude"].candidates, 2);
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+    // The row points at the session's own transcript, not at the sidecar.
+    let raw_path: String = conn
+        .query_row(
+            "SELECT raw_path FROM sessions WHERE session_id = 'claude-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(raw_path.ends_with("claude-1.jsonl"), "{raw_path}");
+
+    let second = discover(&conn, home.path(), &only(&["claude"]));
+    assert_eq!(second.ids(), vec!["claude:claude-1"]);
+    assert_eq!(
+        second.summary.counters.shallow_reads, 0,
+        "neither the transcript nor its sidecar may be re-read when nothing changed"
+    );
+    assert_eq!(second.summary.skipped_unchanged, 2);
+    assert_eq!(
+        second.rows[0].source_stamp, first.rows[0].source_stamp,
+        "the stamp must be stable across rescans"
+    );
+}
+
+/// The same defect class as the claude sidecar: a codex subagent thread is a
+/// real rollout that is not a session, so "no catalog row" left nothing for the
+/// stamp check to match and it was re-read on every run.
+#[test]
+fn a_non_session_source_is_remembered_so_rescans_do_not_reread_it() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    codex_rollout(home.path(), "codex-1", CODEX_BODY, 1_750_000_200_000);
+    codex_rollout(
+        home.path(),
+        "codex-sub",
+        concat!(
+            r#"{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{"id":"codex-sub","cwd":"/work/api","thread_source":"subagent"}}"#,
+            "\n"
+        ),
+        1_750_000_300_000,
+    );
+
+    let first = discover(&conn, home.path(), &only(&["codex"]));
+    assert_eq!(first.summary.counters.shallow_reads, 2);
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert_eq!(
+        second.summary.counters.shallow_reads, 0,
+        "a source already known not to be a session must not be re-read"
+    );
+    assert_eq!(second.ids(), vec!["codex:codex-1"]);
+
+    // A file that later does become a session drops its marker.
+    codex_rollout(
+        home.path(),
+        "codex-sub",
+        &CODEX_BODY.replace("codex-1", "codex-sub"),
+        1_750_000_400_000,
+    );
+    let third = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(third.ids().contains(&"codex:codex-sub".to_string()));
+    let markers: i64 = conn
+        .query_row("SELECT COUNT(*) FROM discovery_skips", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(markers, 0, "a stale non-session marker must be cleared");
+}
+
+#[test]
+fn a_malformed_transcript_does_not_hide_its_healthy_neighbours() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+    // Not JSON at all, and no session id anywhere.
+    claude_session(
+        home.path(),
+        "broken",
+        "}}}} not json at all\nalso not json\n",
+        1_750_000_100_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["claude"]));
+    let ids = found.ids();
+    assert_eq!(
+        ids,
+        vec!["claude:claude-1"],
+        "a corrupt file must not be published as a session under its file name"
+    );
+    assert_eq!(found.summary.providers["claude"].candidates, 2);
+    assert_eq!(found.summary.discovered, 1);
+    // The corruption is named rather than silently absorbed.
+    let diagnostic = found
+        .summary
+        .diagnostics
+        .iter()
+        .find(|entry| entry.source == "claude")
+        .expect("a diagnostic for the corrupt transcript");
+    assert!(
+        diagnostic
+            .locator
+            .as_deref()
+            .is_some_and(|locator| locator.ends_with("broken.jsonl")),
+        "the diagnostic must name the broken file: {diagnostic:?}"
+    );
+    assert!(
+        diagnostic.error.contains("no parseable JSON records"),
+        "{diagnostic:?}"
+    );
+    // A row exists for neither the corrupt file's stem nor anything else.
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+/// An empty transcript is a session that has only just started, not a corrupt
+/// one: nothing to catalog yet, and no diagnostic noise every run.
+#[test]
+fn an_empty_transcript_is_not_a_session_and_not_an_error() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+    claude_session(home.path(), "starting", "", 1_750_000_100_000);
+
+    let found = discover(&conn, home.path(), &only(&["claude"]));
+    assert_eq!(found.ids(), vec!["claude:claude-1"]);
+    assert!(
+        found.summary.diagnostics.is_empty(),
+        "{:?}",
+        found.summary.diagnostics
+    );
+}
+
+#[test]
+fn absent_optional_metadata_stays_null_instead_of_being_invented() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    claude_session(
+        home.path(),
+        "bare",
+        concat!(
+            r#"{"sessionId":"bare","type":"user","message":{"role":"user","content":"hello"}}"#,
+            "\n"
+        ),
+        1_750_000_000_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["claude"]));
+    let row = found.row("bare");
+    assert_eq!(row.cwd, None);
+    assert_eq!(row.git_branch, None);
+    assert_eq!(row.agent_version, None);
+    assert_eq!(row.repo_url, None);
+    assert_eq!(row.initial_commit, None);
+    assert_eq!(row.originator, None);
+    assert_eq!(row.first_activity_ms, None);
+    assert_eq!(row.last_activity_ms, None);
+    assert!(row.models.is_empty());
+    assert!(row.workspace_roots.is_empty());
+    // The columns really are NULL, not empty JSON arrays.
+    let (models, roots): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT models_json, workspace_roots_json FROM sessions WHERE session_id = 'bare'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(models, None);
+    assert_eq!(roots, None);
+}
+
+// ---------------------------------------------------------------------------
+// codex
+// ---------------------------------------------------------------------------
+
+#[test]
+fn codex_session_meta_supplies_originator_version_and_git_provenance() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    codex_rollout(home.path(), "codex-1", CODEX_BODY, 1_750_000_200_000);
+
+    let found = discover(&conn, home.path(), &only(&["codex"]));
+    let row = found.row("codex-1");
+    assert_eq!(row.cwd.as_deref(), Some("/work/api"));
+    assert_eq!(row.git_branch.as_deref(), Some("feature"));
+    assert_eq!(row.originator.as_deref(), Some("codex_cli_rs"));
+    assert_eq!(row.agent_version.as_deref(), Some("0.148.0"));
+    assert_eq!(row.repo_url.as_deref(), Some("git@github.com:acme/api.git"));
+    assert_eq!(row.initial_commit.as_deref(), Some("abc1234"));
+    assert_eq!(row.models, vec!["gpt-5-codex".to_string()]);
+    assert_eq!(
+        row.first_prompt.as_deref(),
+        Some("add a retry to the client"),
+        "the environment_context control turn is not a human prompt"
+    );
+    assert_eq!(
+        row.last_activity_ms,
+        crate::parse_iso_ms("2026-06-20T11:09:00.000Z")
+    );
+}
+
+#[test]
+fn codex_subagent_threads_are_not_sessions() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    codex_rollout(home.path(), "codex-1", CODEX_BODY, 1_750_000_200_000);
+    codex_rollout(
+        home.path(),
+        "codex-sub",
+        concat!(
+            r#"{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{"id":"codex-sub","cwd":"/work/api","thread_source":"subagent"}}"#,
+            "\n"
+        ),
+        1_750_000_300_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["codex"]));
+    assert_eq!(found.ids(), vec!["codex:codex-1"]);
+    assert_eq!(found.summary.providers["codex"].candidates, 2);
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[test]
+fn codex_rescan_is_stamp_guarded_and_identity_stable() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    codex_rollout(home.path(), "codex-1", CODEX_BODY, 1_750_000_200_000);
+    let first = discover(&conn, home.path(), &only(&["codex"]));
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert_eq!(first.ids(), second.ids());
+    assert_eq!(second.summary.counters.shallow_reads, 0);
+    assert_eq!(second.summary.skipped_unchanged, 1);
+}
+
+// ---------------------------------------------------------------------------
+// cursor
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cursor_reports_mtime_as_last_activity_and_leaves_first_activity_null() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-1",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nfix the flaky test\n</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = found.row("cursor-1");
+    assert_eq!(row.first_prompt.as_deref(), Some("fix the flaky test"));
+    assert_eq!(row.cwd.as_deref(), Some("/work/app"));
+    // Cursor records no per-message timestamps, so mtime is the only signal
+    // and it is reported as last activity only.
+    assert_eq!(row.last_activity_ms, Some(1_750_000_400_000));
+    assert_eq!(row.first_activity_ms, None);
+}
+
+#[test]
+fn cursor_rescan_keeps_one_row_per_session() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-1",
+        "{\"role\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+        1_750_000_400_000,
+    );
+    discover(&conn, home.path(), &only(&["cursor"]));
+    let second = discover(&conn, home.path(), &only(&["cursor"]));
+    assert_eq!(second.summary.skipped_unchanged, 1);
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+// ---------------------------------------------------------------------------
+// grok
+// ---------------------------------------------------------------------------
+
+#[test]
+fn grok_summary_supplies_identity_and_the_chat_head_supplies_the_prompt() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-1",
+        r#"{"info":{"id":"grok-1","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z","updated_at":"2026-06-20T09:30:00.000Z","head_branch":"trunk"}"#,
+        concat!(
+            r#"{"type":"user","synthetic_reason":"system_reminder","content":[{"type":"text","text":"synthetic"}]}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"summarize the diff"}]}"#,
+            "\n",
+            r#"{"type":"assistant","content":[{"type":"text","text":"sure"}]}"#,
+            "\n"
+        ),
+        1_750_000_500_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    let row = found.row("grok-1");
+    assert_eq!(row.cwd.as_deref(), Some("/work/grok"));
+    assert_eq!(row.git_branch.as_deref(), Some("trunk"));
+    assert_eq!(
+        row.first_prompt.as_deref(),
+        Some("summarize the diff"),
+        "synthetic user turns are not human prompts"
+    );
+    assert_eq!(
+        row.first_activity_ms,
+        crate::parse_iso_ms("2026-06-20T09:00:00.000Z")
+    );
+    assert_eq!(
+        row.last_activity_ms,
+        crate::parse_iso_ms("2026-06-20T09:30:00.000Z")
+    );
+}
+
+#[test]
+fn grok_rescan_is_stamp_guarded() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-1",
+        r#"{"info":{"id":"grok-1","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"hey\"}\n",
+        1_750_000_500_000,
+    );
+    discover(&conn, home.path(), &only(&["grok"]));
+    let second = discover(&conn, home.path(), &only(&["grok"]));
+    assert_eq!(second.summary.counters.shallow_reads, 0);
+    assert_eq!(second.summary.skipped_unchanged, 1);
+}
+
+// ---------------------------------------------------------------------------
+// opencode
+// ---------------------------------------------------------------------------
+
+#[test]
+fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(
+        home.path(),
+        r#"INSERT INTO session VALUES ('oc-1', '/work/oc', 1750000600000, 1750000700000);
+           INSERT INTO message VALUES ('m1', 'oc-1', 1750000600000, '{"role":"user","modelID":"claude-sonnet"}');
+           INSERT INTO part VALUES ('p1', 'm1', 'oc-1', 1750000600000, '{"type":"text","text":"port the parser"}');"#,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["opencode"]));
+    let row = found.row("oc-1");
+    assert_eq!(row.cwd.as_deref(), Some("/work/oc"));
+    assert_eq!(row.first_prompt.as_deref(), Some("port the parser"));
+    assert_eq!(row.first_activity_ms, Some(1_750_000_600_000));
+    assert_eq!(row.last_activity_ms, Some(1_750_000_700_000));
+    assert_eq!(row.models, vec!["claude-sonnet".to_string()]);
+    assert_eq!(row.raw_path, None, "opencode sessions are not file-backed");
+
+    let second = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(second.summary.skipped_unchanged, 1);
+    assert_eq!(second.summary.counters.shallow_reads, 0);
+}
+
+/// A single opencode part can hold a whole pasted file. The excerpt is cut in
+/// SQL so only the capped prefix ever crosses into Rust.
+#[test]
+fn a_huge_opencode_part_is_truncated_before_it_reaches_rust() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let huge = "x".repeat(EXCERPT_MAX_CHARS * 8);
+    opencode_db(
+        home.path(),
+        &format!(
+            r#"INSERT INTO session VALUES ('oc-big', '/work/oc', 1750000600000, 1750000700000);
+               INSERT INTO message VALUES ('m1', 'oc-big', 1750000600000, '{{"role":"user"}}');
+               INSERT INTO part VALUES ('p1', 'm1', 'oc-big', 1750000600000, json_object('type', 'text', 'text', '{huge}'));"#
+        ),
+    );
+
+    let found = discover(&conn, home.path(), &only(&["opencode"]));
+    let prompt = found.row("oc-big").first_prompt.clone().expect("a prompt");
+    assert_eq!(
+        prompt.chars().count(),
+        EXCERPT_MAX_CHARS,
+        "the excerpt must be capped at the documented bound"
+    );
+    let stored: String = conn
+        .query_row(
+            "SELECT first_prompt FROM sessions WHERE session_id = 'oc-big'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored.chars().count(), EXCERPT_MAX_CHARS);
+}
+
+// ---------------------------------------------------------------------------
+// relay
+// ---------------------------------------------------------------------------
+
+#[test]
+fn relay_discovers_from_already_synced_rows_and_never_touches_the_network() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    for (id, prompt, ts) in [
+        ("ch:general", "[ana] deploy is red", 1_750_000_800_000_i64),
+        ("ch:general", "[bo] rolling back", 1_750_000_900_000),
+    ] {
+        ai_hist_core::insert_history(
+            &conn,
+            &ai_hist_core::HistoryEntry {
+                id: 0,
+                source: "relay".into(),
+                session_id: Some(id.into()),
+                project: Some("ws-1".into()),
+                prompt: prompt.into(),
+                prompt_hash: None,
+                timestamp_ms: ts,
+            },
+        )
+        .unwrap();
+    }
+
+    let found = discover(&conn, home.path(), &only(&["relay"]));
+    let row = found.row("ch:general");
+    assert_eq!(row.first_prompt.as_deref(), Some("[ana] deploy is red"));
+    assert_eq!(row.first_activity_ms, Some(1_750_000_800_000));
+    assert_eq!(row.last_activity_ms, Some(1_750_000_900_000));
+    // Relay has no local working directory to report, and inventing one would
+    // be a fabrication.
+    assert_eq!(row.cwd, None);
+    // No local files were opened at all: relay is a database-only adapter.
+    assert_eq!(found.summary.counters.files_opened, 0);
+}
+
+#[test]
+fn relay_with_nothing_synced_discovers_nothing_rather_than_failing() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let found = discover(&conn, home.path(), &only(&["relay"]));
+    assert!(found.rows.is_empty());
+    assert!(found.summary.diagnostics.is_empty());
+    assert_eq!(found.summary.providers["relay"].candidates, 0);
+}
+
+// ---------------------------------------------------------------------------
+// cross-provider
+// ---------------------------------------------------------------------------
+
+fn three_providers(home: &Path) {
+    claude_session(home, "claude-old", CLAUDE_BODY, 1_000_000_000_000);
+    codex_rollout(home, "codex-mid", CODEX_BODY, 2_000_000_000_000);
+    cursor_session(
+        home,
+        "work-app",
+        "cursor-new",
+        "{\"role\":\"user\",\"message\":{\"content\":\"newest\"}}\n",
+        3_000_000_000_000,
+    );
+}
+
+#[test]
+fn candidates_are_ordered_globally_by_recency_across_providers() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    three_providers(home.path());
+
+    let found = discover(&conn, home.path(), &DiscoverOptions::default());
+    assert_eq!(
+        found.ids(),
+        vec![
+            "cursor:cursor-new".to_string(),
+            "codex:codex-1".to_string(),
+            "claude:claude-1".to_string(),
+        ],
+        "rows must arrive newest-first across providers, not provider by provider"
+    );
+}
+
+#[test]
+fn the_limit_is_global_not_per_provider() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    // Two providers, three sessions each, interleaved in time. The three
+    // newest overall are two claude sessions and one codex session.
+    for (index, id) in ["claude-a", "claude-b", "claude-c"].iter().enumerate() {
+        let body = CLAUDE_BODY.replace("claude-1", id);
+        claude_session(
+            home.path(),
+            id,
+            &body,
+            1_000_000_000_000 + index as i64 * 100,
+        );
+    }
+    for (index, id) in ["codex-a", "codex-b", "codex-c"].iter().enumerate() {
+        let body = CODEX_BODY.replace("codex-1", id);
+        codex_rollout(
+            home.path(),
+            id,
+            &body,
+            1_000_000_000_050 + index as i64 * 100,
+        );
+    }
+
+    let found = discover(
+        &conn,
+        home.path(),
+        &DiscoverOptions {
+            sources: Vec::new(),
+            limit: Some(3),
+        },
+    );
+    assert_eq!(
+        found.ids(),
+        vec![
+            "codex:codex-c".to_string(),
+            "claude:claude-c".to_string(),
+            "codex:codex-b".to_string(),
+        ],
+        "the newest three overall (two codex, one claude), not three from one provider"
+    );
+    assert_eq!(found.summary.counters.candidates_enumerated, 6);
+    assert_eq!(found.summary.counters.shallow_reads, 3);
+}
+
+#[test]
+fn the_same_native_id_under_two_providers_is_two_rows() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    claude_session(
+        home.path(),
+        "shared",
+        &CLAUDE_BODY.replace("claude-1", "shared"),
+        1_000_000_000_000,
+    );
+    codex_rollout(
+        home.path(),
+        "shared",
+        &CODEX_BODY.replace("codex-1", "shared"),
+        1_000_000_000_100,
+    );
+
+    let found = discover(&conn, home.path(), &DiscoverOptions::default());
+    assert_eq!(found.rows.len(), 2);
+    let sources: BTreeSet<&str> = found.rows.iter().map(|row| row.source.as_str()).collect();
+    assert_eq!(sources, ["claude", "codex"].into_iter().collect());
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE session_id = 'shared'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        rows, 2,
+        "(source, session_id) is the identity, not id alone"
+    );
+}
+
+#[test]
+fn one_broken_provider_does_not_block_the_others() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+    // Not a SQLite database at all: the opencode snapshot must fail.
+    fs::write(home.path().join("opencode.db"), "definitely not sqlite").unwrap();
+
+    let found = discover(&conn, home.path(), &DiscoverOptions::default());
+    assert_eq!(found.ids(), vec!["claude:claude-1"]);
+    assert!(found.summary.providers["opencode"].failed);
+    assert!(!found.summary.providers["claude"].failed);
+    assert_eq!(found.summary.diagnostics.len(), 1);
+    assert_eq!(found.summary.diagnostics[0].source, "opencode");
+}
+
+#[test]
+fn a_run_fails_only_when_every_provider_fails() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    fs::write(home.path().join("opencode.db"), "definitely not sqlite").unwrap();
+    let env = env_at(&conn, home.path());
+    let error = discover_sessions_with_env(&env, &only(&["opencode"]), |_| {}).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no provider made progress"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn bounded_reads_do_not_grow_with_the_size_of_the_archive() {
+    let conn = catalog();
+    let small = tempfile::tempdir().unwrap();
+    claude_session(small.path(), "a", &CLAUDE_BODY.replace("claude-1", "a"), 10);
+    codex_rollout(small.path(), "b", &CODEX_BODY.replace("codex-1", "b"), 20);
+    let limited = DiscoverOptions {
+        sources: Vec::new(),
+        limit: Some(2),
+    };
+    let baseline = discover(&conn, small.path(), &limited);
+
+    let conn = catalog();
+    let big = tempfile::tempdir().unwrap();
+    for index in 0..50 {
+        let id = format!("bulk-{index:02}");
+        claude_session(
+            big.path(),
+            &id,
+            &CLAUDE_BODY.replace("claude-1", &id),
+            1_000 + index as i64,
+        );
+    }
+    claude_session(
+        big.path(),
+        "a",
+        &CLAUDE_BODY.replace("claude-1", "a"),
+        900_000,
+    );
+    codex_rollout(
+        big.path(),
+        "b",
+        &CODEX_BODY.replace("codex-1", "b"),
+        900_010,
+    );
+    let scaled = discover(&conn, big.path(), &limited);
+
+    assert_eq!(scaled.summary.counters.candidates_enumerated, 52);
+    assert_eq!(
+        scaled.summary.counters.shallow_reads, 2,
+        "a limit of 2 must read exactly two sources, whatever the archive holds"
+    );
+    assert_eq!(
+        scaled.summary.counters.files_opened, baseline.summary.counters.files_opened,
+        "file opens must not scale with the archive"
+    );
+    assert_eq!(
+        scaled.summary.counters.bytes_read, baseline.summary.counters.bytes_read,
+        "bytes read must not scale with the archive"
+    );
+    assert_eq!(
+        scaled.ids(),
+        vec!["codex:b".to_string(), "claude:a".to_string()]
+    );
+}
+
+#[test]
+fn a_head_read_stays_inside_its_budget_on_a_very_large_transcript() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let mut body = String::from(CLAUDE_BODY);
+    let filler = r#"{"sessionId":"claude-1","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"PADDINGPADDINGPADDINGPADDINGPADDINGPADDINGPADDINGPADDING"}]},"timestamp":"2026-06-20T10:06:00.000Z"}"#;
+    while body.len() < 3 * HEAD_SCAN_MAX_BYTES as usize {
+        body.push_str(filler);
+        body.push('\n');
+    }
+    body.push_str(
+        r#"{"sessionId":"claude-1","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"final"}]},"timestamp":"2026-06-20T23:00:00.000Z"}"#,
+    );
+    body.push('\n');
+    let path = claude_session(home.path(), "claude-1", &body, 1_750_000_000_000);
+    let size = fs::metadata(&path).unwrap().len();
+
+    let found = discover(&conn, home.path(), &only(&["claude"]));
+    assert!(
+        found.summary.counters.bytes_read <= HEAD_SCAN_MAX_BYTES + TAIL_SCAN_MAX_BYTES,
+        "read {} bytes of a {size}-byte transcript",
+        found.summary.counters.bytes_read
+    );
+    assert!(found.summary.counters.bytes_read < size);
+    let row = found.row("claude-1");
+    assert_eq!(row.first_prompt.as_deref(), Some("the real first prompt"));
+    assert_eq!(
+        row.last_activity_ms,
+        crate::parse_iso_ms("2026-06-20T23:00:00.000Z"),
+        "the tail read must still find the last timestamp"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// catalog listing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_cache_only_listing_survives_the_provider_files_disappearing() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    three_providers(home.path());
+    discover(&conn, home.path(), &DiscoverOptions::default());
+
+    // Nothing on disk any more: a cache-only list must not care.
+    fs::remove_dir_all(home.path().join(".claude")).unwrap();
+    fs::remove_dir_all(home.path().join(".codex")).unwrap();
+    fs::remove_dir_all(home.path().join(".cursor")).unwrap();
+
+    let rows = list_session_catalog(&conn, &CatalogListOptions::default()).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row.from_cache));
+    let recency: Vec<Option<i64>> = rows.iter().map(|row| row.last_activity_ms).collect();
+    let mut sorted = recency.clone();
+    sorted.sort_by(|a, b| b.cmp(a));
+    assert_eq!(recency, sorted, "the catalog lists newest first");
+}
+
+#[test]
+fn the_catalog_query_reads_only_the_sessions_table() {
+    let (sql, _) = catalog_list_query(&CatalogListOptions::default());
+    assert!(sql.contains("FROM sessions"), "{sql}");
+    for forbidden in ["history", "session_events", "tool_calls", "file_edits"] {
+        assert!(
+            !sql.contains(forbidden),
+            "the cache-only listing must not touch {forbidden}: {sql}"
+        );
+    }
+}
+
+#[test]
+fn trajectory_rows_never_appear_in_a_session_listing() {
+    let conn = catalog();
+    conn.execute(
+        "INSERT INTO sessions (session_id, source, last_activity_ms, discovery_state) \
+         VALUES ('traj-1', 'trajectory', 9999999999999, 'full')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (session_id, source, last_activity_ms, discovery_state) \
+         VALUES ('claude-1', 'claude', 1, 'shallow')",
+        [],
+    )
+    .unwrap();
+    let rows = list_session_catalog(&conn, &CatalogListOptions::default()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].source, "claude");
+}
+
+#[test]
+fn the_catalog_listing_filters_by_source_and_paginates_by_recency() {
+    let conn = catalog();
+    for (source, id, ts) in [
+        ("claude", "c1", 300_i64),
+        ("claude", "c2", 200),
+        ("codex", "x1", 250),
+    ] {
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, last_activity_ms, discovery_state) \
+             VALUES (?, ?, ?, 'shallow')",
+            params![id, source, ts],
+        )
+        .unwrap();
+    }
+    let claude_only = list_session_catalog(
+        &conn,
+        &CatalogListOptions {
+            sources: vec!["claude".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        claude_only
+            .iter()
+            .map(|row| row.session_id.clone())
+            .collect::<Vec<_>>(),
+        vec!["c1", "c2"]
+    );
+
+    let page = list_session_catalog(
+        &conn,
+        &CatalogListOptions {
+            limit: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(page[0].session_id, "c1");
+    let next = list_session_catalog(
+        &conn,
+        &CatalogListOptions {
+            limit: Some(1),
+            before_ms: page[0].last_activity_ms,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(next[0].session_id, "x1");
+}
+
+fn seed_row(conn: &Connection, source: &str, session_id: &str, last: Option<i64>) {
+    conn.execute(
+        "INSERT INTO sessions (session_id, source, last_activity_ms, discovery_state) \
+         VALUES (?, ?, ?, 'shallow')",
+        params![session_id, source, last],
+    )
+    .unwrap();
+}
+
+/// Walk the whole catalog one page at a time and assert the walk is a
+/// partition: every row exactly once, in the catalog's total order.
+fn walk_pages(conn: &Connection, page_size: i64) -> Vec<(String, String)> {
+    let mut seen = Vec::new();
+    let mut after = None;
+    loop {
+        let page = list_session_catalog_page(
+            conn,
+            &CatalogListOptions {
+                limit: Some(page_size),
+                after: after.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        seen.extend(
+            page.sessions
+                .iter()
+                .map(|row| (row.source.clone(), row.session_id.clone())),
+        );
+        match page.next_cursor {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+        assert!(seen.len() < 500, "pagination did not terminate");
+    }
+    seen
+}
+
+/// Recency alone is not a key: one discovery pass stamps many sessions with the
+/// same mtime-derived millisecond, and a timestamp-only cursor drops every row
+/// tied with the page boundary.
+#[test]
+fn pagination_walks_tied_timestamps_without_skipping_or_repeating_rows() {
+    let conn = catalog();
+    // Twelve sessions across three timestamps: every page boundary lands in
+    // the middle of a tie group.
+    for (source, index) in [("claude", 0), ("codex", 1), ("cursor", 2), ("grok", 3)] {
+        for (tie, last) in [(0, 300_i64), (1, 200), (2, 100)] {
+            seed_row(
+                &conn,
+                source,
+                &format!("{source}-{tie}-{index}"),
+                Some(last),
+            );
+        }
+    }
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(total, 12);
+
+    let all = walk_pages(&conn, 5);
+    assert_eq!(all.len(), 12, "every row must appear exactly once: {all:?}");
+    let unique: BTreeSet<_> = all.iter().cloned().collect();
+    assert_eq!(unique.len(), 12, "no row may repeat across pages: {all:?}");
+
+    // The paged walk must equal one unpaginated read of the whole catalog.
+    let straight: Vec<(String, String)> = list_session_catalog(
+        &conn,
+        &CatalogListOptions {
+            limit: Some(100),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .iter()
+    .map(|row| (row.source.clone(), row.session_id.clone()))
+    .collect();
+    assert_eq!(all, straight, "paging must not reorder the catalog");
+}
+
+/// Sessions whose recency is unknown sort after every dated row. A cursor that
+/// only carries a timestamp can never reach them, so the whole undated tail
+/// would be invisible to a paginating client.
+#[test]
+fn pagination_reaches_the_undated_tail() {
+    let conn = catalog();
+    seed_row(&conn, "claude", "dated-a", Some(300));
+    seed_row(&conn, "claude", "dated-b", Some(300));
+    seed_row(&conn, "cursor", "undated-a", None);
+    seed_row(&conn, "cursor", "undated-b", None);
+    seed_row(&conn, "grok", "undated-c", None);
+
+    let all = walk_pages(&conn, 2);
+    assert_eq!(
+        all,
+        vec![
+            ("claude".to_string(), "dated-a".to_string()),
+            ("claude".to_string(), "dated-b".to_string()),
+            ("cursor".to_string(), "undated-a".to_string()),
+            ("cursor".to_string(), "undated-b".to_string()),
+            ("grok".to_string(), "undated-c".to_string()),
+        ],
+        "undated rows sort last but must still be reachable"
+    );
+
+    // Stepping straight from a dated cursor into the undated tail works too.
+    let page = list_session_catalog_page(
+        &conn,
+        &CatalogListOptions {
+            limit: Some(10),
+            after: Some(CatalogCursor {
+                last_activity_ms: Some(300),
+                source: "claude".into(),
+                session_id: "dated-b".into(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(page.sessions.len(), 3);
+    assert!(page
+        .sessions
+        .iter()
+        .all(|row| row.last_activity_ms.is_none()));
+    assert!(
+        page.next_cursor.is_none(),
+        "a short page ends the walk rather than looping"
+    );
+}
+
+#[test]
+fn a_full_page_carries_a_cursor_and_a_short_one_does_not() {
+    let conn = catalog();
+    for index in 0..3 {
+        seed_row(&conn, "claude", &format!("c{index}"), Some(100 - index));
+    }
+    let full = list_session_catalog_page(
+        &conn,
+        &CatalogListOptions {
+            limit: Some(3),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(full.sessions.len(), 3);
+    assert_eq!(
+        full.next_cursor,
+        Some(CatalogCursor {
+            last_activity_ms: Some(98),
+            source: "claude".into(),
+            session_id: "c2".into(),
+        }),
+        "a page that fills its limit hands back its last row as the cursor"
+    );
+    let short = list_session_catalog_page(
+        &conn,
+        &CatalogListOptions {
+            limit: Some(10),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(short.sessions.len(), 3);
+    assert_eq!(short.next_cursor, None);
+}
+
+#[test]
+fn the_catalog_listing_is_served_by_an_index_not_a_table_scan() {
+    let conn = catalog();
+    // The plan is taken from the *same* builder the listing runs, so this
+    // cannot pass against a restated copy of the query while the real one
+    // drifts into a table scan.
+    let plan = |options: &CatalogListOptions| -> String {
+        let (sql, args) = catalog_list_query(options);
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let params = rusqlite::params_from_iter(args.iter().map(|arg| arg.as_ref()));
+        stmt.query_map(params, |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ")
+    };
+
+    let unfiltered = plan(&CatalogListOptions::default());
+    assert!(
+        unfiltered.contains("idx_sessions_recency"),
+        "the catalog's total order must be served by idx_sessions_recency: {unfiltered}"
+    );
+    assert!(
+        !unfiltered.contains("TEMP B-TREE"),
+        "the listing must not sort the table: {unfiltered}"
+    );
+
+    // The paginated form is the one that runs on every page after the first;
+    // it must stay indexed too, composite cursor predicate and all.
+    let paginated = plan(&CatalogListOptions {
+        limit: Some(10),
+        after: Some(CatalogCursor {
+            last_activity_ms: Some(500),
+            source: "claude".into(),
+            session_id: "c1".into(),
+        }),
+        ..Default::default()
+    });
+    assert!(
+        paginated.contains("idx_sessions_recency") && !paginated.contains("TEMP B-TREE"),
+        "a paginated listing must stay index-ordered: {paginated}"
+    );
+
+    let filtered = plan(&CatalogListOptions {
+        sources: vec!["claude".into()],
+        limit: Some(10),
+        before_ms: Some(1),
+        after: None,
+    });
+    assert!(
+        filtered.contains("idx_sessions_source_recency") && !filtered.contains("TEMP B-TREE"),
+        "a source-filtered listing must be served by idx_sessions_source_recency: {filtered}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// full-ingest interaction
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_shallow_rescan_never_downgrades_a_fully_indexed_row() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let path = claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+    // Stand in for the full-sync path having already ingested this session.
+    crate::upsert_session(
+        &conn,
+        "claude-1",
+        "claude",
+        Some("/work/app"),
+        Some("main"),
+        1,
+        2,
+        Some("the assistant's last word"),
+        Some(&path.to_string_lossy()),
+    )
+    .unwrap();
+
+    let found = discover(&conn, home.path(), &only(&["claude"]));
+    let row = found.row("claude-1");
+    assert_eq!(
+        row.discovery_state, "full",
+        "shallow discovery must never claim a fully indexed session is shallow"
+    );
+    assert_eq!(
+        row.last_assistant_text.as_deref(),
+        Some("the assistant's last word"),
+        "a shallow pass must not null out what full indexing established"
+    );
+    assert_eq!(
+        row.first_prompt.as_deref(),
+        Some("the real first prompt"),
+        "a shallow rescan of a full row still refreshes catalog metadata"
+    );
+    assert!(
+        row.source_stamp
+            .as_deref()
+            .is_some_and(|stamp| stamp.starts_with(&format!("v{SHALLOW_SCANNER_VERSION}:"))),
+        "the stamp records which scanner wrote it: {:?}",
+        row.source_stamp
+    );
+}
+
+/// A row written before `discovery_state` existed carries NULL, which readers
+/// deliberately interpret as fully indexed. The upsert has to agree, or the
+/// first discovery run on an upgraded database quietly demotes every legacy
+/// session to `shallow`.
+#[test]
+fn a_legacy_row_with_no_discovery_state_is_not_demoted_to_shallow() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let path = claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+    // Exactly what a pre-catalog database holds: the original nine columns
+    // populated, every column this feature added still NULL.
+    conn.execute(
+        "INSERT INTO sessions \
+         (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, \
+          last_assistant_text, raw_path, parser_version) \
+         VALUES ('claude-1', 'claude', '/work/app', 'main', 1, 2, 'legacy tail', ?, 1)",
+        [path.to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    let before: Option<String> = conn
+        .query_row(
+            "SELECT discovery_state FROM sessions WHERE session_id = 'claude-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(before, None, "the fixture must start as a legacy row");
+
+    let found = discover(&conn, home.path(), &only(&["claude"]));
+    let row = found.row("claude-1");
+    assert_eq!(
+        row.discovery_state, "full",
+        "a NULL discovery_state means fully indexed and must survive a shallow rescan"
+    );
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT discovery_state FROM sessions WHERE session_id = 'claude-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored.as_deref(), Some("full"));
+    assert_eq!(
+        row.last_assistant_text.as_deref(),
+        Some("legacy tail"),
+        "the legacy row's own evidence must survive too"
+    );
+    assert_eq!(row.first_prompt.as_deref(), Some("the real first prompt"));
+}
+
+/// The limit counts emitted sessions. Truncating candidates up front let a
+/// codex subagent thread -- which is not a session -- eat a result slot.
+#[test]
+fn non_session_candidates_do_not_consume_limit_slots() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    // The two newest candidates are subagent threads; the real sessions are
+    // older, so a candidate-truncating limit returned one session for a limit
+    // of two.
+    for (index, id) in ["sub-a", "sub-b"].iter().enumerate() {
+        codex_rollout(
+            home.path(),
+            id,
+            &format!(
+                concat!(
+                    r#"{{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{{"id":"{}","cwd":"/work/api","thread_source":"subagent"}}}}"#,
+                    "\n"
+                ),
+                id
+            ),
+            1_750_000_900_000 + index as i64,
+        );
+    }
+    for (index, id) in ["real-a", "real-b", "real-c"].iter().enumerate() {
+        codex_rollout(
+            home.path(),
+            id,
+            &CODEX_BODY.replace("codex-1", id),
+            1_750_000_800_000 + index as i64,
+        );
+    }
+
+    let found = discover(
+        &conn,
+        home.path(),
+        &DiscoverOptions {
+            sources: vec!["codex".into()],
+            limit: Some(2),
+        },
+    );
+    assert_eq!(
+        found.ids(),
+        vec!["codex:real-c".to_string(), "codex:real-b".to_string()],
+        "a limit of 2 must yield 2 real sessions, newest first"
+    );
+    assert_eq!(found.summary.discovered, 2);
+    // The two subagent threads were read (and remembered) but did not count.
+    assert_eq!(found.summary.counters.shallow_reads, 4);
+}
+
+#[test]
+fn bumping_the_scanner_version_invalidates_stored_stamps() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+    discover(&conn, home.path(), &only(&["claude"]));
+    // Simulate a database stamped by an older scanner generation.
+    conn.execute(
+        "UPDATE sessions SET source_stamp = 'v0:stale' WHERE session_id = 'claude-1'",
+        [],
+    )
+    .unwrap();
+    let rescan = discover(&conn, home.path(), &only(&["claude"]));
+    assert_eq!(rescan.summary.counters.shallow_reads, 1);
+    assert_eq!(rescan.summary.skipped_unchanged, 0);
+}

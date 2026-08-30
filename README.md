@@ -98,6 +98,14 @@ ai-hist context 4521 --window 15   # ±15 min window (default: 5)
 ai-hist session abc-1234-def
 ai-hist session abc-1234-def --full   # no truncation
 
+# Session catalog — "which agent sessions exist here?", without a full index
+ai-hist sessions discover              # refresh the catalog with bounded reads
+ai-hist sessions discover --limit 20   # only the 20 newest, across all providers
+ai-hist sessions list                  # read the catalog back (no provider I/O)
+ai-hist sessions list --source codex --limit 100
+ai-hist sessions list --json           # {"contract_version":1,"sessions":[...]}
+ai-hist sessions discover --json       # JSONL: session rows, diagnostics, summary
+
 # Resume a conversation directly (the exact command is shown by `ai-hist show <id>`)
 cd /path/to/project && claude --resume <session_id>          # claude
 codex resume <session_id>                                     # codex
@@ -138,15 +146,15 @@ Top 10 projects:
 
 ai-hist supports these sources:
 
-| Source | How | Key fields |
-|--------|-----|------------|
-| Claude Code | Local JSONL (`~/.claude/history.jsonl`) | `display`, `timestamp`, `project`, `sessionId` |
-| Codex CLI | Local JSONL (`~/.codex/history.jsonl`) | `text`, `ts`, `session_id` |
-| Cursor | Per-session JSONL (`~/.cursor/projects/<encoded-path>/agent-transcripts/<uuid>/<uuid>.jsonl`) | `role`, `message.content[].text` (user prompts wrapped in `<user_query>...`) |
-| Grok | Per-session JSONL (`~/.grok/sessions/<encoded-path>/<session-id>/chat_history.jsonl`) plus `summary.json` | `type`, `content[].text`, `info.cwd`, `head_branch` |
-| [Agent Relay](https://github.com/AgentWorkforce/relay) | API (`https://api.relaycast.dev/v1`) | `sender`, `content`, `channel`, `timestamp` |
-| Trajectories | Compacted per-run JSON (`$TRAJECTORY_ROOT/**/compacted/*.json`) | `personaId`, `projectId`, `task`, `decisions`, `retrospective` |
-| OpenCode | Local SQLite (`$OPENCODE_DB` or `~/.local/share/opencode/opencode.db`) | user text parts joined to sessions |
+| Source | How | Key fields | Session catalog (`sessions discover`) |
+|--------|-----|------------|---------------------------------------|
+| Claude Code | Local JSONL (`~/.claude/history.jsonl`) | `display`, `timestamp`, `project`, `sessionId` | head + tail of `~/.claude/projects/**/*.jsonl` |
+| Codex CLI | Local JSONL (`~/.codex/history.jsonl`) | `text`, `ts`, `session_id` | first `session_meta` line of `rollout-*.jsonl` (richest metadata) |
+| Cursor | Per-session JSONL (`~/.cursor/projects/<encoded-path>/agent-transcripts/<uuid>/<uuid>.jsonl`) | `role`, `message.content[].text` (user prompts wrapped in `<user_query>...`) | same files; no provider timestamps, so recency is file mtime |
+| Grok | Per-session JSONL (`~/.grok/sessions/<encoded-path>/<session-id>/chat_history.jsonl`) plus `summary.json` | `type`, `content[].text`, `info.cwd`, `head_branch` | `summary.json` + head of `chat_history.jsonl` |
+| [Agent Relay](https://github.com/AgentWorkforce/relay) | API (`https://api.relaycast.dev/v1`) | `sender`, `content`, `channel`, `timestamp` | already-synced local rows only — never the network |
+| Trajectories | Compacted per-run JSON (`$TRAJECTORY_ROOT/**/compacted/*.json`) | `personaId`, `projectId`, `task`, `decisions`, `retrospective` | exempt — derived records, not agent sessions |
+| OpenCode | Local SQLite (`$OPENCODE_DB` or `~/.local/share/opencode/opencode.db`) | user text parts joined to sessions | `session` table on a WAL-safe snapshot |
 
 **Claude Code, Codex, Cursor & Grok** are synced from local JSONL files incrementally. Grok user prompts are read from `chat_history.jsonl`; synthetic reminders are skipped and session metadata comes from `summary.json`.
 
@@ -197,6 +205,22 @@ The runtime contract is one JSON file per completed run:
 Aggregate `trail compact` artifacts are intentionally not the ai-hist interface; ai-hist indexes the runtime-emitted per-run contract files.
 
 All sources are indexed with [FTS5](https://www.sqlite.org/fts5.html) full-text search. Deduplication uses `INSERT OR IGNORE` on a `UNIQUE(source, timestamp_ms, prompt)` constraint.
+
+### Session catalog
+
+`ai-hist sync` is the deep index — every message, tool call and file edit. When
+you only need to answer *"which agent sessions exist here, newest first?"*, the
+**session catalog** is the shallow half: `ai-hist sessions discover` enumerates
+every provider cheaply, reads only bounded head/tail slices of the newest
+candidates, and caches identifying metadata in the `sessions` table.
+`ai-hist sessions list` then reads that cache back with a single indexed query
+and no provider I/O at all — fast enough for a session picker to call on every
+repaint, and unaffected by how much transcript volume sits behind it.
+
+Both emit a versioned, machine-readable contract (`contract_version: 1`).
+Full details — the JSON shapes, which fields each provider can supply, ordering
+and limit semantics, rescan behaviour, and the performance benchmark — are in
+[`docs/session-catalog.md`](docs/session-catalog.md).
 
 ## Database location
 
@@ -449,6 +473,43 @@ CREATE TABLE history (
 -- FTS5 full-text search index
 CREATE VIRTUAL TABLE history_fts USING fts5(prompt, project, content='history', content_rowid='id');
 ```
+
+The `sessions` table is the session catalog — one row per coding-agent session,
+keyed by `(session_id, source)`, written both by full sync and by shallow
+discovery:
+
+```sql
+CREATE TABLE sessions (
+    session_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    cwd TEXT,
+    git_branch TEXT,
+    first_activity_ms INTEGER,
+    last_activity_ms INTEGER,
+    last_assistant_text TEXT,      -- full indexing only; NULL on a shallow row
+    raw_path TEXT,                 -- provider file, when the source is file-backed
+    parser_version INTEGER NOT NULL DEFAULT 1,
+    first_prompt TEXT,             -- derived: bounded excerpt of the first human turn
+    models_json TEXT,              -- JSON array
+    originator TEXT,
+    agent_version TEXT,
+    repo_url TEXT,
+    initial_commit TEXT,
+    workspace_roots_json TEXT,     -- JSON array
+    source_stamp TEXT,             -- 'v<scanner>:<provider change marker>'
+    discovery_state TEXT,          -- 'shallow' or 'full'
+    PRIMARY KEY (session_id, source)
+);
+
+CREATE INDEX idx_sessions_last ON sessions(last_activity_ms DESC);
+CREATE INDEX idx_sessions_source_last ON sessions(source, last_activity_ms DESC);
+CREATE INDEX idx_sessions_raw_path ON sessions(source, raw_path);
+```
+
+Databases created before the catalog existed are migrated in place on the next
+open, so no manual step is needed. See
+[`docs/session-catalog.md`](docs/session-catalog.md) for field semantics and the
+per-provider capability matrix.
 
 Trajectory sync also maintains a structured `trajectories` table for decisions and retrospectives, while inserting a searchable `source='trajectory'` row into `history`.
 

@@ -42,6 +42,7 @@ The MCP server exposes:
 
 - `search_history`
 - `recent_entries`
+- `list_sessions`
 - `get_session`
 - `get_context`
 - `stats`
