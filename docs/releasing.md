@@ -13,17 +13,19 @@ The `Publish RelayHistory npm packages` workflow:
 5. publishes `ai-hist-native` with exact optional dependencies;
 6. builds and publishes `ai-hist` (SDK + CLI);
 7. publishes `ai-hist-mcp` last;
-8. performs a clean registry install and CLI/MCP smoke test.
+8. performs a clean registry install and CLI/MCP smoke test;
+9. creates the `sdk-ts-v<version>` tag and GitHub Release.
 
 The SDK root is never published before required platform artifacts. This is
 important because npm multi-package publication is not atomic.
 
 When manually dispatching the workflow, choose `patch`, `minor`, or `major`.
-The workflow computes the next version from `crates/ai-hist-napi/package.json`
-and applies that exact version to the native root, every platform package, the
-SDK/CLI, and the MCP wrapper. `custom_version` is available for an explicit
-version and overrides the selected bump type. Leave `dry_run` enabled to build
-and validate the release without publishing it.
+The workflow computes the next version from the currently published `ai-hist`
+version on npm and applies that exact version to the native root, every platform
+package, the SDK/CLI, and the MCP wrapper. For example, from `0.6.0`, `patch`
+produces `0.6.1` and `minor` produces `0.7.0`. `custom_version` is available for
+an explicit version and overrides the selected bump type. Leave `dry_run`
+enabled to build and validate without publishing packages or creating a tag.
 
 ## Supported matrix
 
