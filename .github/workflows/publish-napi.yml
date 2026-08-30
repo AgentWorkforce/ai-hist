@@ -66,6 +66,10 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             cross: true
+            # Rust 1.98 adds --fix-cortex-a53-843419, which Zig 0.13 rejects.
+            # Keep this target on the last compatible toolchain until Zig's
+            # linker accepts the flag.
+            rust: 1.97.0
             test_musl: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -82,6 +86,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ matrix.rust || 'stable' }}
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
