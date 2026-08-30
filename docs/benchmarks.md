@@ -1,15 +1,21 @@
 # Native-path benchmarks
 
-Run benchmarks against a representative database by setting `AI_HIST_DB`,
-building the addon and SDK, then running:
+Run benchmarks from the repository root against the default RelayHistory
+database:
 
 ```bash
-cd sdk-ts
+npm run benchmark
+```
+
+Write the report to a file with:
+
+```bash
 npm run benchmark -- --output=foo.md
 ```
 
 The output format follows the extension: `.md` writes a Markdown report and
-any other extension writes JSON. Omit `--output` to print JSON to stdout.
+any other extension writes JSON. Omit `--output` to print JSON to stdout. npm
+requires the `--` separator before benchmark-specific options.
 
 Useful overrides:
 
