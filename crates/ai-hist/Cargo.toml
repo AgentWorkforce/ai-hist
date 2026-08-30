@@ -1,15 +1,12 @@
 [package]
-name = "ai-hist-cli"
-# Kept in lockstep with the release version (sdk-ts/package.json) by the
-# publish workflow's "Sync CLI crate version" step, so `ai-hist --version`
-# reports the release version even for source builds.
-version = "0.6.0"
+name = "ai-hist-engine"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "ai_hist_cli"
+name = "ai_hist_engine"
 path = "src/lib.rs"
 
 [[bin]]

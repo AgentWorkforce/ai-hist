@@ -8,7 +8,7 @@
 //! Run it with:
 //!
 //! ```text
-//! cargo test -p ai-hist-cli --test discovery_bench -- --ignored --nocapture
+//! cargo test -p ai-hist-engine --test discovery_bench -- --ignored --nocapture
 //! ```
 //!
 //! It is `#[ignore]`d because it writes tens of megabytes of fixtures and runs
@@ -42,12 +42,12 @@
 //! 4. **A bounded request does not parse the archive.** `--limit 5` reads the
 //!    same bytes from a 5x larger archive.
 
-use ai_hist_cli::discover::{HEAD_SCAN_MAX_BYTES, TAIL_SCAN_MAX_BYTES};
-use ai_hist_cli::{
+use ai_hist_core::open_db;
+use ai_hist_engine::discover::{HEAD_SCAN_MAX_BYTES, TAIL_SCAN_MAX_BYTES};
+use ai_hist_engine::{
     discover_sessions_with_env, list_session_catalog, CatalogListOptions, DiscoverOptions,
     DiscoveryEnv, DiscoverySummary,
 };
-use ai_hist_core::open_db;
 use rusqlite::Connection;
 use serde_json::Value;
 use std::fs;

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-30
+
+### Breaking
+
+- Replace the synchronous `openAiHist()`/`AiHist` snapshot API with top-level
+  async native-backed functions.
+- Remove `sql.js`, JSONL/trajectory fallback scanners, CLI subprocess bridges,
+  `AI_HIST_RUST_BIN`, binary resolution, and fallback selection.
+- Make shallow discovery and full sync explicit; cache-only reads never invoke
+  either operation.
+- Make session-event pagination the primitive API and ship the public
+  `ai-hist` Node CLI from this package.
+
+### Added
+
+- Mandatory `ai-hist-native` contract validation and stable errors for
+  unsupported/missing platforms, load/version failures, and database errors.
+- Native-backed discovery, catalog pages, session history, event pages,
+  search, recent history, statistics, and sync.
+- Thin SDK-only CLI and MCP adapters plus macOS, glibc, musl, and Windows x64
+  native-package release validation.
+
 ## [0.6.0] - 2026-08-30
 
 ### Added

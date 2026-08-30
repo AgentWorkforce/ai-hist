@@ -1,14 +1,12 @@
 {
   "name": "ai-hist-mcp",
-  "version": "0.6.0",
+  "version": "1.0.0",
   "description": "Thin npx wrapper for the ai-hist stdio MCP server.",
   "license": "MIT",
   "private": false,
   "type": "module",
   "bin": {
-    "ai-hist-mcp": "bin/ai-hist-mcp.js",
-    "ai-hist-pair-setup": "bin/pair-setup.js",
-    "ai-hist-pair-hook": "bin/pair-hook.js"
+    "ai-hist-mcp": "bin/ai-hist-mcp.js"
   },
   "files": [
     "bin",
@@ -24,9 +22,9 @@
     "access": "public"
   },
   "dependencies": {
-    "ai-hist": "0.6.0"
+    "ai-hist": "1.0.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }

@@ -1,13 +1,14 @@
 {
   "name": "ai-hist",
-  "version": "0.6.0",
-  "description": "TypeScript SDK and MCP server for AI coding agent session history — Claude Code, Codex, Cursor, Grok, and Agent Relay in one searchable index. Works with or without ai-hist sync via automatic JSONL fallback.",
+  "version": "1.0.0",
+  "description": "Native-backed TypeScript SDK, CLI, and MCP server for RelayHistory.",
   "license": "MIT",
   "private": false,
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
+    "ai-hist": "./dist/cli.js",
     "ai-hist-mcp": "./dist/mcp-server.js"
   },
   "exports": {
@@ -42,7 +43,10 @@
   ],
   "homepage": "https://github.com/AgentWorkforce/relayhistory",
   "files": [
-    "dist",
+    "dist/index.*",
+    "dist/cli.*",
+    "dist/mcp-server.*",
+    "dist/cloud-client.*",
     "README.md",
     "package.json"
   ],
@@ -55,24 +59,26 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
     "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsc -p tsconfig.json && node --test dist/*.test.js",
+    "test": "npm run build && node --test dist/*.test.js",
+    "test:architecture": "node --test dist/architecture.test.js",
+    "benchmark": "npm run build && node ../scripts/benchmark-native.mjs",
     "lint": "tsc -p tsconfig.json --noEmit",
     "prepare": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "sql.js": "^1.13.0",
+    "ai-hist-native": "file:../crates/ai-hist-napi",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.18.0",
-    "@types/sql.js": "^1.4.9",
     "typescript": "^5.9.2"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }

@@ -1,7 +1,6 @@
-//! Thin binary wrapper. All logic lives in the `ai_hist_cli` library so it can
-//! also be driven in-process (e.g. by the napi binding) rather than only via
-//! the CLI.
+//! Internal thin binary wrapper. All logic lives in `ai_hist_engine`; the
+//! production Node CLI calls the public TypeScript SDK instead.
 
 fn main() -> anyhow::Result<()> {
-    ai_hist_cli::run()
+    ai_hist_engine::run()
 }

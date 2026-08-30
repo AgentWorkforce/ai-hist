@@ -1,537 +1,111 @@
-# ai-hist
+# RelayHistory (`ai-hist`)
 
-Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor](https://cursor.com), Grok, [Agent Relay](https://github.com/AgentWorkforce/relay), and compacted persona trajectory history into a local SQLite database with full-text search.
+RelayHistory indexes coding-agent sessions from Claude Code, Codex, Cursor,
+Grok, OpenCode, and Agent Relay in a local SQLite database.
 
-`ai-hist` is a Rust CLI. New commands and integrations should land in the Rust
-SDK/CLI surfaces.
+Its production architecture has one implementation:
 
-## Why ai-hist
+```text
+Rust engine (providers + SQLite + migrations + queries)
+  → Node-API addon
+    → TypeScript SDK
+      → Node CLI / MCP server
+```
 
-Coding agents start every session from zero — they can't see the decisions you
-made yesterday, the approach that already failed, or the reasoning behind the
-architecture they're editing. Local transcript search recovers *what* you typed.
-ai-hist also captures *why*.
-
-- **HOW + WHY, not just HOW.** Most history tools index raw prompts and
-  transcripts (the *how*). ai-hist indexes those **and** distilled
-  **trajectories** — the `decisions` (question → chosen → reasoning →
-  alternatives) and `retrospectives` (learnings, confidence) behind each run.
-  Ask `why_for_task` and get the reasoning, not just the keystrokes.
-- **Local-first, team-optional.** Everything lands in local SQLite with FTS5 —
-  no keys, no network required. When you want it, opt into **cloud sync** to
-  feed a shared team memory with server-side secret/PII scrubbing and a
-  self-host Enterprise tier.
-- **It talks back.** Pushed history powers **Pair**: before a risky action, your
-  agent queries the store and gets *cited warnings drawn from your team's own
-  prior work* — so nobody repeats a mistake that's already in the record.
-- **Built for agents.** A stdio **MCP server** (`npx -y ai-hist-mcp`) exposes
-  `search_history`, `get_context`, `search_trajectories`, and `why_for_task` so
-  the agent can pull its own context mid-session, scoped to one project.
-
-If you only want fast local grep over your own agent history, ai-hist does that
-in one command. The trajectory + Pair loop is there when you're ready for team
-memory that prevents repeat mistakes.
+TypeScript never opens SQLite, scans provider files, or invokes another
+executable. The native addon is mandatory and operates on the SQLite file in
+place, including WAL-backed databases.
 
 ## Install
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/AgentWorkforce/relayhistory/main/install.sh | sh
-```
-
-Make sure `~/.local/bin` is in your `PATH`:
+Node.js 20 or 22 is required. npm installs the SDK, CLI, MCP server, native
+loader, and matching prebuilt platform package:
 
 ```bash
-export PATH="$HOME/.local/bin:$PATH"  # add to .zshrc / .bashrc
+npm install ai-hist
+
+# Global CLI
+npm install --global ai-hist
+ai-hist sessions discover --limit 100
+ai-hist sessions list --limit 100
 ```
 
-The installer installs the `ai-hist` launcher. For normal installs it downloads
-a prebuilt Rust binary from GitHub Releases, so users do not need a local Rust
-toolchain.
-
-Upgrading to the Rust-only release removes installer-managed `ai-hist-python`
-and `ai-hist-rust` compatibility launchers. Unrecognized files with those names
-are left untouched and reported by the installer.
-
-If no prebuilt binary is available for your platform, the installer falls back
-to building from source. That fallback requires `cargo`; install Rust from
-<https://rustup.rs/> if you intentionally use the source path.
-
-Installer controls:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/AgentWorkforce/relayhistory/main/install.sh | AI_HIST_INSTALL_METHOD=binary sh
-curl -fsSL https://raw.githubusercontent.com/AgentWorkforce/relayhistory/main/install.sh | AI_HIST_VERSION=0.3.5 sh
-AI_HIST_INSTALL_METHOD=source sh install.sh   # from a local checkout
-AI_HIST_SOURCE_REF=my-branch sh install.sh    # override source fallback ref
-```
-
-The publish workflow creates the npm packages, the `sdk-ts-v<version>` GitHub
-Release, and the prebuilt Rust assets consumed by the installer.
+No Rust toolchain, C/C++ compiler, standalone CLI, curl installer, or runtime
+binary download is used.
 
 ### Checking your version
 
-`ai-hist --version` prints the installed version and, when a newer GitHub
-release exists, a short update notice on stderr. The check only runs
-interactively (stderr must be a terminal), times out quickly, and stays silent
-when offline. To print just the version, pass `--no-warning` or set
+`ai-hist --version` prints the installed npm package version. In an interactive
+terminal it also checks npm for a newer release, with a three-second timeout and
+silent offline fallback. Suppress the notice with `--no-warning` or
 `RELAYHISTORY_NO_UPDATE_CHECK=1`:
 
 ```bash
-ai-hist --version               # version + update notice when one is available
-ai-hist --version --no-warning  # version only
+ai-hist --version
+ai-hist --version --no-warning
 ```
 
-## Usage
+## TypeScript
 
-```bash
-# Import all history (incremental — only reads new bytes on re-run)
-ai-hist sync
+```ts
+import {
+  discoverSessions,
+  listSessionCatalog,
+  getSessionEventsPage,
+  search,
+  sync,
+} from 'ai-hist';
 
-# Full-text search
-ai-hist search "authentication bug"
-ai-hist search "refactor" --source claude --limit 10
-ai-hist search "deploy" --source relay
-ai-hist search "retry policy" --source trajectory
-ai-hist search "deploy" --project relay
-ai-hist search --tag relayfile-migration
-
-# Recent prompts
-ai-hist recent                             # last 20
-ai-hist recent 50                          # last 50
-ai-hist recent --source claude --project my-app
-
-# Drill into a specific entry (shows full prompt + metadata + resume command)
-ai-hist show 4521
-
-# See surrounding context (same session + nearby entries)
-ai-hist context 4521
-ai-hist context 4521 --window 15   # ±15 min window (default: 5)
-
-# View all prompts in a session
-ai-hist session abc-1234-def
-ai-hist session abc-1234-def --full   # no truncation
-
-# Session catalog — "which agent sessions exist here?", without a full index
-ai-hist sessions discover              # refresh the catalog with bounded reads
-ai-hist sessions discover --limit 20   # only the 20 newest, across all providers
-ai-hist sessions list                  # read the catalog back (no provider I/O)
-ai-hist sessions list --source codex --limit 100
-ai-hist sessions list --json           # {"contract_version":1,"sessions":[...]}
-ai-hist sessions discover --json       # JSONL: session rows, diagnostics, summary
-
-# Resume a conversation directly (the exact command is shown by `ai-hist show <id>`)
-cd /path/to/project && claude --resume <session_id>          # claude
-codex resume <session_id>                                     # codex
-cd /path/to/project && cursor-agent --resume=<session_id>    # cursor
-
-# Stats overview
-ai-hist stats
+await discoverSessions({ limit: 100 });
+const sessions = await listSessionCatalog({ limit: 100 });
+const firstEvents = sessions[0]
+  ? await getSessionEventsPage(sessions[0].sessionId, {
+      source: sessions[0].source,
+      limit: 200,
+    })
+  : null;
+const matches = await search('migration', { limit: 20 });
+await sync(); // explicit full ingestion
 ```
 
-Search results include entry IDs (`#NNN`) — use them to drill deeper:
+`listSessionCatalog` is cache-only. `discoverSessions` performs bounded shallow
+provider discovery and updates the catalog. `sync` performs full ingestion.
+Reads never silently turn into either discovery or sync.
 
-```
-ai-hist search "deploy" → find #4521
-ai-hist show 4521       → see full prompt, session info, resume command
-ai-hist context 4521    → see what else was happening in that session + nearby
-ai-hist session <id>    → browse the full conversation
-```
-
-Example output from `ai-hist stats`:
-
-```
-Total entries: 47,665
-
-By source:
-  claude: 37,406
-  codex: 10,259
-
-Date range:
-  2025-10-05 to 2026-03-08
-
-Top 10 projects:
-   8,701  /Users/you/Projects/my-app
-   4,586  /Users/you/Projects/api-server
-   ...
-```
-
-## How it works
-
-ai-hist supports these sources:
-
-| Source | How | Key fields | Session catalog (`sessions discover`) |
-|--------|-----|------------|---------------------------------------|
-| Claude Code | Local JSONL (`~/.claude/history.jsonl`) | `display`, `timestamp`, `project`, `sessionId` | head + tail of `~/.claude/projects/**/*.jsonl` |
-| Codex CLI | Local JSONL (`~/.codex/history.jsonl`) | `text`, `ts`, `session_id` | first `session_meta` line of `rollout-*.jsonl` (richest metadata) |
-| Cursor | Per-session JSONL (`~/.cursor/projects/<encoded-path>/agent-transcripts/<uuid>/<uuid>.jsonl`) | `role`, `message.content[].text` (user prompts wrapped in `<user_query>...`) | same files; no provider timestamps, so recency is file mtime |
-| Grok | Per-session JSONL (`~/.grok/sessions/<encoded-path>/<session-id>/chat_history.jsonl`) plus `summary.json` | `type`, `content[].text`, `info.cwd`, `head_branch` | `summary.json` + head of `chat_history.jsonl` |
-| [Agent Relay](https://github.com/AgentWorkforce/relay) | API (`https://api.relaycast.dev/v1`) | `from_name`, `text`, `thread_id`, `created_at` | already-synced local rows only — never the network |
-| Trajectories | Compacted per-run JSON (`$TRAJECTORY_ROOT/**/compacted/*.json`) | `personaId`, `projectId`, `task`, `decisions`, `retrospective` | exempt — derived records, not agent sessions |
-| OpenCode | Local SQLite (`$OPENCODE_DB` or `~/.local/share/opencode/opencode.db`) | user text parts joined to sessions | `session` table on a WAL-safe snapshot |
-
-**Claude Code, Codex, Cursor & Grok** are synced from local JSONL files incrementally. Grok user prompts are read from `chat_history.jsonl`; synthetic reminders are skipped and session metadata comes from `summary.json`.
-
-**Agent Relay** is synced via the [Relaycast API](https://github.com/AgentWorkforce/relaycast), pulling workspace messages with cursor-based pagination. Configure with:
-
-```bash
-export RELAYCAST_API_KEY="rk_live_..."
-export RELAYCAST_WORKSPACE_ID="ws_abc123"
-```
-
-**Trajectories** are synced from compacted per-run JSON files. Configure an explicit root with:
-
-```bash
-export TRAJECTORY_ROOT="/path/to/repo/.trajectories"
-```
-
-ai-hist scans `$TRAJECTORY_ROOT/**/compacted/*.json`. Without `TRAJECTORY_ROOT`, it discovers `~/Projects/**/.trajectories/**/compacted/*.json`.
-
-The runtime contract is one JSON file per completed run:
-
-```json
-{
-  "id": "run-id",
-  "version": 1,
-  "personaId": "planner",
-  "projectId": "agent-workforce",
-  "task": { "title": "Task title", "description": "Task description" },
-  "status": "completed",
-  "startedAt": "2026-06-06T10:00:00.000Z",
-  "completedAt": "2026-06-06T10:05:00.000Z",
-  "decisions": [
-    {
-      "question": "What should we do?",
-      "chosen": "Chosen option",
-      "reasoning": "Why this option won",
-      "alternatives": ["Other option"]
-    }
-  ],
-  "retrospective": {
-    "summary": "What happened",
-    "approach": "How the work was done",
-    "learnings": ["What to carry forward"],
-    "confidence": 0.8
-  }
-}
-```
-
-Aggregate `trail compact` artifacts are intentionally not the ai-hist interface; ai-hist indexes the runtime-emitted per-run contract files.
-
-All sources are indexed with [FTS5](https://www.sqlite.org/fts5.html) full-text search. Deduplication uses `INSERT OR IGNORE` on a `UNIQUE(source, timestamp_ms, prompt)` constraint.
-
-### Session catalog
-
-`ai-hist sync` is the deep index — every message, tool call and file edit. When
-you only need to answer *"which agent sessions exist here, newest first?"*, the
-**session catalog** is the shallow half: `ai-hist sessions discover` enumerates
-every provider cheaply, reads only bounded head/tail slices of the newest
-candidates, and caches identifying metadata in the `sessions` table.
-`ai-hist sessions list` then reads that cache back with a single indexed query
-and no provider I/O at all — fast enough for a session picker to call on every
-repaint, and unaffected by how much transcript volume sits behind it.
-
-Both emit a versioned, machine-readable contract (`contract_version: 1`).
-Full details — the JSON shapes, which fields each provider can supply, ordering
-and limit semantics, rescan behaviour, and the performance benchmark — are in
-[`docs/session-catalog.md`](docs/session-catalog.md).
-
-## Database location
-
-Default: `~/.local/share/ai-hist/ai-history.db`
-
-Override with the `AI_HIST_DB` environment variable:
-
-```bash
-export AI_HIST_DB="$HOME/Dropbox/ai-history/ai-history.db"
-```
-
-## MCP server
-
-The TypeScript package exposes a stdio MCP server that wraps the SDK and serves both HOW history and WHY trajectories:
+## MCP
 
 ```bash
 npx -y ai-hist-mcp
 ```
 
-Tools include `search_history`, `recent_entries`, `get_session`, `get_context`, `stats`, `search_trajectories`, and `why_for_task`.
+MCP exposes thin adapters for search, recent history, catalog listing,
+discovery, sessions, paged events, statistics, and explicit sync.
 
-To scope the MCP server to one project, pass a project scope when launching it. The scope includes exact matches and child paths, so `/path/to/project` also includes sessions recorded under `/path/to/project/packages/api`.
+## Supported production matrix
 
-```bash
-npx -y ai-hist-mcp --project .
-npx -y ai-hist-mcp --project /path/to/project
-```
+| OS/runtime | Architectures |
+|---|---|
+| macOS 12+ | arm64, x64 |
+| Linux glibc | arm64, x64 |
+| Linux musl | arm64, x64 |
+| Windows 10/11 and Server 2022 | x64 MSVC |
 
-## Continuous sync
+Node-API level 4 is used. CI tests Node.js 20 and 22. Windows arm64, FreeBSD,
+Bun, Deno, browsers, Electron renderer processes, and other unlisted runtimes
+are not supported. Windows arm64 remains follow-up work until it can be built
+and executed reliably in CI.
 
-The installer sets up a background sync service automatically, so history stays
-fresh without any manual step. To opt out at install time, set
-`AI_HIST_NO_AUTOSYNC=1`.
+See [architecture](docs/architecture.md), [getting started](docs/getting-started.md),
+[migration](docs/native-sdk-migration.md), and [release validation](docs/releasing.md).
 
-To manage it yourself at any time:
+## Repository development
 
-```bash
-ai-hist sync --install-service    # launchd on macOS, cron on Linux
-ai-hist sync --uninstall-service  # remove it
-ai-hist sync                      # run a one-off sync now
-ai-hist import --watch            # foreground alias for continuous live capture
-```
-
-`--install-service` points the scheduler directly at the resolved `ai-hist`
-binary and reloads idempotently, avoiding stale development launchers. On
-macOS, pass `--interval <seconds>` to change the cadence (default 60;
-cron runs at 1-minute granularity). Verify health with:
+The `ai-hist-engine` Rust binary target remains an internal development harness while
+provider-ingestion code is being physically separated from command rendering.
+It is not published as a second user runtime. Normal users install with npm.
 
 ```bash
-launchctl list | grep ai-hist   # middle "last exit status" column should be 0
+cargo test --workspace
+cd crates/ai-hist-napi && npm ci && npm run build:debug
+cd ../../sdk-ts && npm install && npm test
 ```
-
-### Continuous cloud push
-
-`sync` keeps the **local** database fresh. Uploading it to relayhistory-cloud is
-a separate step (`push`), which has its own background service using the same
-launchd/cron plumbing:
-
-```bash
-ai-hist push --install-service      # schedule automatic cloud push (macOS: every 300s)
-ai-hist push --install-service --limit 50  # persist a smaller batch for a heavy machine
-ai-hist push --uninstall-service    # remove it
-ai-hist push                        # push new history now
-```
-
-On macOS the launchd job honors `--interval` (default 300s). On Linux the job is
-a cron entry: whole-minute intervals become a step schedule (300s → `*/5`), and
-sub-minute intervals run every minute (cron's finest granularity).
-
-Running both services keeps local capture and cloud upload going end-to-end.
-When the Cloud worker rejects a batch for resource limits, `push` halves the batch and retries
-from the unchanged cursor down to a safe floor. If even that floor is rejected, it exits with a
-clear error that the cursor was not advanced; this is distinct from `Nothing new to push.`
-The push job authenticates with the `rth_at_` token written by `ai-hist login`.
-Because that token goes on the wire, an `https://` endpoint is required; plain
-`http://` is accepted only for loopback (`http://127.0.0.1:8787`, the `wrangler
-dev` address), where nothing leaves the machine.
-
-Each push identifies the machine by name so `coverage` below can name it back.
-The name comes from the OS, with `$HOSTNAME` as an override if you want a box to
-report as something else:
-
-```bash
-HOSTNAME=kjg-laptop ai-hist push
-```
-
-`$HOSTNAME` alone is not enough to rely on — it is a shell convenience that
-launchd and systemd do not pass to a service, so a scheduled push reading only
-that variable reports no name at all.
-
-### Checking fleet coverage
-
-A machine whose push service dies does not announce it — it just stops
-appearing in new data. `ai-hist coverage` asks the server which machines have
-reported and how recently, so a mute machine is visible without ssh'ing to it:
-
-```bash
-ai-hist coverage                    # the whole fleet, newest first
-ai-hist coverage --json             # same data, machine-readable
-ai-hist coverage --fail-on-stale    # exit 1 if any machine has fallen behind
-```
-
-```text
-Fleet coverage — 3 machine(s): 2 active, 0 stale, 1 missing
-
-MACHINE     STATUS   LAST PUSH  24H PUSHES  RECORDS  CURSOR
-kjg-laptop  active   2m ago            287     1148  history_id=82896
-sf-mini     active   4m ago            283      903  history_id=5512
-finn-mini   MISSING  3d ago              0        0  history_id=13409762
-
-⚠️  finn-mini has not pushed in 3d (last seen 2026-08-03T04:11:00Z).
-```
-
-`STATUS` is `active`, `STALE`, or `MISSING`, measured against the server's
-thresholds — 900s (three missed 300s pushes) and 24h by default, overridable
-with `--stale-after` and `--missing-after` if your push interval differs.
-
-The push and record columns are there because recency alone is not coverage: a
-machine working through a large backlog pushes on schedule for days while its
-history is still far behind. The columns show you that; `coverage` does not try
-to diagnose it for you. A batch that reached the push limit means only that the
-batch was full — it separates neither a draining machine from one that happened
-to have exactly that many records, nor a healthy machine from a failing one, and
-500 is the *default* `--limit` rather than a fact about the fleet. Calling a
-backlog needs a has-more signal the server does not yet send.
-
-`--fail-on-stale` is what makes this more than a spot check — run it from cron
-and a machine going quiet raises an alert instead of going unnoticed.
-
-### Manual setup (macOS)
-
-If you prefer to write the launchd plist by hand, sync every 60 seconds with:
-
-The unquoted heredoc (`<< EOF`) expands `$HOME` to an absolute path as the
-file is written — launchd does **not** expand `${HOME}` in `ProgramArguments`,
-so the path must be literal. Point it directly at the installed `ai-hist`
-launcher.
-
-```bash
-cat > ~/Library/LaunchAgents/com.ai-hist.sync.plist << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.ai-hist.sync</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$HOME/.local/bin/ai-hist</string>
-        <string>sync</string>
-    </array>
-    <key>StartInterval</key>
-    <integer>60</integer>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/ai-hist-sync.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/ai-hist-sync.err</string>
-</dict>
-</plist>
-EOF
-
-# Reload (idempotent — unload any previous version first)
-launchctl unload ~/Library/LaunchAgents/com.ai-hist.sync.plist 2>/dev/null
-launchctl load ~/Library/LaunchAgents/com.ai-hist.sync.plist
-```
-
-> Replace `$HOME/.local/bin/ai-hist` with the literal path to your installed
-> `ai-hist` launcher if needed, then confirm the job is healthy with
-> `launchctl list | grep ai-hist` (the middle "last exit status" column should
-> be `0`, not `1`).
-
-### Manual setup (Linux, cron)
-
-```bash
-# Sync every minute
-echo "* * * * * ~/.local/bin/ai-hist sync >> /tmp/ai-hist-sync.log 2>&1" | crontab -
-```
-
-### Alternative: watch mode
-
-```bash
-ai-hist watch              # syncs every 60s
-ai-hist watch --interval 30  # syncs every 30s
-ai-hist import --watch --interval 30
-```
-
-## Session → commit links
-
-`ai-hist` can record local, no-network links between captured agent sessions
-and git commits. The rows are raw evidence for downstream outcome attribution:
-they contain match method, confidence, changed files, numstat, and evidence
-JSON. They do **not** score work quality.
-
-Install the hook in a repo:
-
-```bash
-ai-hist setup git --repo /path/to/repo
-```
-
-After each commit, the managed `post-commit` hook runs `ai-hist link commit`,
-stores a row in `session_commit_links`, and may write a local
-`refs/notes/ai-hist` note when Git accepts the note write. `note_ref` is
-nullable so link rows remain valid when notes are disabled or cannot be written.
-To link manually:
-
-```bash
-ai-hist link commit --repo /path/to/repo --commit HEAD --json
-```
-
-Export links for Reflex or another consumer:
-
-```bash
-ai-hist export commit-links --jsonl --since 2026-06-01
-```
-
-Each JSONL row includes:
-
-```json
-{
-  "source": "claude",
-  "session_id": "session-id",
-  "repo": "/path/to/repo",
-  "branch": "feature-branch",
-  "commit_sha": "abc123...",
-  "note_ref": "refs/notes/ai-hist",
-  "match_method": "git_note",
-  "confidence": 0.95,
-  "files_json": ["src/file.rs"],
-  "numstat_json": [{"path": "src/file.rs", "additions": 10, "deletions": 2}],
-  "evidence_json": {"candidate": {"branch_match": true}},
-  "created_at_ms": 1780000000000
-}
-```
-
-## Schema
-
-```sql
-CREATE TABLE history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,          -- 'claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', or 'opencode'
-    session_id TEXT,
-    project TEXT,
-    prompt TEXT NOT NULL,
-    timestamp_ms INTEGER NOT NULL,
-    UNIQUE(source, timestamp_ms, prompt)
-);
-
--- FTS5 full-text search index
-CREATE VIRTUAL TABLE history_fts USING fts5(prompt, project, content='history', content_rowid='id');
-```
-
-The `sessions` table is the session catalog — one row per coding-agent session,
-keyed by `(session_id, source)`, written both by full sync and by shallow
-discovery:
-
-```sql
-CREATE TABLE sessions (
-    session_id TEXT NOT NULL,
-    source TEXT NOT NULL,
-    cwd TEXT,
-    git_branch TEXT,
-    first_activity_ms INTEGER,
-    last_activity_ms INTEGER,
-    last_assistant_text TEXT,      -- full indexing only; NULL on a shallow row
-    raw_path TEXT,                 -- provider file, when the source is file-backed
-    parser_version INTEGER NOT NULL DEFAULT 1,
-    first_prompt TEXT,             -- derived: bounded excerpt of the first human turn
-    models_json TEXT,              -- JSON array
-    originator TEXT,
-    agent_version TEXT,
-    repo_url TEXT,
-    initial_commit TEXT,
-    workspace_roots_json TEXT,     -- JSON array
-    source_stamp TEXT,             -- 'v<scanner>:<provider change marker>'
-    discovery_state TEXT,          -- 'shallow' or 'full'
-    PRIMARY KEY (session_id, source)
-);
-
-CREATE INDEX idx_sessions_last ON sessions(last_activity_ms DESC);
-CREATE INDEX idx_sessions_source_last ON sessions(source, last_activity_ms DESC);
-CREATE INDEX idx_sessions_raw_path ON sessions(source, raw_path);
-```
-
-Databases created before the catalog existed are migrated in place on the next
-open, so no manual step is needed. See
-[`docs/session-catalog.md`](docs/session-catalog.md) for field semantics and the
-per-provider capability matrix.
-
-Trajectory sync also maintains a structured `trajectories` table for decisions and retrospectives, while inserting a searchable `source='trajectory'` row into `history`.
-
-You can query the database directly with any SQLite client:
-
-```bash
-sqlite3 ~/.local/share/ai-hist/ai-history.db "SELECT COUNT(*) FROM history"
-```
-
-## License
-
-MIT

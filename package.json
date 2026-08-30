@@ -1,0 +1,8 @@
+{
+  "name": "relayhistory-repository",
+  "private": true,
+  "scripts": {
+    "prebenchmark": "npm --prefix sdk-ts install --ignore-scripts",
+    "benchmark": "npm --prefix sdk-ts run benchmark --"
+  }
+}

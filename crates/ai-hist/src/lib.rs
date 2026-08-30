@@ -1,9 +1,10 @@
 use ai_hist_core::convergence::MachineIdentity;
 use ai_hist_core::{
     default_db_path, import_json, insert_history, normalize_tag_name, open_db, open_db_readonly,
-    parse_cursor_text, prompt_hash, raw_fts_query_error, recent, resume_command, schema_is_current,
-    search, session, session_events, session_file_edits, session_tool_calls, sync_opencode_db,
-    untag_session, HistoryEntry, QueryFilter, SourceDatabaseError, SOURCE_CHOICES,
+    parse_cursor_text, prompt_hash, raw_fts_query_error, recent, resume_command,
+    schema_is_catalog_read_current, schema_is_current, search, session, session_events,
+    session_file_edits, session_tool_calls, sync_opencode_db, untag_session, HistoryEntry,
+    QueryFilter, SourceDatabaseError, SOURCE_CHOICES,
 };
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
@@ -26,24 +27,14 @@ mod cloud;
 /// listing that backs it.
 pub mod discover;
 mod learn;
-mod update;
-
-/// Version this build identifies as: the release version CI stamps in when
-/// building the binaries attached to a GitHub release (release tags follow
-/// `sdk-ts/package.json`, not the crate version), falling back to the crate
-/// version for local builds.
-pub const CLI_VERSION: &str = match option_env!("AI_HIST_RELEASE_VERSION") {
-    Some(version) => version,
-    None => env!("CARGO_PKG_VERSION"),
-};
 
 pub use discover::{
     discover_sessions, discover_sessions_collect, discover_sessions_with_env, list_session_catalog,
     list_session_catalog_page, shallow_providers, AllProvidersFailed, Candidate, CatalogCursor,
     CatalogListOptions, DiscoverOptions, DiscoveryCounters, DiscoveryDiagnostic, DiscoveryEnv,
-    DiscoverySummary, ProviderSummary, SessionCatalogPage, ShallowSession, ShallowSessionProvider,
-    SourceExemption, DEFAULT_CATALOG_LIMIT, DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION,
-    SHALLOW_SCANNER_VERSION,
+    DiscoverySummary, ProviderSummary, ScanEnv, SessionCatalogPage, ShallowReadAccess,
+    ShallowSession, ShallowSessionProvider, SourceExemption, DEFAULT_CATALOG_LIMIT,
+    DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION, SHALLOW_SCANNER_VERSION,
 };
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -78,8 +69,16 @@ pub struct SyncPushOutcome {
 /// When another process owns the sync lock the refresh is skipped — the
 /// concurrent scan is already producing the fresh data this caller wants.
 pub fn sync_local() -> Result<()> {
+    sync_local_at(&default_db_path()).map(|_| ())
+}
+
+/// Refresh local history into an explicitly selected database.
+///
+/// This is the reusable engine entry point used by the N-API boundary. The
+/// command-line parser is intentionally not involved.
+pub fn sync_local_at(db_path: &Path) -> Result<bool> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    sync_exclusive(&default_db_path()).map(|_| ())
+    sync_exclusive(db_path)
 }
 
 /// Sync local agent history into the DB, then push new records to
@@ -111,7 +110,7 @@ pub fn sync_and_push() -> Result<SyncPushOutcome> {
         id: cloud::machine_id()?,
         hostname: cloud::machine_hostname(),
         os: Some(std::env::consts::OS.to_string()),
-        cli_version: Some(CLI_VERSION.to_string()),
+        cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         ..Default::default()
     };
     let cursor = cloud::load_cursor(&auth.base_url)?;
@@ -138,15 +137,22 @@ pub fn sync_and_push() -> Result<SyncPushOutcome> {
 /// over `sessions`, no provider I/O. A database that does not exist yet is an
 /// empty catalog, not an error — the caller is expected to run discovery next.
 pub fn list_sessions_local(options: &CatalogListOptions) -> Result<SessionCatalogPage> {
-    let db_path = default_db_path();
+    list_sessions_local_at(&default_db_path(), options)
+}
+
+/// Cache-only catalog listing against an explicitly selected database.
+pub fn list_sessions_local_at(
+    db_path: &Path,
+    options: &CatalogListOptions,
+) -> Result<SessionCatalogPage> {
     if !db_path.exists() {
         return Ok(SessionCatalogPage::default());
     }
-    let conn = match open_db_readonly(&db_path) {
-        Ok(conn) if schema_is_current(&conn).unwrap_or(false) => conn,
+    let conn = match open_db_readonly(db_path) {
+        Ok(conn) if schema_is_catalog_read_current(&conn).unwrap_or(false) => conn,
         // Missing migration (a read-only handle skips init_db) or an
         // unreadable handle: let the writable open sort it out.
-        _ => open_db(&db_path)?,
+        _ => open_db(db_path)?,
     };
     list_session_catalog_page(&conn, options)
 }
@@ -159,7 +165,15 @@ pub fn list_sessions_local(options: &CatalogListOptions) -> Result<SessionCatalo
 pub fn discover_sessions_local(
     options: &DiscoverOptions,
 ) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
-    let conn = open_db(&default_db_path())?;
+    discover_sessions_local_at(&default_db_path(), options)
+}
+
+/// Shallow discovery into an explicitly selected database.
+pub fn discover_sessions_local_at(
+    db_path: &Path,
+    options: &DiscoverOptions,
+) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
+    let conn = open_db(db_path)?;
     discover_sessions_collect(&conn, options)
 }
 
@@ -167,19 +181,12 @@ pub fn discover_sessions_local(
 #[command(
     name = "ai-hist",
     bin_name = "ai-hist",
-    version = CLI_VERSION,
+    version,
     about = "Sync, search, tag, and relay AI coding agent history"
 )]
 struct Cli {
     #[arg(long)]
     db: Option<PathBuf>,
-    /// Suppress the new-version notice `--version` may print.
-    // Never read from the parsed struct: `--version` short-circuits parsing
-    // (`ErrorKind::DisplayVersion`), so the version path re-scans raw args
-    // instead. The field exists so clap accepts and documents the flag.
-    #[allow(dead_code)]
-    #[arg(long = "no-warning", global = true)]
-    no_warning: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -414,7 +421,7 @@ enum Command {
         /// Legacy/manual: RelayAuth/Agent Relay token (device-flow JWT). Prefer Cloud login.
         #[arg(long)]
         token: Option<String>,
-        #[arg(long, default_value = "ai-hist-cli")]
+        #[arg(long, default_value = "ai-hist-engine")]
         label: String,
     },
     /// Dev-only: mint a local `rth_at_` token via /v1/admin/mint (needs ADMIN_MINT_SECRET).
@@ -717,18 +724,7 @@ fn read_only_connection(command: &Command, db_path: &Path) -> Option<Connection>
 /// CLI entry point. `src/main.rs` is a thin wrapper that calls this so the same
 /// code is available as a library (for the napi binding).
 pub fn run() -> Result<()> {
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
-        // `--version`: print the version like clap would, then (unless
-        // suppressed) check GitHub for a newer release and note it on stderr.
-        Err(err) if err.kind() == clap::error::ErrorKind::DisplayVersion => {
-            err.print()?;
-            update::maybe_print_update_notice();
-            return Ok(());
-        }
-        // Help, usage errors, …: keep clap's exact output and exit codes.
-        Err(err) => err.exit(),
-    };
+    let cli = Cli::parse();
     let db_path = cli.db.unwrap_or_else(default_db_path);
     // Sync commands must acquire their advisory lock before opening a writable connection.
     // Pre-dispatch them so the common connection setup below cannot initialize the schema or
@@ -1141,7 +1137,7 @@ pub fn run() -> Result<()> {
                 id: cloud::machine_id()?,
                 hostname: cloud::machine_hostname(),
                 os: Some(std::env::consts::OS.to_string()),
-                cli_version: Some(CLI_VERSION.to_string()),
+                cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 ..Default::default()
             };
             let cursor = cloud::load_cursor(&auth.base_url)?;
@@ -6547,8 +6543,17 @@ fn collect_matching_files_inner(
         return Ok(());
     }
     for entry in fs::read_dir(root)? {
-        let path = entry?.path();
-        if path.is_dir() {
+        let entry = entry?;
+        // The directory read already knows each entry's type; only a symlink
+        // needs a stat to see what it points at.
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        let is_dir = if file_type.is_symlink() {
+            path.is_dir()
+        } else {
+            file_type.is_dir()
+        };
+        if is_dir {
             collect_matching_files_inner(&path, prefix, ext, out)?;
         } else if path
             .file_name()
@@ -6562,9 +6567,8 @@ fn collect_matching_files_inner(
     Ok(())
 }
 
-fn file_stamp(path: &Path) -> Result<String> {
-    let metadata = path.metadata()?;
-    Ok(format!(
+fn stamp_of(metadata: &fs::Metadata) -> String {
+    format!(
         "{}:{}",
         metadata
             .modified()
@@ -6573,7 +6577,31 @@ fn file_stamp(path: &Path) -> Result<String> {
             .map(|d| d.as_nanos())
             .unwrap_or(0),
         metadata.len()
-    ))
+    )
+}
+
+fn modified_ms_of(metadata: &fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+}
+
+fn file_stamp(path: &Path) -> Result<String> {
+    Ok(stamp_of(&path.metadata()?))
+}
+
+/// The change stamp and recency hint discovery needs per enumerated file,
+/// from one stat. Errors for anything that is not a regular file.
+fn file_stamp_and_modified(path: &Path) -> Result<(String, Option<i64>)> {
+    let metadata = path.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
+    Ok((stamp_of(&metadata), modified_ms_of(&metadata)))
 }
 
 fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
@@ -6668,8 +6696,15 @@ fn sorted_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     if root.exists() {
         for entry in fs::read_dir(root)? {
-            let path = entry?.path();
-            if path.is_dir() {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            let is_dir = if file_type.is_symlink() {
+                path.is_dir()
+            } else {
+                file_type.is_dir()
+            };
+            if is_dir {
                 dirs.push(path);
             }
         }
@@ -6760,6 +6795,22 @@ fn grok_session_stamp(chat: &Path) -> Result<String> {
         stamp.push_str(&file_stamp(&summary)?);
     }
     Ok(stamp)
+}
+
+/// [`grok_session_stamp`] plus the recency hint, with one stat per file.
+fn grok_session_stamp_and_modified(chat: &Path) -> Result<(String, Option<i64>)> {
+    let metadata = chat.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{} is not a regular file",
+        chat.display()
+    );
+    let mut stamp = stamp_of(&metadata);
+    if let Ok(summary) = chat.with_file_name("summary.json").metadata() {
+        stamp.push('|');
+        stamp.push_str(&stamp_of(&summary));
+    }
+    Ok((stamp, modified_ms_of(&metadata)))
 }
 
 struct GrokSession {
@@ -6877,11 +6928,7 @@ fn percent_decode_path(raw: &str) -> Option<String> {
 }
 
 fn file_modified_ms(path: &Path) -> Option<i64> {
-    path.metadata()
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
+    path.metadata().ok().as_ref().and_then(modified_ms_of)
 }
 
 fn grok_chat_text(value: &Value, role: &str) -> Option<String> {
@@ -7518,9 +7565,9 @@ mod tests {
         load_sync_state, parse_trajectory_file, paths_overlap, prepare_sync_and_push_db,
         process_status_with_programs, save_sync_state, search_all, service_command_args,
         shell_single_quote, source_database_path, strip_url_credentials,
-        sync_claude_session_metadata, sync_exclusive, sync_opencode_exclusive, sync_relaycast,
-        try_acquire_sync_lock, wal_contention_line, write_contention_diagnostic, xml_escape,
-        SearchRole, SyncSourceReport, PUSH_SERVICE, WAL_WARN_BYTES,
+        sync_claude_session_metadata, sync_exclusive, sync_local_at, sync_opencode_exclusive,
+        sync_relaycast, try_acquire_sync_lock, wal_contention_line, write_contention_diagnostic,
+        xml_escape, SearchRole, SyncSourceReport, PUSH_SERVICE, WAL_WARN_BYTES,
     };
     use ai_hist_core::{
         init_db, insert_history, open_db, prompt_hash, HistoryEntry, QueryFilter,
@@ -7648,6 +7695,7 @@ mod tests {
             "the sidecar lock must not initialize SQLite"
         );
         assert!(!sync_exclusive(&alias).unwrap());
+        assert!(!sync_local_at(&alias).unwrap());
         assert!(!sync_opencode_exclusive(&alias, &missing_opencode).unwrap());
         assert!(
             !db_path.exists(),

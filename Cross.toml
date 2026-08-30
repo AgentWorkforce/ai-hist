@@ -1,5 +1,0 @@
-# cross-rs container builds only forward allowlisted host env vars. The
-# release workflows stamp the GitHub release version into the binary via
-# this variable (see crates/ai-hist/src/lib.rs `CLI_VERSION`).
-[build.env]
-passthrough = ["AI_HIST_RELEASE_VERSION"]

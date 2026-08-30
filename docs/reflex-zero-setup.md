@@ -13,23 +13,24 @@ calls the **`ai-hist-native`** napi addon's `syncAndPush()`:
 agent-relay up  ──(every few minutes, if reflex.json.enabled)──▶  require('ai-hist-native').syncAndPush()
                                                                         │  (in-process, worker thread)
                                                                         ▼
-                                              ai_hist_cli::sync_and_push()  (Rust)
+                                              ai_hist_engine::sync_and_push()  (Rust)
                                                 sync local history → push new records → POST /v1/ingest
 ```
 
 - **No subprocess:** `ai-hist-native` is a native (napi) Node addon. Relay loads
   it and calls the Rust `sync_and_push` directly via FFI; the blocking work runs
   on a worker thread so the event loop isn't blocked.
-- **Single source of truth:** the Rust `ai_hist_cli` library does the sync +
+- **Single source of truth:** the Rust `ai_hist_engine` library does the sync +
   push. The CLI binary and the addon call the same code.
 - **Auth:** the `rth_at_` token written by `reflex on` (in the stage-scoped
   `~/.agentworkforce/relayhistory/stages/` store). `syncAndPush()` returns
   `authenticated: false` (a no-op) until the user is logged in. If the access token expires,
   the addon serializes refresh-token rotation, atomically persists the new pair, and retries.
-- **One sync owner:** Reflex supplies the periodic sync + push loop. Do not run standalone
-  `ai-hist sync` / `ai-hist push` launchd services at the same time. A cross-process lock
-  prevents overlapping scans as a safeguard. If another scanner owns it, `syncAndPush()` sets
-  `syncSkipped: true` and still pushes rows already present in SQLite.
+- **One sync owner:** Reflex supplies the periodic sync + push loop. Remove any legacy
+  pre-1.0 launchd services, and do not separately schedule the public `ai-hist sync`
+  command while Relay owns capture. A cross-process lock prevents overlapping scans as a
+  safeguard. If another scanner owns it, `syncAndPush()` sets `syncSkipped: true` and still
+  pushes rows already present in SQLite.
 
 ## The packages
 

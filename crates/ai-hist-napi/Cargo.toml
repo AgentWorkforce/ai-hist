@@ -1,6 +1,6 @@
 [package]
 name = "ai-hist-napi"
-version = "0.4.3"
+version = "1.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,9 +10,12 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-ai-hist-cli = { path = "../ai-hist" }
+ai-hist-core = { path = "../ai-hist-core" }
+ai-hist-engine = { path = "../ai-hist" }
+anyhow = "1"
 napi = { version = "2", default-features = false, features = ["napi4", "tokio_rt"] }
 napi-derive = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [build-dependencies]
 napi-build = "2"

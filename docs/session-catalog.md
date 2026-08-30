@@ -21,7 +21,7 @@ fully indexed session keeps its richer state when discovery re-reads it.
 | Reads | the `sessions` table only | provider locations, with bounded reads |
 | Provider I/O | none | head/tail of the newest candidates |
 | Writes | nothing (read-only handle when the schema is current) | upserts `sessions` rows |
-| Output | one JSON object | JSONL, streamed as rows are produced |
+| Output | one JSON object | JSONL session, diagnostic, and summary records |
 | Use it for | every repaint of a session picker | refreshing the catalog |
 
 Use **`list`** whenever you are rendering: it is a single indexed query, it
@@ -106,8 +106,8 @@ is exhausted (the page came back short of its limit). See
 
 ### `sessions discover --json`
 
-JSONL, one object per line, streamed as the run progresses (the `events`
-command's precedent). Three line types, in this order:
+JSONL, one object per line (the `events` command's precedent). Three line
+types, in this order:
 
 ```jsonc
 // 0..n session rows, in global recency order (newest first)
@@ -419,8 +419,8 @@ discoverable".
 
 - **Native (napi)** — `listSessions(options?)` returns
   `{contractVersion, sessions, nextCursor}`; `discoverSessions(options?)` runs a shallow
-  scan and returns the rows plus the summary (collected rather than streamed —
-  use the CLI's JSONL output when you want progressive rendering). Both run on
+  scan and returns the rows plus the summary. The CLI renders the same collected
+  result as JSONL when line-oriented records are more convenient. Both run on
   a blocking worker thread and accept `sources` / `limit`, with `beforeMs` and
   `after` (the previous page's `nextCursor`) on the listing.
 - **TypeScript SDK** — `listSessionCatalog()` / `discoverSessions()` wrap the
@@ -441,7 +441,7 @@ The claims above are validated by a benchmark harness rather than by wall-clock
 assertions in the test suite:
 
 ```bash
-cargo test -p ai-hist-cli --test discovery_bench -- --ignored --nocapture
+cargo test -p ai-hist-engine --test discovery_bench -- --ignored --nocapture
 ```
 
 It builds a synthetic multi-provider archive in a temp directory, runs both

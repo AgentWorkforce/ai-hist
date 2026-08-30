@@ -24,11 +24,6 @@ jobs:
           cache: npm
           cache-dependency-path: sdk-ts/package-lock.json
 
-      - name: Install SQLite CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y sqlite3
-
       - name: Rust formatting
         run: cargo fmt --all -- --check
 
@@ -38,11 +33,12 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace
 
-      - name: Build Rust CLI for wrapper tests
-        run: cargo build -q -p ai-hist-cli
-
-      - name: Installer verification
-        run: ./scripts/verify-install.sh
+      - name: Native binding contract
+        working-directory: crates/ai-hist-napi
+        run: |
+          npm ci
+          npm run build:debug
+          git diff --exit-code -- index.d.ts
 
       - name: TypeScript tests
         working-directory: sdk-ts
@@ -51,15 +47,61 @@ jobs:
           npm run lint
           npm test
 
-      - name: Native binding contract
-        working-directory: crates/ai-hist-napi
+      - name: Installed SDK and CLI smoke test
+        working-directory: sdk-ts
         run: |
-          npm ci
-          npm run build:debug
-          git diff --exit-code -- index.d.ts
+          set -euo pipefail
+          PACK_DIR=$(mktemp -d)
+          SDK_STAGE=$(mktemp -d)
+          PLATFORM_STAGE=$(mktemp -d)
+          SMOKE=$(mktemp -d)
+          VERSION=$(node -p "require('../crates/ai-hist-napi/package.json').version")
 
-      - name: End-to-end wrapper verification
-        run: AI_HIST_RUST_BIN="$PWD/target/debug/ai-hist" ./scripts/verify-e2e.sh
+          (cd ../crates/ai-hist-napi && npm pack --ignore-scripts --pack-destination "$PACK_DIR")
+          cp package.json README.md "$SDK_STAGE/"
+          cp -R dist "$SDK_STAGE/dist"
+          (cd "$SDK_STAGE" && npm pkg set dependencies.ai-hist-native="$VERSION" && npm pkg delete scripts.prepare && npm pack --ignore-scripts --pack-destination "$PACK_DIR")
+
+          cp ../crates/ai-hist-napi/ai-hist-native.linux-x64-gnu.node "$PLATFORM_STAGE/"
+          VERSION="$VERSION" node -e '
+            const fs = require("node:fs");
+            fs.writeFileSync(process.argv[1], JSON.stringify({
+              name: "ai-hist-native-linux-x64-gnu", version: process.env.VERSION,
+              main: "ai-hist-native.linux-x64-gnu.node",
+              files: ["ai-hist-native.linux-x64-gnu.node"],
+              os: ["linux"], cpu: ["x64"], libc: ["glibc"]
+            }, null, 2));
+          ' "$PLATFORM_STAGE/package.json"
+          (cd "$PLATFORM_STAGE" && npm pack --ignore-scripts --pack-destination "$PACK_DIR")
+
+          cd "$SMOKE"
+          npm init -y >/dev/null
+          npm install --ignore-scripts \
+            "$PACK_DIR/ai-hist-$VERSION.tgz" \
+            "$PACK_DIR/ai-hist-native-$VERSION.tgz" \
+            "$PACK_DIR/ai-hist-native-linux-x64-gnu-$VERSION.tgz"
+          ./node_modules/.bin/ai-hist sessions list --db "$SMOKE/missing.db" --json
+          node --input-type=module -e 'await import("ai-hist")'
+          node -e 'require("ai-hist/package.json")'
+
+  node-22-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            crates/ai-hist-napi/package-lock.json
+            sdk-ts/package-lock.json
+      - name: Build native addon
+        working-directory: crates/ai-hist-napi
+        run: npm ci && npm run build:debug
+      - name: Test SDK on Node 22
+        working-directory: sdk-ts
+        run: npm ci && npm test
 
   windows-state-replacement:
     runs-on: windows-latest
@@ -69,4 +111,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Verify repeated private-state replacement
-        run: cargo test -p ai-hist-cli write_private_replaces_existing_state
+        run: cargo test -p ai-hist-engine write_private_replaces_existing_state

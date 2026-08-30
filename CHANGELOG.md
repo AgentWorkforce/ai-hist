@@ -4,7 +4,17 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+### Breaking
+
+- Retire standalone Rust CLI release assets and the curl/source installer.
+  npm now distributes the public TypeScript SDK, Node CLI, MCP server, and
+  mandatory Node-API engine.
+
 ### Added
+
+- Add native search, recent, session, paged events, statistics, discovery,
+  catalog listing, and explicit sync operations with contract version 2.
+- Add deterministic bounded event pagination using `(ts_ms, id)`.
 
 - Add `ai-hist sessions list` and `ai-hist sessions discover`: a shallow session
   catalog over every provider. `discover` enumerates candidates cheaply, orders
@@ -21,16 +31,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
   databases migrate in place on the next open.
 - Expose `listSessions` and `discoverSessions` from the napi binding, so a Node
   host can drive the catalog in-process instead of shelling out.
-- `ai-hist --version` now notices when a newer GitHub release exists and says
-  so on stderr, with the install one-liner to update. The check is
-  interactive-only (stderr must be a terminal), bounded by a 3-second timeout,
-  and silent on any failure; suppress it with `--no-warning` or
-  `RELAYHISTORY_NO_UPDATE_CHECK=1`. To make `--version` report the `sdk-ts-v*`
-  release version instead of a stale internal crate version (released binaries
-  used to report `0.2.0` regardless of release), the crate version is bumped to
-  the current release and kept in lockstep by the publish workflow, and release
-  workflows additionally stamp the release version into the binaries they build
-  (`AI_HIST_RELEASE_VERSION`).
+- The npm-installed `ai-hist --version` reports the SDK package version and can
+  notify interactive users when a newer npm release exists. The best-effort
+  check has a 3-second timeout and is suppressed with `--no-warning` or
+  `RELAYHISTORY_NO_UPDATE_CHECK=1`.
 
 ### Breaking
 
