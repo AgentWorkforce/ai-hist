@@ -28,7 +28,7 @@
 //! 1. **Cached listing scales with the rows you ask for, not with the archive.**
 //!    Timings across catalog sizes and event volumes, at three limits. The
 //!    structural half of this claim — the query is served by
-//!    `idx_sessions_last` / `idx_sessions_source_last` and never sorts the
+//!    `idx_sessions_recency` / `idx_sessions_source_recency` and never sorts the
 //!    table — is asserted with `EXPLAIN QUERY PLAN` by the unit test
 //!    `discover::tests::the_catalog_listing_is_served_by_an_index_not_a_table_scan`.
 //! 2. **A cached listing reads zero provider files.** Structurally true
