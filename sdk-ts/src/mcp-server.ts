@@ -161,9 +161,9 @@ Grok, OpenCode, Agent Relay, and trajectories — all searchable in a single ind
 
 ## Available tools
 
-- **search_history** — Full-text search across all prompts. Start here when looking
-  for past work on a specific topic, bug, feature, or keyword. Supports boolean
-  operators (AND, OR, NOT) and prefix wildcards (*).
+- **search_history** — Literal substring search across all prompts. Start here when
+  looking for past work on a specific topic, bug, feature, or keyword. Boolean
+  operators and prefix wildcards are not supported.
 
 - **get_session** — Read the full conversation thread for a session_id. Use after
   search_history or recent_history to see the complete context of a session, and
@@ -262,19 +262,19 @@ server.tool(
 
 server.tool(
   "search_history",
-  "Search your AI coding agent history using full-text search across all prompts " +
+  "Search your AI coding agent history using literal substring search across all prompts " +
     "from Claude Code, Codex, Cursor, Grok, OpenCode, Agent Relay, and trajectories. Returns matching entries with " +
     "source, project path, session ID, and timestamp ordered by most recent first. " +
-    "Supports FTS5 boolean operators (AND, OR, NOT), leading - to exclude a term, and " +
-    "trailing * for prefix matching. Use get_session with a returned session_id to read " +
+    "The query is matched as a case-insensitive literal substring; boolean operators, " +
+    "exclusions, and wildcards are not supported. Use get_session with a returned session_id to read " +
     "the full conversation.",
   {
     query: z
       .string()
       .describe(
-        "Search query. Plain terms are matched literally. Use AND/OR/NOT (uppercase) for " +
-          'boolean, leading - to exclude, trailing * for prefix. ' +
-          'Examples: "authentication", "auth AND login", "deploy*", "refactor -test"',
+        "Search query. The whole query is matched literally as a case-insensitive " +
+          'substring of the prompt or project path; boolean operators and wildcards are not supported. ' +
+          'Examples: "authentication", "auth login", "deploy", "refactor test"',
       ),
     source: SOURCE_SCHEMA
       .optional()
@@ -283,7 +283,7 @@ server.tool(
       .string()
       .optional()
       .describe(
-        'Filter by project directory path. Substring match — use a partial path like "/myproject" or "src/api".',
+        'Filter by project directory path. Exact match in the SDK — pass the full recorded path like "/work/myproject".',
       ),
     tag: z.string().optional().describe("Filter to sessions tagged with this tag."),
     limit: z
@@ -666,7 +666,7 @@ server.tool(
     project: z
       .string()
       .optional()
-      .describe('Filter by project directory path (substring match). Example: "/my-app" or "work/api".'),
+      .describe('Filter by project directory path (exact match in the SDK). Example: "/work/my-app".'),
     tag: z.string().optional().describe("Filter to sessions tagged with this tag."),
   },
   READ_ONLY,
