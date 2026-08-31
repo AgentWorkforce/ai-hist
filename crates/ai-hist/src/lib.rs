@@ -6414,7 +6414,7 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
                     .collect::<Vec<_>>()
                     .join("\n")
             };
-            if !prompt.is_empty() && !prompt.starts_with("<command-name>") {
+            if !prompt.is_empty() && !discover::is_claude_control_prompt(&prompt) {
                 insert_history(
                     conn,
                     &HistoryEntry {
@@ -9509,6 +9509,33 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(event_count, 4);
+    }
+
+    #[test]
+    fn claude_control_wrappers_do_not_enter_prompt_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"s-control\",\"uuid\":\"control\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"<command-message>generated wrapper\"}}\n",
+                "{\"sessionId\":\"s-control\",\"uuid\":\"human\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"real prompt\"}}\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let prompts: Vec<String> = conn
+            .prepare("SELECT prompt FROM history ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(prompts, vec!["real prompt"]);
     }
 
     #[test]

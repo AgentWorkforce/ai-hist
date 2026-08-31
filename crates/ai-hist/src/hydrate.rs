@@ -92,18 +92,21 @@ fn hydrate_session_at_with_home(
     let mut conn = open_db(db_path)?;
     let target = catalog_target(&conn, options)?;
     let snapshot = source_snapshot(options, &target, home)?;
-    let previous: Option<(Option<String>, bool)> = conn
+    let previous: Option<(Option<String>, i64, bool)> = conn
         .query_row(
-            "SELECT source_stamp, include_related FROM session_hydration_checkpoints \
+            "SELECT source_stamp, parser_version, include_related FROM session_hydration_checkpoints \
              WHERE source = ? AND session_id = ? AND location = 'local'",
             params![options.source, options.session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let previous_stamp = previous.as_ref().and_then(|(stamp, _)| stamp.clone());
+    let previous_stamp = previous.as_ref().and_then(|(stamp, _, _)| stamp.clone());
 
     if previous_stamp.as_deref() == Some(snapshot.stamp.as_str())
-        && (!options.include_related || previous.as_ref().is_some_and(|(_, included)| *included))
+        && previous
+            .as_ref()
+            .is_some_and(|(_, parser_version, _)| *parser_version == HYDRATION_PARSER_VERSION)
+        && (!options.include_related || previous.as_ref().is_some_and(|(_, _, included)| *included))
         && target.discovery_state.as_deref() == Some("full")
     {
         return build_result(
@@ -132,9 +135,9 @@ fn hydrate_session_at_with_home(
         ],
     )?;
     tx.execute(
-        "UPDATE session_presences SET discovery_state = 'full', source_stamp = ? \
+        "UPDATE session_presences SET discovery_state = 'full' \
          WHERE source = ? AND session_id = ? AND location = 'local'",
-        params![snapshot.stamp, options.source, options.session_id],
+        params![options.source, options.session_id],
     )?;
     let last_event_at_ms = max_event_time(&tx, &options.source, &options.session_id)?;
     tx.execute(
@@ -235,9 +238,26 @@ fn source_snapshot(
         ));
     }
     if options.source == "opencode" {
-        let path = std::env::var_os("OPENCODE_DB")
+        let configured_path = std::env::var_os("OPENCODE_DB")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
+        let locator = target.locator.as_deref().ok_or_else(|| {
+            hydration_error(
+                "SESSION_SOURCE_UNAVAILABLE",
+                "OpenCode catalog row has no store provenance; run discoverSessions() again",
+            )
+        })?;
+        let path = PathBuf::from(locator);
+        if fs::canonicalize(&path).ok() != fs::canonicalize(&configured_path).ok() {
+            return Err(hydration_error(
+                "SESSION_SOURCE_MISMATCH",
+                format!(
+                    "OpenCode catalog store {} does not match configured store {}",
+                    path.display(),
+                    configured_path.display()
+                ),
+            ));
+        }
         if !path.is_file() {
             return Err(hydration_error(
                 "SESSION_SOURCE_UNAVAILABLE",
@@ -248,14 +268,28 @@ fn source_snapshot(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
+        let columns = src
+            .prepare("SELECT name FROM pragma_table_info('session')")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
+        let created = if columns.contains("time_created") {
+            "time_created"
+        } else {
+            "NULL"
+        };
+        let updated = if columns.contains("time_updated") {
+            "time_updated"
+        } else {
+            "NULL"
+        };
+        let stamp_sql = format!(
+            "SELECT printf('%lld:%lld', COALESCE({created}, 0), \
+                COALESCE({updated}, {created}, 0)) FROM session WHERE id = ?"
+        );
         let stamp = src
-            .query_row(
-                "SELECT printf('%lld:%lld', COALESCE(time_created, 0), \
-                    COALESCE(time_updated, time_created, 0)) \
-                 FROM session WHERE id = ?",
-                [&options.session_id],
-                |row| row.get::<_, String>(0),
-            )
+            .query_row(&stamp_sql, [&options.session_id], |row| {
+                row.get::<_, String>(0)
+            })
             .optional()?
             .ok_or_else(|| {
                 hydration_error(
@@ -687,8 +721,8 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO session_presences \
-             (source, session_id, location, raw_locator, discovery_state) \
-             VALUES (?, ?, 'local', ?, 'shallow')",
+             (source, session_id, location, raw_locator, source_stamp, discovery_state) \
+             VALUES (?, ?, 'local', ?, 'v2:test-discovery-stamp', 'shallow')",
             params![
                 source,
                 session_id,
@@ -755,11 +789,31 @@ mod tests {
         assert_eq!(first.status, "hydrated");
         assert_eq!(first.evidence.prompts, 1);
         assert_eq!(first.evidence.events, 3);
+        let presence_stamp: String = open_db(&db)
+            .unwrap()
+            .query_row(
+                "SELECT source_stamp FROM session_presences WHERE source='claude' AND session_id='session-1' AND location='local'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(presence_stamp, "v2:test-discovery-stamp");
 
         let second =
             hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
         assert_eq!(second.status, "unchanged");
         assert_eq!(second.evidence.events, 3);
+
+        open_db(&db)
+            .unwrap()
+            .execute(
+                "UPDATE session_hydration_checkpoints SET parser_version = 0 WHERE source='claude' AND session_id='session-1'",
+                [],
+            )
+            .unwrap();
+        let reparsed =
+            hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        assert_eq!(reparsed.status, "updated");
 
         let mut file = fs::OpenOptions::new()
             .append(true)
@@ -828,10 +882,10 @@ mod tests {
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         let src = Connection::open(&source).unwrap();
         src.execute_batch(
-            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER, time_updated INTEGER); \
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER); \
              CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); \
              CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT); \
-             INSERT INTO session VALUES ('selected', '/work/selected', 1, 2), ('unrelated', '/work/other', 3, 4); \
+             INSERT INTO session VALUES ('selected', '/work/selected', 1), ('unrelated', '/work/other', 3); \
              INSERT INTO message VALUES ('m1', 'selected', 1, '{\"role\":\"user\"}'), ('m2', 'unrelated', 3, '{\"role\":\"user\"}'); \
              INSERT INTO part VALUES ('p1', 'm1', 'selected', 2, '{\"type\":\"text\",\"text\":\"selected prompt\"}'), ('p2', 'm2', 'unrelated', 4, '{\"type\":\"text\",\"text\":\"must not ingest\"}');",
         )
@@ -839,7 +893,7 @@ mod tests {
         drop(src);
         let db = dir.path().join("history.db");
         let conn = open_db(&db).unwrap();
-        catalog_row(&conn, "opencode", "selected", None);
+        catalog_row(&conn, "opencode", "selected", Some(&source));
         drop(conn);
         let result =
             hydrate_session_at_with_home(&db, &options("opencode", "selected"), dir.path())
@@ -854,6 +908,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unrelated, 0);
+    }
+
+    #[test]
+    fn opencode_hydration_rejects_a_different_catalog_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = dir.path().join(".local/share/opencode/opencode.db");
+        let catalog_store = dir.path().join("other-opencode.db");
+        fs::create_dir_all(configured.parent().unwrap()).unwrap();
+        for path in [&configured, &catalog_store] {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, time_created INTEGER); \
+                 CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); \
+                 CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT); \
+                 INSERT INTO session VALUES ('selected', 1);",
+            )
+            .unwrap();
+        }
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "opencode", "selected", Some(&catalog_store));
+        drop(conn);
+
+        let error = hydrate_session_at_with_home(&db, &options("opencode", "selected"), dir.path())
+            .unwrap_err();
+        assert!(format!("{error:#}").starts_with("SESSION_SOURCE_MISMATCH:"));
     }
 
     #[test]

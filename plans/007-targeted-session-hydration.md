@@ -23,8 +23,8 @@
 
 ## Related sessions
 
-- Add an explicit `session_relationships` table keyed by provider-native parent
-  and child identities. Codex related rollouts are resolved from native root
+- Add an explicit `session_relationships` table keyed by provider-native
+  parent-child session IDs. Codex related rollouts are resolved from native root
   session metadata and ingested without flattening child events or promoting
   child task prompts to human prompt history. Claude sidechain evidence remains
   attributed according to the existing parser until the provider exposes a

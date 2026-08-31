@@ -771,7 +771,11 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     assert_eq!(row.first_activity_ms, Some(1_750_000_600_000));
     assert_eq!(row.last_activity_ms, Some(1_750_000_700_000));
     assert_eq!(row.models, vec!["claude-sonnet".to_string()]);
-    assert_eq!(row.raw_path, None, "opencode sessions are not file-backed");
+    assert_eq!(
+        row.raw_path.as_deref(),
+        Some(home.path().join("opencode.db").to_string_lossy().as_ref()),
+        "opencode sessions retain their store provenance"
+    );
 
     let second = discover(&conn, home.path(), &only(&["opencode"]));
     assert_eq!(second.summary.skipped_unchanged, 1);

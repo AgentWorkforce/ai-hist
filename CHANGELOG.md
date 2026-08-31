@@ -11,7 +11,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
   mandatory Node-API engine.
 - Rust engine consumers must recompile for the scoped session API. Public
   catalog/discovery option, page, summary, and row structs now carry scope or
-  location data, and the native/catalog contract versions are now 3 and 2.
+  location data; that scoped-session change advanced the native/catalog
+  contract versions to 3 and 2 at the time.
   The legacy-named `list_sessions_local*` and `discover_sessions_local*`
   wrappers reject non-local options instead of silently rewriting them; use
   their `*_scoped*` counterparts for `remote` or `all`.
