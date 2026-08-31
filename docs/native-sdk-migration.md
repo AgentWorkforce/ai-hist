@@ -34,6 +34,28 @@ Every database API is now async. Remove `fallback`, `sourceKind`, `close`, and
 binary-path options. If the database is missing, read APIs return empty data;
 call `discoverSessions()` or `sync()` explicitly.
 
+Collection APIs, including statistics, now use a shared `scope` option: `'local'`, `'remote'`, or
+`'all'`; omitting it means `'local'`. The CLI equivalents are mutually
+exclusive `--local`, `--remote`, and `--all` flags. Local and remote rows live
+in one ledger and represent presences of the same session, so `all` is
+deduplicated. Direct session and event lookup does not take a scope. Remote
+discovery and sync remain unsupported until provider connectors ship; `all`
+acquisition runs all currently configured adapters.
+
+The acquisition result's `scope` echoes what was requested. It is not an
+"executed connector locations" list: `all` currently executes local adapters
+only. Use each returned session's `locations` for observed presences. Search,
+recent, and direct-session history rows also carry `locations`;
+`resumeCommand()` returns `null` when those locations are remote-only.
+
+Rust embedders must also update and recompile. Catalog/discovery option, page,
+summary, and row structs gained scope/location fields. The local-named wrapper
+functions now reject a non-local option instead of silently coercing it; call
+the corresponding `*_scoped*` API for `remote` or `all`. Human CLI parsers must
+account for a locations column in catalog rows, a scope line in statistics,
+and requested/executed wording in discovery summaries. Remote-only matches do
+not produce a local resume command.
+
 Replace unbounded event reads with a page or async iterator:
 
 ```ts

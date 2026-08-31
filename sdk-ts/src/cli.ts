@@ -4,12 +4,19 @@ import { readFile } from 'node:fs/promises';
 
 import {
   discoverSessions, getSession, getSessionEventsPage, listSessionCatalogPage,
-  recent, search, stats, sync, type CatalogCursor,
+  recent, search, stats, sync, type CatalogCursor, type SessionScope,
 } from './index.js';
 
 type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
 
 type PackageMetadata = { version?: string };
+
+const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-warning', 'remote', 'version']);
+const VALUE_FLAGS = new Set([
+  'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
+  'project', 'source', 'tag',
+]);
+const KNOWN_FLAGS = new Set([...BOOLEAN_FLAGS, ...VALUE_FLAGS]);
 
 function versionTriple(value: string): [number, number, number] | null {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(value);
@@ -57,14 +64,37 @@ function parse(argv: string[]): Parsed {
   const flags = new Map<string, Array<string | true>>();
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    if (arg === '-V') {
+      flags.set('version', [...(flags.get('version') ?? []), true]);
+      continue;
+    }
     if (!arg.startsWith('--')) { positional.push(arg); continue; }
     const [name, inline] = arg.slice(2).split('=', 2);
-    if (inline !== undefined) { flags.set(name, [...(flags.get(name) ?? []), inline]); continue; }
+    if (!KNOWN_FLAGS.has(name)) usage(`unknown option '--${name}'`);
+    if (inline !== undefined && BOOLEAN_FLAGS.has(name)) usage(`--${name} does not take a value`);
+    if (inline !== undefined) {
+      if (inline === '') usage(`--${name} requires a value`);
+      flags.set(name, [...(flags.get(name) ?? []), inline]);
+      continue;
+    }
+    if (BOOLEAN_FLAGS.has(name)) {
+      const next = argv[i + 1];
+      if (next === 'true' || next === 'false') usage(`--${name} does not take a value`);
+      flags.set(name, [...(flags.get(name) ?? []), true]);
+      continue;
+    }
     const next = argv[i + 1];
     if (next && !next.startsWith('-')) { flags.set(name, [...(flags.get(name) ?? []), next]); i++; }
-    else flags.set(name, [...(flags.get(name) ?? []), true]);
+    else usage(`--${name} requires a value`);
   }
   return { positional, flags };
+}
+
+function validateFlags(args: Parsed, command: string, allowed: readonly string[]): void {
+  const permitted = new Set([...allowed, 'no-warning']);
+  for (const name of args.flags.keys()) {
+    if (!permitted.has(name)) usage(`${command} does not accept --${name}`);
+  }
 }
 
 function textFlag(args: Parsed, name: string): string | undefined {
@@ -84,9 +114,31 @@ function numberFlag(args: Parsed, name: string): number | undefined {
   return parsed;
 }
 
+function scopeFlag(args: Parsed): SessionScope {
+  const selected = (['local', 'remote', 'all'] as const).filter((scope) => args.flags.has(scope));
+  for (const scope of selected) {
+    if (args.flags.get(scope)?.some((value) => value !== true)) {
+      usage(`--${scope} does not take a value`);
+    }
+  }
+  if (selected.length > 1) usage('--local, --remote, and --all are mutually exclusive');
+  return selected[0] ?? 'local';
+}
+
+function rejectScopeFlag(args: Parsed, command: string): void {
+  if (['local', 'remote', 'all'].some((scope) => args.flags.has(scope))) {
+    usage(`${command} addresses a session by identity and does not accept --local, --remote, or --all`);
+  }
+}
+
+function rejectSurplusPositionals(values: string[], command: string): void {
+  if (values.length > 0) usage(`${command} does not accept positional argument '${values[0]}'`);
+}
+
 function common(args: Parsed) {
   return {
     dbPath: textFlag(args, 'db'),
+    scope: scopeFlag(args),
     source: textFlag(args, 'source') as never,
     project: textFlag(args, 'project'),
     tag: textFlag(args, 'tag'),
@@ -108,7 +160,8 @@ function wireValue(value: unknown): unknown {
 function humanLine(value: unknown): string {
   if (!value || typeof value !== 'object') return String(value);
   const row = value as Record<string, unknown>;
-  return [row.timestampMs ?? row.lastActivityMs ?? '', row.source ?? '', row.sessionId ?? '', row.project ?? row.cwd ?? '', row.prompt ?? row.firstPrompt ?? '']
+  const locations = Array.isArray(row.locations) ? `[${row.locations.join(',')}]` : '';
+  return [row.timestampMs ?? row.lastActivityMs ?? '', row.source ?? '', locations, row.sessionId ?? '', row.project ?? row.cwd ?? '', row.prompt ?? row.firstPrompt ?? '']
     .filter((item) => item !== '' && item != null)
     .join('  ');
 }
@@ -131,16 +184,17 @@ function output(value: unknown, json: boolean): void {
   }
 }
 
-function usage(): never {
+function usage(message?: string): never {
+  if (message) process.stderr.write(`ai-hist: ${message}\n\n`);
   process.stderr.write(`Usage:
-  ai-hist sessions list [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
-  ai-hist sessions discover [--source SOURCE] [--limit N] [--json]
-  ai-hist search QUERY... [--source SOURCE] [--project PATH] [--limit N] [--json]
-  ai-hist recent [N] [--source SOURCE] [--project PATH] [--json]
+  ai-hist sessions list [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
+  ai-hist sessions discover [--local | --remote | --all] [--source SOURCE] [--limit N] [--json]
+  ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--limit N] [--json]
+  ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--json]
   ai-hist session SESSION_ID [--source SOURCE] [--json]
   ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
-  ai-hist stats [--json]
-  ai-hist sync [--db PATH] [--json]
+  ai-hist stats [--local | --remote | --all] [--json]
+  ai-hist sync [--local | --remote | --all] [--db PATH] [--json]
 `);
   process.exit(2);
 }
@@ -163,7 +217,11 @@ function catalogCursorFlag(args: Parsed): CatalogCursor | undefined {
 function outputDiscovery(value: Awaited<ReturnType<typeof discoverSessions>>, json: boolean): void {
   if (!json) {
     for (const session of value.sessions) process.stdout.write(`${humanLine(session)}\n`);
-    process.stdout.write(`${value.sessions.length} session(s): ${value.discovered} discovered, ${value.skippedUnchanged} unchanged\n`);
+    process.stdout.write(
+      `${value.sessions.length} session(s): ${value.discovered} discovered, ${value.skippedUnchanged} unchanged ` +
+      `(${value.counters.filesOpened} file(s) opened, ${value.counters.shallowReads} shallow read(s)); ` +
+      `requested scope: ${value.scope}, connector locations run: local\n`,
+    );
     return;
   }
   for (const session of value.sessions) output({ type: 'session', ...session }, true);
@@ -175,7 +233,8 @@ function outputDiscovery(value: Awaited<ReturnType<typeof discoverSessions>>, js
 
 async function main(): Promise<void> {
   const rawArgs = process.argv.slice(2);
-  if (rawArgs.includes('--version') || rawArgs.includes('-V')) {
+  const versionArgs = rawArgs.filter((arg) => arg !== '--no-warning');
+  if (versionArgs.length === 1 && (versionArgs[0] === '--version' || versionArgs[0] === '-V')) {
     const version = await packageVersion();
     process.stdout.write(`ai-hist ${version}\n`);
     await maybePrintUpdateNotice(version, rawArgs);
@@ -186,47 +245,78 @@ async function main(): Promise<void> {
   const json = args.flags.has('json');
 
   if (command === 'sessions' && subcommand === 'list') {
+    validateFlags(args, 'sessions list', [
+      'after', 'after-ms', 'after-session-id', 'after-source', 'all', 'before-ms', 'db',
+      'json', 'limit', 'local', 'remote', 'source',
+    ]);
+    rejectSurplusPositionals(rest, 'sessions list');
     const sources = textFlags(args, 'source');
     output(await listSessionCatalogPage({
-      dbPath: textFlag(args, 'db'), sources: sources.length ? sources as never : undefined,
+      dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sources: sources.length ? sources as never : undefined,
       limit: numberFlag(args, 'limit'), beforeMs: numberFlag(args, 'before-ms'),
       after: catalogCursorFlag(args),
     }), json);
     return;
   }
   if (command === 'sessions' && subcommand === 'discover') {
+    validateFlags(args, 'sessions discover', ['all', 'db', 'json', 'limit', 'local', 'remote', 'source']);
+    rejectSurplusPositionals(rest, 'sessions discover');
     const sources = textFlags(args, 'source');
     outputDiscovery(await discoverSessions({
-      dbPath: textFlag(args, 'db'), sources: sources.length ? sources as never : undefined,
+      dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sources: sources.length ? sources as never : undefined,
       limit: numberFlag(args, 'limit'),
     }), json);
     return;
   }
   if (command === 'search') {
+    validateFlags(args, 'search', [
+      'all', 'before-ms', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag',
+    ]);
     if (!subcommand) usage();
     output(await search([subcommand, ...rest].join(' '), { ...common(args), rawFts: args.flags.has('fts') }), json);
     return;
   }
   if (command === 'recent') {
+    validateFlags(args, 'recent', [
+      'all', 'before-ms', 'db', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag',
+    ]);
+    rejectSurplusPositionals(rest, 'recent');
     const fallback = subcommand ? Number(subcommand) : undefined;
+    if (fallback !== undefined && !Number.isFinite(fallback)) usage(`recent count must be a number (got '${subcommand}')`);
     output(await recent({ ...common(args), limit: numberFlag(args, 'limit') ?? fallback }), json);
     return;
   }
   if (command === 'session') {
+    validateFlags(args, 'session', ['all', 'db', 'json', 'local', 'remote', 'source', 'tag']);
     if (!subcommand) usage();
+    rejectSurplusPositionals(rest, 'session');
+    rejectScopeFlag(args, 'session');
     output(await getSession(subcommand, { dbPath: textFlag(args, 'db'), source: textFlag(args, 'source') as never, tag: textFlag(args, 'tag') }), json);
     return;
   }
   if (command === 'events') {
+    validateFlags(args, 'events', ['after', 'all', 'db', 'json', 'limit', 'local', 'remote', 'source']);
     if (!subcommand) usage();
+    rejectSurplusPositionals(rest, 'events');
+    rejectScopeFlag(args, 'events');
     output(await getSessionEventsPage(subcommand, {
       dbPath: textFlag(args, 'db'), source: textFlag(args, 'source') as never,
       limit: numberFlag(args, 'limit'), after: cursorFlag(args),
     }), json);
     return;
   }
-  if (command === 'stats') { output(await stats({ dbPath: textFlag(args, 'db'), tag: textFlag(args, 'tag') }), json); return; }
-  if (command === 'sync') { output(await sync({ dbPath: textFlag(args, 'db') }), json); return; }
+  if (command === 'stats') {
+    validateFlags(args, 'stats', ['all', 'db', 'json', 'local', 'remote', 'tag']);
+    rejectSurplusPositionals([subcommand, ...rest].filter((value): value is string => value !== undefined), 'stats');
+    output(await stats({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args), tag: textFlag(args, 'tag') }), json);
+    return;
+  }
+  if (command === 'sync') {
+    validateFlags(args, 'sync', ['all', 'db', 'json', 'local', 'remote']);
+    rejectSurplusPositionals([subcommand, ...rest].filter((value): value is string => value !== undefined), 'sync');
+    output(await sync({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args) }), json);
+    return;
+  }
   usage();
 }
 

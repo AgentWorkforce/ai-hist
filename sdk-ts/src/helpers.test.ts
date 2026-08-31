@@ -22,9 +22,9 @@ test('defaultDbPath follows native environment precedence', () => {
 });
 
 test('resumeCommand preserves source and project-aware commands', () => {
-  assert.equal(resumeCommand({ source: 'claude', sessionId: 's1', project: '/work/app' }), 'cd /work/app && claude --resume s1');
-  assert.equal(resumeCommand({ source: 'codex', sessionId: 's2', project: null }), 'codex resume s2');
-  assert.equal(resumeCommand({ source: 'cursor', sessionId: 's3', project: '/work/app' }), 'cd /work/app && cursor-agent --resume=s3');
-  assert.equal(resumeCommand({ source: 'grok', sessionId: 's4', project: null }), 'grok resume s4');
-  assert.equal(resumeCommand({ source: 'relay', sessionId: 's5', project: null }), null);
+  assert.equal(resumeCommand({ source: 'claude', sessionId: 's1', project: '/work/app', locations: [] }), 'cd /work/app && claude --resume s1');
+  assert.equal(resumeCommand({ source: 'codex', sessionId: 's2', project: null, locations: ['local'] }), 'codex resume s2');
+  assert.equal(resumeCommand({ source: 'cursor', sessionId: 's3', project: '/work/app', locations: ['local', 'remote'] }), 'cd /work/app && cursor-agent --resume=s3');
+  assert.equal(resumeCommand({ source: 'grok', sessionId: 's4', project: null, locations: ['remote'] }), null);
+  assert.equal(resumeCommand({ source: 'relay', sessionId: 's5', project: null, locations: ['local'] }), null);
 });

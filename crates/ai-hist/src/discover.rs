@@ -60,9 +60,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use ai_hist_core::SOURCE_CHOICES;
+use ai_hist_core::{upsert_session_presence, SessionLocation, SessionScope, SOURCE_CHOICES};
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, DatabaseName, OpenFlags};
+use rusqlite::{params, Connection, DatabaseName, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -70,7 +70,7 @@ use serde_json::Value;
 ///
 /// Bumped when the shape or meaning of [`ShallowSession`] / the CLI JSON
 /// payloads changes in a way a consumer must notice.
-pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 1;
+pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 2;
 
 /// Version of the shallow scanners themselves.
 ///
@@ -144,6 +144,10 @@ pub struct ShallowSession {
     pub source_stamp: Option<String>,
     /// `"shallow"` (catalog row only) or `"full"` (full evidence ingested).
     pub discovery_state: String,
+    /// Places where this logical provider session is known to exist.
+    /// A session may be present both locally and remotely while remaining one
+    /// catalog row.
+    pub locations: Vec<String>,
     /// `true` when this row was served from the catalog without re-reading the
     /// provider source — either a cache-only list, or a rescan whose stamp
     /// matched.
@@ -1413,7 +1417,17 @@ fn file_candidates(
 const SESSION_COLUMNS: &str = "source, session_id, cwd, git_branch, first_activity_ms, \
      last_activity_ms, first_prompt, last_assistant_text, models_json, originator, \
      agent_version, repo_url, initial_commit, workspace_roots_json, raw_path, source_stamp, \
-     discovery_state";
+     discovery_state, \
+     CASE \
+       WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
+        AND EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote') \
+       THEN '[\"local\",\"remote\"]' \
+       WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote') \
+       THEN '[\"remote\"]' \
+       WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
+       THEN '[\"local\"]' \
+       ELSE '[]' \
+     END";
 
 fn json_string_list(raw: Option<String>) -> Vec<String> {
     raw.and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
@@ -1441,6 +1455,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShallowSession> {
         discovery_state: row
             .get::<_, Option<String>>(16)?
             .unwrap_or_else(|| "full".to_string()),
+        locations: json_string_list(row.get(17)?),
         from_cache: true,
     })
 }
@@ -1466,6 +1481,8 @@ pub struct CatalogCursor {
 /// Options for the cache-only catalog listing.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogListOptions {
+    /// Which presences to include. Defaults to local for compatibility.
+    pub scope: SessionScope,
     /// Restrict to these sources. Empty means every discoverable source.
     pub sources: Vec<String>,
     /// Row cap; defaults to [`DEFAULT_CATALOG_LIMIT`].
@@ -1482,6 +1499,8 @@ pub struct CatalogListOptions {
 /// One page of the catalog plus the cursor that continues it.
 #[derive(Debug, Clone, Default)]
 pub struct SessionCatalogPage {
+    /// Scope applied to this cache-only page.
+    pub scope: SessionScope,
     /// The rows, newest first.
     pub sessions: Vec<ShallowSession>,
     /// Pass as [`CatalogListOptions::after`] for the next page. `None` when
@@ -1496,6 +1515,16 @@ pub struct SessionCatalogPage {
 fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     let mut sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE source <> 'trajectory'");
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    match options.scope {
+        SessionScope::Local => sql.push_str(
+            " AND (EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
+               OR NOT EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id))",
+        ),
+        SessionScope::Remote => sql.push_str(
+            " AND EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote')",
+        ),
+        SessionScope::All => {}
+    }
     if !options.sources.is_empty() {
         let placeholders = vec!["?"; options.sources.len()].join(", ");
         sql.push_str(&format!(" AND source IN ({placeholders})"));
@@ -1585,6 +1614,7 @@ pub fn list_session_catalog_page(
             session_id: row.session_id.clone(),
         });
     Ok(SessionCatalogPage {
+        scope: options.scope,
         sessions,
         next_cursor,
     })
@@ -1601,16 +1631,59 @@ fn fetch_catalog_row(
         .ok())
 }
 
+fn fetch_catalog_row_at_location(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    location: SessionLocation,
+) -> Result<Option<ShallowSession>> {
+    let Some(mut row) = fetch_catalog_row(conn, source, session_id)? else {
+        return Ok(None);
+    };
+    let location = match location {
+        SessionLocation::Local => "local",
+        SessionLocation::Remote => "remote",
+    };
+    let presence = conn
+        .query_row(
+            "SELECT raw_locator, source_stamp FROM session_presences \
+             WHERE source = ? AND session_id = ? AND location = ?",
+            params![source, session_id, location],
+            |result| {
+                Ok((
+                    result.get::<_, Option<String>>(0)?,
+                    result.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((raw_locator, source_stamp)) = presence else {
+        return Ok(None);
+    };
+    row.raw_path = raw_locator;
+    row.source_stamp = source_stamp;
+    Ok(Some(row))
+}
+
 fn fetch_catalog_row_by_path(
     conn: &Connection,
     source: &str,
     raw_path: &str,
 ) -> Result<Option<ShallowSession>> {
-    let sql =
-        format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE source = ? AND raw_path = ? LIMIT 1");
-    Ok(conn
-        .query_row(&sql, params![source, raw_path], row_to_session)
-        .ok())
+    let session_id = conn
+        .query_row(
+            "SELECT session_id FROM session_presences \
+             WHERE location = 'local' AND source = ? AND raw_locator = ? LIMIT 1",
+            params![source, raw_path],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    match session_id {
+        Some(session_id) => {
+            fetch_catalog_row_at_location(conn, source, &session_id, SessionLocation::Local)
+        }
+        None => Ok(None),
+    }
 }
 
 /// Whether this source was already examined at this exact stamp and found not
@@ -1672,6 +1745,29 @@ fn now_ms() -> i64 {
 /// `'full'`. A shallow rescan of such a row still refreshes its metadata and
 /// stamp.
 pub fn upsert_shallow_session(conn: &Connection, session: &ShallowSession) -> Result<()> {
+    upsert_shallow_session_at_location(conn, session, SessionLocation::Local)
+}
+
+/// Upsert shallow canonical metadata and connector-specific presence state.
+pub fn upsert_shallow_session_at_location(
+    conn: &Connection,
+    session: &ShallowSession,
+    location: SessionLocation,
+) -> Result<()> {
+    if conn.is_autocommit() {
+        let transaction = conn.unchecked_transaction()?;
+        upsert_shallow_session_in_transaction(&transaction, session, location)?;
+        transaction.commit()?;
+        return Ok(());
+    }
+    upsert_shallow_session_in_transaction(conn, session, location)
+}
+
+fn upsert_shallow_session_in_transaction(
+    conn: &Connection,
+    session: &ShallowSession,
+    location: SessionLocation,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO sessions \
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, \
@@ -1722,6 +1818,15 @@ pub fn upsert_shallow_session(conn: &Connection, session: &ShallowSession) -> Re
             session.source_stamp,
         ],
     )?;
+    upsert_session_presence(
+        conn,
+        &session.source,
+        &session.session_id,
+        location,
+        session.raw_path.as_deref(),
+        session.source_stamp.as_deref(),
+        Some(&session.discovery_state),
+    )?;
     Ok(())
 }
 
@@ -1732,6 +1837,8 @@ pub fn upsert_shallow_session(conn: &Connection, session: &ShallowSession) -> Re
 /// Options for one discovery run.
 #[derive(Debug, Clone, Default)]
 pub struct DiscoverOptions {
+    /// Provider-presence scope. Defaults to local for compatibility.
+    pub scope: SessionScope,
     /// Restrict to these sources. Empty means every adapter.
     pub sources: Vec<String>,
     /// Global cap on emitted rows, applied across providers by recency.
@@ -1768,6 +1875,8 @@ pub struct ProviderSummary {
 pub struct DiscoverySummary {
     /// [`SESSION_CATALOG_CONTRACT_VERSION`].
     pub contract_version: u32,
+    /// Scope selected for this discovery run.
+    pub scope: SessionScope,
     /// Rows freshly read and upserted.
     pub discovered: usize,
     /// Rows served from the catalog on an unchanged stamp.
@@ -1812,7 +1921,21 @@ fn stored_stamp(raw: &str) -> String {
     format!("v{SHALLOW_SCANNER_VERSION}:{raw}")
 }
 
+/// Reject an acquisition scope for which no connector is configured.
+///
+/// Call this before opening the ledger so an unsupported remote-only request
+/// has no database side effects.
+pub fn validate_discovery_scope(scope: SessionScope) -> Result<()> {
+    if scope == SessionScope::Remote {
+        anyhow::bail!(
+            "remote session discovery is not available: no remote provider connectors are configured"
+        );
+    }
+    Ok(())
+}
+
 fn select_providers(options: &DiscoverOptions) -> Result<Vec<Box<dyn ShallowSessionProvider>>> {
+    validate_discovery_scope(options.scope)?;
     for source in &options.sources {
         if let Some(exempt) = DISCOVERY_EXEMPTIONS
             .iter()
@@ -1868,6 +1991,7 @@ pub fn discover_sessions_with_env(
     let providers = select_providers(options)?;
     let mut summary = DiscoverySummary {
         contract_version: SESSION_CATALOG_CONTRACT_VERSION,
+        scope: options.scope,
         exempt_sources: DISCOVERY_EXEMPTIONS.to_vec(),
         ..Default::default()
     };
@@ -1949,7 +2073,12 @@ pub fn discover_sessions_with_env(
             };
             let expected = stored_stamp(&candidate.stamp);
             let cached = match candidate.session_id.as_deref() {
-                Some(session_id) => fetch_catalog_row(conn, candidate.source, session_id)?,
+                Some(session_id) => fetch_catalog_row_at_location(
+                    conn,
+                    candidate.source,
+                    session_id,
+                    SessionLocation::Local,
+                )?,
                 None => fetch_catalog_row_by_path(conn, candidate.source, &candidate.locator)?,
             };
             if let Some(cached) =

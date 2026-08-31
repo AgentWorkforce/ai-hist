@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
-  DatabaseOpenError, NativeContractMismatchError, listSessionCatalogPage, recent, stats,
-  validateNativeContract,
+  DatabaseOpenError, NativeContractMismatchError, UnsupportedOperationError, discoverSessions,
+  listSessionCatalogPage, recent, stats, sync, validateNativeContract, validateNativeScope,
 } from './index.js';
 
 test('missing database reads are explicit empty cache operations', async () => {
@@ -13,11 +13,11 @@ test('missing database reads are explicit empty cache operations', async () => {
   const dbPath = join(root, 'missing', 'history.db');
   try {
     assert.deepEqual(await listSessionCatalogPage({ dbPath, limit: 20 }), {
-      contractVersion: 1, sessions: [], nextCursor: null,
+      contractVersion: 2, scope: 'local', sessions: [], nextCursor: null,
     });
     assert.deepEqual(await recent({ dbPath, limit: 20 }), []);
     assert.deepEqual(await stats({ dbPath }), {
-      total: 0, bySource: {}, byProject: [], firstTimestampMs: null, lastTimestampMs: null,
+      scope: 'local', total: 0, bySource: {}, byProject: [], firstTimestampMs: null, lastTimestampMs: null,
     });
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -29,8 +29,34 @@ test('SDK/native contract mismatch is actionable', () => {
     () => validateNativeContract(999),
     (error: unknown) => error instanceof NativeContractMismatchError
       && error.code === 'NATIVE_CONTRACT_MISMATCH'
-      && /requires native contract 2/.test(error.message),
+      && /requires native contract 3/.test(error.message),
   );
+  assert.throws(
+    () => validateNativeScope('cloud'),
+    (error: unknown) => error instanceof NativeContractMismatchError
+      && error.code === 'NATIVE_CONTRACT_MISMATCH'
+      && /invalid session scope/.test(error.message),
+  );
+});
+
+test('unsupported remote acquisition has one stable SDK error', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-unsupported-remote-'));
+  const dbPath = join(root, 'history.db');
+  try {
+    for (const operation of [
+      () => discoverSessions({ dbPath, scope: 'remote' }),
+      () => sync({ dbPath, scope: 'remote' }),
+    ]) {
+      await assert.rejects(
+        operation(),
+        (error: unknown) => error instanceof UnsupportedOperationError
+          && error.code === 'UNSUPPORTED_OPERATION'
+          && error.message.includes('no remote provider connectors are configured'),
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('database open failures use the stable SDK error', async () => {

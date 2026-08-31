@@ -11,9 +11,10 @@ import {
 } from './index.js';
 
 const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
-const WRITE = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
+const LOCAL_WRITE = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
 const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode']);
 const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode']);
+const SESSION_SCOPE = z.enum(['local', 'remote', 'all']);
 const packageVersion = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
 ).version as string;
@@ -37,27 +38,31 @@ async function call(operation: () => Promise<unknown>) {
 
 server.tool('search_history', 'Search already-indexed RelayHistory prompts.', {
   query: z.string(), source: SOURCE.optional(), project: z.string().optional(), tag: z.string().optional(),
+  scope: SESSION_SCOPE.optional().default('local'),
   limit: z.number().int().min(1).max(1000).optional().default(20),
-}, READ, ({ query, source, project, tag, limit }) => call(() => search(query, { source, project, tag, limit })));
+}, READ, ({ query, source, project, tag, scope, limit }) => call(() => search(query, { source, project, tag, scope, limit })));
 
 server.tool('recent_history', 'List recent already-indexed history.', {
   source: SOURCE.optional(), project: z.string().optional(), tag: z.string().optional(),
+  scope: SESSION_SCOPE.optional().default('local'),
   n: z.number().int().min(1).max(1000).optional().default(20),
   before_ms: z.number().int().optional(),
-}, READ, ({ source, project, tag, n, before_ms }) => call(() => recent({ source, project, tag, limit: n, beforeMs: before_ms })));
+}, READ, ({ source, project, tag, scope, n, before_ms }) => call(() => recent({ source, project, tag, scope, limit: n, beforeMs: before_ms })));
 
 server.tool('list_sessions', 'Cache-only indexed session catalog listing. This never discovers or syncs.', {
   sources: z.array(CATALOG_SOURCE).optional(), limit: z.number().int().min(1).max(1000).optional().default(20),
+  scope: SESSION_SCOPE.optional().default('local'),
   before_ms: z.number().int().optional(),
   after: z.object({ lastActivityMs: z.number().int().nullable().optional(), source: z.string(), sessionId: z.string() }).optional(),
-}, READ, ({ sources, limit, before_ms, after }) => call(() => listSessionCatalogPage({
-  sources, limit, beforeMs: before_ms,
+}, READ, ({ sources, scope, limit, before_ms, after }) => call(() => listSessionCatalogPage({
+  sources, scope, limit, beforeMs: before_ms,
   after: after ? { ...after, lastActivityMs: after.lastActivityMs ?? null } : undefined,
 })));
 
 server.tool('discover_sessions', 'Explicit shallow provider discovery. Updates only the session catalog.', {
   sources: z.array(CATALOG_SOURCE).optional(), limit: z.number().int().min(1).max(10000).optional(),
-}, WRITE, (args) => call(() => discoverSessions(args)));
+  scope: SESSION_SCOPE.optional().default('local'),
+}, LOCAL_WRITE, (args) => call(() => discoverSessions(args)));
 
 server.tool('get_session', 'Get indexed prompts for one session.', {
   session_id: z.string(), source: SOURCE.optional(), tag: z.string().optional(),
@@ -69,9 +74,12 @@ server.tool('get_session_events', 'Get one bounded page of normalized events.', 
 }, READ, ({ session_id, source, limit, after }) => call(() => getSessionEventsPage(session_id, { source, limit, after })));
 
 server.tool('history_stats', 'Statistics for already-indexed RelayHistory data.', {
+  scope: SESSION_SCOPE.optional().default('local'),
   tag: z.string().optional(),
-}, READ, ({ tag }) => call(() => stats({ tag })));
+}, READ, ({ scope, tag }) => call(() => stats({ scope, tag })));
 
-server.tool('sync', 'Explicit full provider ingestion into RelayHistory.', {}, WRITE, () => call(() => sync()));
+server.tool('sync', 'Explicit full provider ingestion into RelayHistory.', {
+  scope: SESSION_SCOPE.optional().default('local'),
+}, LOCAL_WRITE, ({ scope }) => call(() => sync({ scope })));
 
 await server.connect(new StdioServerTransport());

@@ -11,7 +11,7 @@
 //! listing performs no file I/O at all.
 
 use super::*;
-use ai_hist_core::init_db;
+use ai_hist_core::{init_db, mark_session_presence, upsert_session_presence};
 use std::fs;
 use std::time::{Duration, SystemTime};
 
@@ -150,6 +150,7 @@ fn only(sources: &[&str]) -> DiscoverOptions {
     DiscoverOptions {
         sources: sources.iter().map(|s| s.to_string()).collect(),
         limit: None,
+        ..Default::default()
     }
 }
 
@@ -924,6 +925,7 @@ fn the_limit_is_global_not_per_provider() {
         &DiscoverOptions {
             sources: Vec::new(),
             limit: Some(3),
+            ..Default::default()
         },
     );
     assert_eq!(
@@ -1011,6 +1013,7 @@ fn bounded_reads_do_not_grow_with_the_size_of_the_archive() {
     let limited = DiscoverOptions {
         sources: Vec::new(),
         limit: Some(2),
+        ..Default::default()
     };
     let baseline = discover(&conn, small.path(), &limited);
 
@@ -1117,6 +1120,137 @@ fn the_cache_only_listing_survives_the_provider_files_disappearing() {
 }
 
 #[test]
+fn catalog_scope_filters_presences_without_duplicating_dual_sessions() {
+    let conn = catalog();
+    for (id, recency) in [
+        ("legacy-local", 400),
+        ("local-only", 300),
+        ("remote-only", 200),
+        ("dual", 100),
+    ] {
+        seed_row(&conn, "codex", id, Some(recency));
+    }
+    conn.execute(
+        "DELETE FROM session_presences WHERE source = 'codex' AND session_id IN ('legacy-local', 'remote-only')",
+        [],
+    )
+    .unwrap();
+    mark_session_presence(&conn, "codex", "local-only", SessionLocation::Local).unwrap();
+    mark_session_presence(&conn, "codex", "remote-only", SessionLocation::Remote).unwrap();
+    upsert_session_presence(
+        &conn,
+        "codex",
+        "remote-only",
+        SessionLocation::Remote,
+        Some("cloud://remote-only"),
+        Some("v1:remote-stamp"),
+        Some("shallow"),
+    )
+    .unwrap();
+    mark_session_presence(&conn, "codex", "dual", SessionLocation::Local).unwrap();
+    mark_session_presence(&conn, "codex", "dual", SessionLocation::Remote).unwrap();
+
+    let ids = |scope| {
+        list_session_catalog(
+            &conn,
+            &CatalogListOptions {
+                scope,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.session_id, row.locations))
+        .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        ids(SessionScope::Local),
+        vec![
+            ("legacy-local".into(), vec![]),
+            ("local-only".into(), vec!["local".into()]),
+            ("dual".into(), vec!["local".into(), "remote".into()]),
+        ]
+    );
+    assert_eq!(
+        ids(SessionScope::Remote),
+        vec![
+            ("remote-only".into(), vec!["remote".into()]),
+            ("dual".into(), vec!["local".into(), "remote".into()]),
+        ]
+    );
+    assert_eq!(
+        ids(SessionScope::All),
+        vec![
+            ("legacy-local".into(), vec![]),
+            ("local-only".into(), vec!["local".into()]),
+            ("remote-only".into(), vec!["remote".into()]),
+            ("dual".into(), vec!["local".into(), "remote".into()]),
+        ]
+    );
+
+    assert!(
+        fetch_catalog_row_at_location(&conn, "codex", "remote-only", SessionLocation::Local,)
+            .unwrap()
+            .is_none()
+    );
+    let remote_cache =
+        fetch_catalog_row_at_location(&conn, "codex", "remote-only", SessionLocation::Remote)
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        remote_cache.raw_path.as_deref(),
+        Some("cloud://remote-only")
+    );
+    assert_eq!(
+        remote_cache.source_stamp.as_deref(),
+        Some("v1:remote-stamp")
+    );
+}
+
+#[test]
+fn remote_shallow_upsert_rolls_back_canonical_row_when_presence_write_fails() {
+    let conn = catalog();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_remote_presence BEFORE INSERT ON session_presences
+         WHEN NEW.location = 'remote'
+         BEGIN SELECT RAISE(ABORT, 'injected remote presence failure'); END;",
+    )
+    .unwrap();
+    let session = ShallowSession {
+        source: "codex".into(),
+        session_id: "remote-atomic".into(),
+        first_prompt: Some("remote prompt".into()),
+        raw_path: Some("cloud://remote-atomic".into()),
+        source_stamp: Some("v1:remote".into()),
+        discovery_state: "shallow".into(),
+        ..Default::default()
+    };
+
+    let error = upsert_shallow_session_at_location(&conn, &session, SessionLocation::Remote)
+        .expect_err("presence failure must abort the canonical upsert");
+    assert!(error
+        .to_string()
+        .contains("injected remote presence failure"));
+    let session_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source = 'codex' AND session_id = 'remote-atomic'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let presence_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_presences WHERE source = 'codex' AND session_id = 'remote-atomic'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(session_count, 0);
+    assert_eq!(presence_count, 0);
+}
+
+#[test]
 fn the_catalog_query_reads_only_the_sessions_table() {
     let (sql, _) = catalog_list_query(&CatalogListOptions::default());
     assert!(sql.contains("FROM sessions"), "{sql}");
@@ -1143,6 +1277,7 @@ fn trajectory_rows_never_appear_in_a_session_listing() {
         [],
     )
     .unwrap();
+    mark_session_presence(&conn, "claude", "claude-1", SessionLocation::Local).unwrap();
     let rows = list_session_catalog(&conn, &CatalogListOptions::default()).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].source, "claude");
@@ -1156,12 +1291,7 @@ fn the_catalog_listing_filters_by_source_and_paginates_by_recency() {
         ("claude", "c2", 200),
         ("codex", "x1", 250),
     ] {
-        conn.execute(
-            "INSERT INTO sessions (session_id, source, last_activity_ms, discovery_state) \
-             VALUES (?, ?, ?, 'shallow')",
-            params![id, source, ts],
-        )
-        .unwrap();
+        seed_row(&conn, source, id, Some(ts));
     }
     let claude_only = list_session_catalog(
         &conn,
@@ -1207,6 +1337,7 @@ fn seed_row(conn: &Connection, source: &str, session_id: &str, last: Option<i64>
         params![session_id, source, last],
     )
     .unwrap();
+    mark_session_presence(conn, source, session_id, SessionLocation::Local).unwrap();
 }
 
 /// Walk the whole catalog one page at a time and assert the walk is a
@@ -1415,6 +1546,7 @@ fn the_catalog_listing_is_served_by_an_index_not_a_table_scan() {
         limit: Some(10),
         before_ms: Some(1),
         after: None,
+        ..Default::default()
     });
     assert!(
         filtered.contains("idx_sessions_source_recency") && !filtered.contains("TEMP B-TREE"),
@@ -1558,6 +1690,7 @@ fn non_session_candidates_do_not_consume_limit_slots() {
         &DiscoverOptions {
             sources: vec!["codex".into()],
             limit: Some(2),
+            ..Default::default()
         },
     );
     assert_eq!(
@@ -1578,7 +1711,8 @@ fn bumping_the_scanner_version_invalidates_stored_stamps() {
     discover(&conn, home.path(), &only(&["claude"]));
     // Simulate a database stamped by an older scanner generation.
     conn.execute(
-        "UPDATE sessions SET source_stamp = 'v0:stale' WHERE session_id = 'claude-1'",
+        "UPDATE session_presences SET source_stamp = 'v0:stale' \
+         WHERE location = 'local' AND session_id = 'claude-1'",
         [],
     )
     .unwrap();

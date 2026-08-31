@@ -6,9 +6,10 @@ use ai_hist_core::{
     session_file_edits, session_tool_calls, sync_opencode_db, untag_session, HistoryEntry,
     QueryFilter, SourceDatabaseError, SOURCE_CHOICES,
 };
+pub use ai_hist_core::{SessionLocation, SessionScope};
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -31,11 +32,12 @@ mod learn;
 
 pub use discover::{
     discover_sessions, discover_sessions_collect, discover_sessions_with_env, list_session_catalog,
-    list_session_catalog_page, shallow_providers, AllProvidersFailed, Candidate, CatalogCursor,
-    CatalogListOptions, DiscoverOptions, DiscoveryCounters, DiscoveryDiagnostic, DiscoveryEnv,
-    DiscoverySummary, ProviderSummary, ScanEnv, SessionCatalogPage, ShallowReadAccess,
-    ShallowSession, ShallowSessionProvider, SourceExemption, DEFAULT_CATALOG_LIMIT,
-    DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION, SHALLOW_SCANNER_VERSION,
+    list_session_catalog_page, shallow_providers, validate_discovery_scope, AllProvidersFailed,
+    Candidate, CatalogCursor, CatalogListOptions, DiscoverOptions, DiscoveryCounters,
+    DiscoveryDiagnostic, DiscoveryEnv, DiscoverySummary, ProviderSummary, ScanEnv,
+    SessionCatalogPage, ShallowReadAccess, ShallowSession, ShallowSessionProvider, SourceExemption,
+    DEFAULT_CATALOG_LIMIT, DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION,
+    SHALLOW_SCANNER_VERSION,
 };
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -80,6 +82,34 @@ pub fn sync_local() -> Result<()> {
 pub fn sync_local_at(db_path: &Path) -> Result<bool> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
     sync_exclusive(db_path)
+}
+
+/// Full ingestion for a selected scope into the default database.
+pub fn sync_scoped(scope: SessionScope) -> Result<bool> {
+    sync_scoped_at(&default_db_path(), scope)
+}
+
+/// Full ingestion for a selected session-presence scope.
+///
+/// Remote provider connectors are intentionally a capability boundary. Until
+/// one is configured, remote-only ingestion fails loudly; `all` runs every
+/// available connector, which currently means the local registry.
+pub fn sync_scoped_at(db_path: &Path, scope: SessionScope) -> Result<bool> {
+    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    sync_scope_exclusive(db_path, scope)
+}
+
+fn sync_scope_exclusive(db_path: &Path, scope: SessionScope) -> Result<bool> {
+    validate_sync_scope(scope)?;
+    sync_exclusive(db_path)
+}
+
+fn validate_sync_scope(scope: SessionScope) -> Result<()> {
+    anyhow::ensure!(
+        scope != SessionScope::Remote,
+        "remote session sync is not available: no remote provider connectors are configured"
+    );
+    Ok(())
 }
 
 /// Sync local agent history into the DB, then push new records to
@@ -146,8 +176,28 @@ pub fn list_sessions_local_at(
     db_path: &Path,
     options: &CatalogListOptions,
 ) -> Result<SessionCatalogPage> {
+    anyhow::ensure!(
+        options.scope == SessionScope::Local,
+        "list_sessions_local_at only accepts local scope; use list_sessions_scoped_at for remote or all"
+    );
+    list_sessions_scoped_at(db_path, options)
+}
+
+/// Cache-only catalog listing for an explicit session-presence scope.
+pub fn list_sessions_scoped(options: &CatalogListOptions) -> Result<SessionCatalogPage> {
+    list_sessions_scoped_at(&default_db_path(), options)
+}
+
+/// Scoped cache-only catalog listing against an explicitly selected database.
+pub fn list_sessions_scoped_at(
+    db_path: &Path,
+    options: &CatalogListOptions,
+) -> Result<SessionCatalogPage> {
     if !db_path.exists() {
-        return Ok(SessionCatalogPage::default());
+        return Ok(SessionCatalogPage {
+            scope: options.scope,
+            ..Default::default()
+        });
     }
     let conn = match open_db_readonly(db_path) {
         Ok(conn) if schema_is_catalog_read_current(&conn).unwrap_or(false) => conn,
@@ -174,8 +224,64 @@ pub fn discover_sessions_local_at(
     db_path: &Path,
     options: &DiscoverOptions,
 ) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
+    anyhow::ensure!(
+        options.scope == SessionScope::Local,
+        "discover_sessions_local_at only accepts local scope; use discover_sessions_scoped_at for remote or all"
+    );
     let conn = open_db(db_path)?;
     discover_sessions_collect(&conn, options)
+}
+
+/// Scoped discovery into the default database.
+pub fn discover_sessions_scoped(
+    options: &DiscoverOptions,
+) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
+    discover_sessions_scoped_at(&default_db_path(), options)
+}
+
+/// Scoped discovery into an explicitly selected database.
+pub fn discover_sessions_scoped_at(
+    db_path: &Path,
+    options: &DiscoverOptions,
+) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
+    validate_discovery_scope(options.scope)?;
+    let conn = open_db(db_path)?;
+    discover_sessions_collect(&conn, options)
+}
+
+#[derive(Args, Debug, Clone, Copy, Default)]
+#[group(id = "session_scope", multiple = false)]
+struct SessionScopeArgs {
+    /// Request/select sessions with a local presence (default).
+    #[arg(long, group = "session_scope")]
+    local: bool,
+    /// Request/select sessions with a remote provider presence.
+    #[arg(long, group = "session_scope")]
+    remote: bool,
+    /// Request/select the deduplicated union of local and remote presences.
+    #[arg(long, group = "session_scope")]
+    all: bool,
+}
+
+impl SessionScopeArgs {
+    fn resolve(self) -> SessionScope {
+        if self.remote {
+            SessionScope::Remote
+        } else if self.all {
+            SessionScope::All
+        } else {
+            SessionScope::Local
+        }
+    }
+
+    fn service_args(self) -> Vec<String> {
+        match self.resolve() {
+            SessionScope::Local if self.local => vec!["--local".to_string()],
+            SessionScope::Local => Vec::new(),
+            SessionScope::Remote => vec!["--remote".to_string()],
+            SessionScope::All => vec!["--all".to_string()],
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -196,6 +302,8 @@ struct Cli {
 enum Command {
     /// Search prompts and sessions.
     Search {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         query: Vec<String>,
         #[arg(long)]
         source: Option<String>,
@@ -220,6 +328,8 @@ enum Command {
     },
     /// Show recent history entries.
     Recent {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         #[arg(default_value_t = 20)]
         n: i64,
         #[arg(long)]
@@ -267,8 +377,10 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         window: i64,
     },
-    /// Show local history statistics.
+    /// Show history statistics.
     Stats {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         #[arg(long)]
         tag: Option<String>,
         #[arg(long)]
@@ -305,6 +417,8 @@ enum Command {
     },
     /// Print a resume command for the best matching session.
     Resume {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         #[arg(required = true)]
         query: Vec<String>,
         /// Pass the query through as a raw FTS5 MATCH expression. Operators such as
@@ -319,8 +433,10 @@ enum Command {
         #[arg(long)]
         opencode_db: Option<PathBuf>,
     },
-    /// Sync local agent history into the relayhistory database.
+    /// Sync agent history using the requested configured connectors.
     Sync {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         /// Install a background service (launchd on macOS, cron on Linux) that
         /// runs `sync` on an interval so the database stays fresh automatically.
         #[arg(long)]
@@ -333,8 +449,10 @@ enum Command {
         #[arg(long, default_value_t = 60)]
         interval: u64,
     },
-    /// Repeatedly sync local agent history.
+    /// Repeatedly sync agent history using the requested configured connectors.
     Watch {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         #[arg(long, default_value_t = 60)]
         interval: u64,
     },
@@ -345,6 +463,8 @@ enum Command {
     },
     /// Build a compact context pack from matching history.
     Pack {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         #[arg(required = true)]
         query: Vec<String>,
         #[arg(long)]
@@ -515,6 +635,8 @@ enum SessionsAction {
     /// tool calls: one indexed query over `sessions`. Run `sessions discover`
     /// first to populate a fresh database.
     List {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         /// Restrict to a source (repeatable). Defaults to every discoverable source.
         #[arg(long)]
         source: Vec<String>,
@@ -548,12 +670,17 @@ enum SessionsAction {
         #[arg(long)]
         json: bool,
     },
-    /// Discover sessions from provider locations with bounded reads.
+    /// Discover sessions from the requested provider locations with bounded reads.
     ///
     /// Enumerates every provider, orders candidates globally by recency, reads
     /// only what the catalog needs, and upserts rows as it goes. Sources whose
     /// bytes have not changed since the last run are served from the catalog.
+    /// The summary `scope` echoes the request; it is not a list of connector
+    /// locations that ran. Remote connectors are not configured yet, so
+    /// `--remote` is unsupported and `--all` currently runs local adapters.
     Discover {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         /// Restrict to a source (repeatable). Defaults to every discoverable source.
         #[arg(long)]
         source: Vec<String>,
@@ -732,19 +859,27 @@ pub fn run() -> Result<()> {
     // wait on SQLite before contention is detected.
     match &cli.command {
         Command::Sync {
+            scope,
             install_service,
             uninstall_service,
             interval,
         } => {
             if *install_service {
-                return install_managed_service(&SYNC_SERVICE, *interval, &[]);
+                validate_sync_scope(scope.resolve())?;
+                return install_managed_service(&SYNC_SERVICE, *interval, &scope.service_args());
             }
             if *uninstall_service {
                 return uninstall_managed_service(&SYNC_SERVICE);
             }
-            return sync_exclusive(&db_path).map(|_| ());
+            return sync_scope_exclusive(&db_path, scope.resolve()).map(|_| ());
         }
-        Command::Watch { interval } => return watch_loop(&db_path, *interval),
+        Command::Watch { scope, interval } => {
+            validate_sync_scope(scope.resolve())?;
+            return watch_loop(&db_path, *interval, scope.resolve());
+        }
+        Command::Sessions {
+            action: SessionsAction::Discover { scope, .. },
+        } => validate_discovery_scope(scope.resolve())?,
         Command::SyncOpencode { opencode_db } => {
             let source = opencode_db.clone().unwrap_or_else(default_opencode_db_path);
             return sync_opencode_exclusive(&db_path, &source).map(|_| ());
@@ -763,6 +898,7 @@ pub fn run() -> Result<()> {
 
     match cli.command {
         Command::Search {
+            scope,
             query,
             source,
             project,
@@ -781,6 +917,7 @@ pub fn run() -> Result<()> {
                 &query,
                 fts,
                 &QueryFilter {
+                    scope: scope.resolve(),
                     source,
                     project,
                     tag,
@@ -800,6 +937,7 @@ pub fn run() -> Result<()> {
             print_search_rows(rows, json)
         }
         Command::Recent {
+            scope,
             n,
             source,
             project,
@@ -810,6 +948,7 @@ pub fn run() -> Result<()> {
             let rows = recent(
                 &conn,
                 &QueryFilter {
+                    scope: scope.resolve(),
                     source,
                     project,
                     tag,
@@ -862,6 +1001,7 @@ pub fn run() -> Result<()> {
         Command::Context { id, window } => show_context(&conn, id, window),
         Command::Doctor { json } => doctor(&db_path, json),
         Command::Pack {
+            scope,
             query,
             source,
             project,
@@ -876,6 +1016,7 @@ pub fn run() -> Result<()> {
                 &conn,
                 query,
                 QueryFilter {
+                    scope: scope.resolve(),
                     source,
                     project,
                     tag,
@@ -887,7 +1028,9 @@ pub fn run() -> Result<()> {
                 json,
             )
         }
-        Command::Stats { tag, json } => print_stats(&conn, tag.as_deref(), json),
+        Command::Stats { scope, tag, json } => {
+            print_stats(&conn, scope.resolve(), tag.as_deref(), json)
+        }
         Command::Tag {
             session_id,
             tag_name,
@@ -950,12 +1093,19 @@ pub fn run() -> Result<()> {
             sessions,
             json,
         } => print_tags(&conn, tag.as_deref(), sessions, json),
-        Command::Resume { query, fts, json } => {
+        Command::Resume {
+            scope,
+            query,
+            fts,
+            json,
+        } => {
+            let requested_scope = scope.resolve();
             let rows = search(
                 &conn,
                 &query,
                 fts,
                 &QueryFilter {
+                    scope: requested_scope,
                     limit: 1,
                     ..Default::default()
                 },
@@ -964,13 +1114,26 @@ pub fn run() -> Result<()> {
                 .into_iter()
                 .find(|e| e.session_id.as_ref().is_some_and(|s| !s.is_empty()));
             if let Some(entry) = entry {
-                let cmd = resume_command(&entry);
+                let (locations, cmd) = local_resume_details(&conn, &entry)?;
+                let locally_available =
+                    locations.is_empty() || locations.iter().any(|location| location == "local");
                 if json {
                     let mut out = entry_output(&entry);
                     out["resume_cmd"] = json!(cmd);
+                    out["scope"] = json!(requested_scope);
+                    out["locations"] = json!(locations);
+                    if !locally_available {
+                        out["resume_unavailable_reason"] =
+                            json!("session is remote-only; materialize it locally before resuming");
+                    }
                     println!("{}", out);
                 } else if let Some(cmd) = cmd {
                     println!("{cmd}");
+                } else if !locally_available {
+                    anyhow::bail!(
+                        "Session {} is remote-only and cannot be resumed locally; materialize it locally first.",
+                        entry.session_id.as_deref().unwrap_or("(unknown)")
+                    );
                 } else {
                     anyhow::bail!("No resume command available for source '{}'", entry.source);
                 }
@@ -1026,7 +1189,7 @@ pub fn run() -> Result<()> {
                     !dry_run,
                     "`ai-hist import --watch` cannot be combined with --dry-run"
                 );
-                watch_loop(&db_path, interval)
+                watch_loop(&db_path, interval, SessionScope::Local)
             } else {
                 let file = file.context("`ai-hist import` requires FILE unless --watch is set")?;
                 import_history(&conn, &file, dry_run)
@@ -1316,6 +1479,7 @@ pub fn run() -> Result<()> {
         },
         Command::Sessions { action } => match action {
             SessionsAction::List {
+                scope,
                 source,
                 limit,
                 before_ms,
@@ -1346,6 +1510,7 @@ pub fn run() -> Result<()> {
                 let page = list_session_catalog_page(
                     &conn,
                     &CatalogListOptions {
+                        scope: scope.resolve(),
                         sources: source,
                         limit,
                         before_ms,
@@ -1355,10 +1520,11 @@ pub fn run() -> Result<()> {
                 print_session_catalog(&page, json)
             }
             SessionsAction::Discover {
+                scope,
                 source,
                 limit,
                 json,
-            } => run_session_discovery(&conn, source, limit, json),
+            } => run_session_discovery(&conn, scope.resolve(), source, limit, json),
         },
     }
 }
@@ -1367,7 +1533,7 @@ pub fn run() -> Result<()> {
 ///
 /// The JSON form is one object, not a bare array, so the contract version and
 /// the pagination cursor travel with the payload:
-/// `{"contract_version":1,"sessions":[…],"next_cursor":{…}|null}`. Feed
+/// `{"contract_version":2,"scope":"local","sessions":[…],"next_cursor":{…}|null}`. Feed
 /// `next_cursor` back as `--after-ms/--after-source/--after-session-id` to get
 /// the next page; it is null once the catalog is exhausted.
 fn print_session_catalog(page: &SessionCatalogPage, as_json: bool) -> Result<()> {
@@ -1377,6 +1543,7 @@ fn print_session_catalog(page: &SessionCatalogPage, as_json: bool) -> Result<()>
             "{}",
             json!({
                 "contract_version": SESSION_CATALOG_CONTRACT_VERSION,
+                "scope": page.scope,
                 "sessions": rows,
                 "next_cursor": page.next_cursor,
             })
@@ -1424,9 +1591,10 @@ fn fmt_session_row(row: &ShallowSession) -> String {
             }
         })
         .unwrap_or_default();
+    let locations = row.locations.join(",");
     format!(
-        "  {when}  {:<8} {:<8} {:<38} {cwd}  {prompt}",
-        row.source, row.discovery_state, row.session_id
+        "  {when}  {:<8} {:<12} {:<8} {:<38} {cwd}  {prompt}",
+        row.source, locations, row.discovery_state, row.session_id
     )
 }
 
@@ -1438,11 +1606,16 @@ fn fmt_session_row(row: &ShallowSession) -> String {
 /// not change the exit code; only an every-provider failure does.
 fn run_session_discovery(
     conn: &Connection,
+    scope: SessionScope,
     sources: Vec<String>,
     limit: Option<usize>,
     as_json: bool,
 ) -> Result<()> {
-    let options = DiscoverOptions { sources, limit };
+    let options = DiscoverOptions {
+        scope,
+        sources,
+        limit,
+    };
     let mut count = 0usize;
     let outcome = discover_sessions(conn, &options, |session| {
         count += 1;
@@ -1503,17 +1676,26 @@ fn run_session_discovery(
         println!("{payload}");
     } else {
         println!(
-            "  {count} session(s): {} discovered, {} unchanged ({} file(s) opened, {} shallow read(s))",
+            "  {count} session(s): {} discovered, {} unchanged ({} file(s) opened, {} shallow read(s)); requested scope: {}, connector locations run: local",
             summary.discovered,
             summary.skipped_unchanged,
             summary.counters.files_opened,
-            summary.counters.shallow_reads
+            summary.counters.shallow_reads,
+            session_scope_label(summary.scope),
         );
     }
     if let Some(failure) = failure {
         return Err(failure);
     }
     Ok(())
+}
+
+fn session_scope_label(scope: SessionScope) -> &'static str {
+    match scope {
+        SessionScope::Local => "local",
+        SessionScope::Remote => "remote",
+        SessionScope::All => "all",
+    }
 }
 
 /// Best-effort `git remote get-url origin` for project scoping (None if not a repo).
@@ -1770,6 +1952,39 @@ fn entry_output(row: &HistoryEntry) -> serde_json::Value {
     })
 }
 
+/// Locations recorded for an indexed history entry.
+///
+/// A missing presence remains an empty list. Callers that select local rows
+/// apply the legacy local fallback separately; output should report observed
+/// presences, not invent one.
+fn entry_locations(conn: &Connection, entry: &HistoryEntry) -> Result<Vec<String>> {
+    let Some(session_id) = entry.session_id.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare(
+        "SELECT location FROM session_presences \
+         WHERE source = ? AND session_id = ? \
+         ORDER BY CASE location WHEN 'local' THEN 0 ELSE 1 END",
+    )?;
+    let locations = stmt
+        .query_map(params![entry.source, session_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(locations)
+}
+
+fn local_resume_details(
+    conn: &Connection,
+    entry: &HistoryEntry,
+) -> Result<(Vec<String>, Option<String>)> {
+    let locations = entry_locations(conn, entry)?;
+    // A zero-presence row is legacy local evidence. Keep that compatibility
+    // fallback for behavior without claiming an observed location in output.
+    let locally_available =
+        locations.is_empty() || locations.iter().any(|location| location == "local");
+    let command = locally_available.then(|| resume_command(entry)).flatten();
+    Ok((locations, command))
+}
+
 fn fmt_row(row: &HistoryEntry, verbose: bool) -> String {
     let dt = Local
         .timestamp_millis_opt(row.timestamp_ms)
@@ -1820,7 +2035,7 @@ fn validate_source(source: Option<&str>) -> Result<()> {
 
 fn show_entry(conn: &Connection, id: i64, as_json: bool) -> Result<()> {
     let entry = get_entry(conn, id)?;
-    let resume = resume_command(&entry);
+    let (locations, resume) = local_resume_details(conn, &entry)?;
     let session_count: Option<i64> = if let Some(session_id) = &entry.session_id {
         Some(conn.query_row(
             "SELECT COUNT(*) FROM history WHERE source = ? AND session_id = ?",
@@ -1838,6 +2053,7 @@ fn show_entry(conn: &Connection, id: i64, as_json: bool) -> Result<()> {
     if as_json {
         let mut out = entry_output(&entry);
         out["resume_cmd"] = json!(resume);
+        out["locations"] = json!(locations);
         out["session_count"] = json!(session_count);
         out["tags"] = json!(tags);
         println!("{out}");
@@ -1927,13 +2143,18 @@ fn show_context(conn: &Connection, id: i64, window_minutes: i64) -> Result<()> {
     Ok(())
 }
 
-fn print_stats(conn: &Connection, tag: Option<&str>, as_json: bool) -> Result<()> {
+fn print_stats(
+    conn: &Connection,
+    scope: SessionScope,
+    tag: Option<&str>,
+    as_json: bool,
+) -> Result<()> {
     let tag_norm = tag.map(normalize_tag_name);
-    let where_sql = if tag_norm.is_some() {
-        format!(" WHERE {}", tag_filter_clause("h"))
-    } else {
-        String::new()
-    };
+    let mut where_sql = " WHERE 1=1".to_string();
+    append_session_scope_filter(&mut where_sql, scope, "h");
+    if tag_norm.is_some() {
+        where_sql.push_str(&format!(" AND {}", tag_filter_clause("h")));
+    }
     let params_vec = tag_norm.iter().map(String::as_str).collect::<Vec<_>>();
     let total: i64 = conn.query_row(
         &format!("SELECT COUNT(*) FROM history h{where_sql}"),
@@ -1951,11 +2172,7 @@ fn print_stats(conn: &Connection, tag: Option<&str>, as_json: bool) -> Result<()
         .iter()
         .cloned()
         .collect::<serde_json::Map<_, _>>();
-    let project_where = if tag_norm.is_some() {
-        format!("WHERE project IS NOT NULL AND {}", tag_filter_clause("h"))
-    } else {
-        "WHERE project IS NOT NULL".to_string()
-    };
+    let project_where = format!("{where_sql} AND project IS NOT NULL");
     let top_projects = query_pairs(
         conn,
         &format!("SELECT project, COUNT(*) FROM history h {project_where} GROUP BY project ORDER BY COUNT(*) DESC LIMIT 10"),
@@ -1979,11 +2196,20 @@ fn print_stats(conn: &Connection, tag: Option<&str>, as_json: bool) -> Result<()
                 "first_timestamp_ms": first,
                 "last_timestamp_ms": last,
                 "tag": tag_norm,
+                "scope": scope,
             })
         );
         return Ok(());
     }
     println!("\nTotal entries: {total}");
+    println!(
+        "Scope: {}",
+        match scope {
+            SessionScope::Local => "local",
+            SessionScope::Remote => "remote",
+            SessionScope::All => "all",
+        }
+    );
     if let Some(tag) = tag_norm {
         println!("Tag filter: {tag}");
     }
@@ -2954,10 +3180,10 @@ fn prepare_sync_and_push_db(db_path: &Path) -> Result<(Connection, bool)> {
     Ok((conn, false))
 }
 
-fn watch_loop(db_path: &Path, interval: u64) -> Result<()> {
+fn watch_loop(db_path: &Path, interval: u64, scope: SessionScope) -> Result<()> {
     println!("Watching every {interval}s (Ctrl-C to stop)...");
     loop {
-        match sync_exclusive(db_path) {
+        match sync_scope_exclusive(db_path, scope) {
             Ok(_) => {}
             Err(err) => eprintln!("Error: {err:#}"),
         }
@@ -3418,6 +3644,12 @@ fn link_git_commit(
             Err(_) => {}
         }
     }
+    ai_hist_core::mark_session_presence(
+        conn,
+        &candidate.source,
+        &candidate.session_id,
+        SessionLocation::Local,
+    )?;
     conn.execute(
         "INSERT INTO session_commit_links \
          (source, session_id, repo, branch, commit_sha, note_ref, match_method, confidence, files_json, numstat_json, evidence_json, created_at_ms) \
@@ -3912,6 +4144,7 @@ fn append_history_search_filters(
     filter: &QueryFilter,
     alias: &str,
 ) {
+    append_session_scope_filter(sql, filter.scope, alias);
     if let Some(source) = &filter.source {
         sql.push_str(&format!(" AND {alias}.source = ?"));
         params.push(source.clone());
@@ -3933,6 +4166,7 @@ fn append_event_search_filters(
     alias: &str,
     role: SearchRole,
 ) {
+    append_session_scope_filter(sql, filter.scope, alias);
     if let Some(source) = &filter.source {
         sql.push_str(&format!(" AND {alias}.source = ?"));
         params.push(source.clone());
@@ -3949,6 +4183,26 @@ fn append_event_search_filters(
         SearchRole::All => {}
         SearchRole::User => sql.push_str(&format!(" AND {alias}.role = 'user'")),
         SearchRole::Assistant => sql.push_str(&format!(" AND {alias}.role = 'assistant'")),
+    }
+}
+
+/// Restrict a history/event query by where its canonical session is present.
+///
+/// Legacy rows with no session id or no classification are local so upgrading
+/// cannot make existing history disappear. Remote requires an explicit remote
+/// presence. `all` adds no predicate and therefore cannot multiply rows.
+fn append_session_scope_filter(sql: &mut String, scope: SessionScope, alias: &str) {
+    match scope {
+        SessionScope::Local => sql.push_str(&format!(
+            " AND ({alias}.session_id IS NULL \
+               OR EXISTS (SELECT 1 FROM session_presences p WHERE p.source = {alias}.source AND p.session_id = {alias}.session_id AND p.location = 'local') \
+               OR NOT EXISTS (SELECT 1 FROM session_presences p WHERE p.source = {alias}.source AND p.session_id = {alias}.session_id))"
+        )),
+        SessionScope::Remote => sql.push_str(&format!(
+            " AND {alias}.session_id IS NOT NULL \
+               AND EXISTS (SELECT 1 FROM session_presences p WHERE p.source = {alias}.source AND p.session_id = {alias}.session_id AND p.location = 'remote')"
+        )),
+        SessionScope::All => {}
     }
 }
 
@@ -4937,6 +5191,58 @@ fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) ->
 /// (session cwds, session branches, prompts inserted).
 type CodexRolloutWalk = (HashMap<String, String>, HashMap<String, String>, usize);
 
+/// Reconcile the catalog registration for a locally observed Codex subagent.
+///
+/// A local-only subagent stays out of the catalog. If the same canonical
+/// session was separately discovered remotely, its retained local events are
+/// also local evidence, so both presences and the canonical row must survive.
+fn cleanup_codex_subagent_registration(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM session_presences \
+         WHERE source = 'codex' AND session_id = ? AND location = 'local' \
+           AND NOT EXISTS (\
+             SELECT 1 FROM session_presences \
+             WHERE source = 'codex' AND session_id = ? AND location = 'remote'\
+           )",
+        params![session_id, session_id],
+    )?;
+    conn.execute(
+        "DELETE FROM sessions \
+         WHERE source = 'codex' AND session_id = ? \
+           AND NOT EXISTS (\
+             SELECT 1 FROM session_presences \
+             WHERE source = 'codex' AND session_id = ?\
+           )",
+        params![session_id, session_id],
+    )?;
+    Ok(())
+}
+
+fn codex_session_has_remote_presence(conn: &Connection, session_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(\
+           SELECT 1 FROM session_presences \
+           WHERE source = 'codex' AND session_id = ? AND location = 'remote'\
+         )",
+        [session_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+/// Remove prompt history that an older local sync incorrectly attributed to a
+/// subagent. A remote presence makes the history canonical shared evidence, so
+/// it must not be destroyed by a later local scan.
+fn cleanup_codex_subagent_history(conn: &Connection, session_id: &str) -> Result<()> {
+    if !codex_session_has_remote_presence(conn, session_id)? {
+        conn.execute(
+            "DELETE FROM history WHERE source = 'codex' AND session_id = ?",
+            [session_id],
+        )?;
+    }
+    Ok(())
+}
+
 fn sync_codex_rollouts(
     conn: &Connection,
     state: &mut Map<String, Value>,
@@ -4972,10 +5278,26 @@ fn sync_codex_rollouts(
                 .map(|r| r.get("stamp").and_then(Value::as_str) == Some(stamp.as_str()))
                 .unwrap_or(false);
             if stamp_unchanged {
-                match record
+                let recorded_session = record
                     .and_then(|r| r.get("session"))
-                    .and_then(Value::as_str)
+                    .and_then(Value::as_str);
+                if record
+                    .and_then(|r| r.get("subagent"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
                 {
+                    if let Some(session_id) = recorded_session {
+                        // The fast path must still repair state from an older
+                        // sync/migration. In particular, presence backfill can
+                        // recreate a local catalog registration from retained
+                        // subagent events without changing the rollout stamp.
+                        cwds.remove(session_id);
+                        branches.remove(session_id);
+                        cleanup_codex_subagent_history(conn, session_id)?;
+                        cleanup_codex_subagent_registration(conn, session_id)?;
+                    }
+                }
+                match recorded_session {
                     // No session id was recorded because the file had no
                     // usable session_meta; there is nothing to re-ingest.
                     None => continue,
@@ -4997,14 +5319,7 @@ fn sync_codex_rollouts(
                 // would resurrect the session row this walk refuses to create.
                 cwds.remove(&meta.session_id);
                 branches.remove(&meta.session_id);
-                conn.execute(
-                    "DELETE FROM history WHERE source = 'codex' AND session_id = ?",
-                    [meta.session_id.as_str()],
-                )?;
-                conn.execute(
-                    "DELETE FROM sessions WHERE source = 'codex' AND session_id = ?",
-                    [meta.session_id.as_str()],
-                )?;
+                cleanup_codex_subagent_history(conn, &meta.session_id)?;
             } else {
                 cwds.insert(meta.session_id.clone(), meta.cwd.clone());
                 if let Some(branch) = &meta.git_branch {
@@ -5012,9 +5327,27 @@ fn sync_codex_rollouts(
                 }
             }
             let outcome = if repair_user_messages {
-                repair_codex_rollout_user_messages(conn, &rollout, &meta)?
+                repair_codex_rollout_user_messages(conn, &rollout, &meta)
             } else {
-                ingest_codex_rollout(conn, &rollout, &meta)?
+                ingest_codex_rollout(conn, &rollout, &meta)
+            };
+            let cleanup = meta
+                .is_subagent
+                .then(|| cleanup_codex_subagent_registration(conn, &meta.session_id));
+            let outcome = match outcome {
+                Ok(outcome) => {
+                    if let Some(cleanup) = cleanup {
+                        cleanup?;
+                    }
+                    outcome
+                }
+                Err(error) => {
+                    // Cleanup was attempted above. Preserve the ingestion
+                    // failure as the primary diagnostic if both operations
+                    // fail, since it explains why this rollout made no
+                    // progress and is what a retry must address.
+                    return Err(error);
+                }
             };
             inserted += outcome.prompts;
             events += outcome.events;
@@ -5284,10 +5617,14 @@ fn repair_codex_rollout_user_messages(
          WHERE source = 'codex' AND session_id = ? AND role = 'user'",
         [meta.session_id.as_str()],
     )?;
-    tx.execute(
-        "DELETE FROM history WHERE source = 'codex' AND session_id = ?",
-        [meta.session_id.as_str()],
-    )?;
+    if meta.is_subagent {
+        cleanup_codex_subagent_history(&tx, &meta.session_id)?;
+    } else {
+        tx.execute(
+            "DELETE FROM history WHERE source = 'codex' AND session_id = ?",
+            [meta.session_id.as_str()],
+        )?;
+    }
     let outcome = ingest_codex_rollout(&tx, path, meta)?;
     tx.commit()?;
     Ok(outcome)
@@ -6255,6 +6592,7 @@ fn insert_session_event(
     token_json: Option<&str>,
     event_uid: &str,
 ) -> Result<()> {
+    ai_hist_core::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     conn.execute(
         "INSERT INTO session_events \
          (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
@@ -6296,6 +6634,7 @@ fn insert_tool_call(
     is_error: Option<bool>,
     ts_ms: i64,
 ) -> Result<()> {
+    ai_hist_core::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     conn.execute(
         "INSERT INTO tool_calls \
          (source, session_id, message_id, tool_use_id, name, target, args_json, is_error, ts_ms) \
@@ -6345,6 +6684,7 @@ fn upsert_file_edit_from_call(
     git_branch: Option<&str>,
     cwd: Option<&str>,
 ) -> Result<()> {
+    ai_hist_core::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     conn.execute(
         "INSERT INTO file_edits \
          (source, session_id, message_id, tool_use_id, file_path, tool_name, ts_ms, git_branch, cwd) \
@@ -6541,6 +6881,15 @@ fn upsert_session(
             last_assistant_text,
             raw_path,
         ],
+    )?;
+    ai_hist_core::upsert_session_presence(
+        conn,
+        source,
+        session_id,
+        SessionLocation::Local,
+        raw_path,
+        None,
+        Some("full"),
     )?;
     Ok(())
 }
@@ -8027,6 +8376,7 @@ mod tests {
     fn only_non_mutating_commands_get_a_read_only_handle() {
         // Reads must not take the write lock...
         assert!(super::is_read_only(&super::Command::Stats {
+            scope: super::SessionScopeArgs::default(),
             tag: None,
             json: false
         }));
@@ -8049,6 +8399,7 @@ mod tests {
         // ...and anything that writes must not get a read-only handle, or it
         // fails at runtime with "attempt to write a readonly database".
         assert!(!super::is_read_only(&super::Command::Sync {
+            scope: super::SessionScopeArgs::default(),
             install_service: false,
             uninstall_service: false,
             interval: 60,
@@ -8060,6 +8411,203 @@ mod tests {
             color: None,
             json: false,
         }));
+    }
+
+    #[test]
+    fn local_named_catalog_wrappers_reject_nonlocal_scope_without_touching_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("must-not-be-created.db");
+
+        let list_error = super::list_sessions_local_at(
+            &db,
+            &super::CatalogListOptions {
+                scope: super::SessionScope::Remote,
+                ..Default::default()
+            },
+        )
+        .expect_err("the local wrapper must not coerce a remote request");
+        assert!(list_error
+            .to_string()
+            .contains("use list_sessions_scoped_at"));
+        assert!(!db.exists());
+
+        let discover_error = super::discover_sessions_local_at(
+            &db,
+            &super::DiscoverOptions {
+                scope: super::SessionScope::All,
+                ..Default::default()
+            },
+        )
+        .expect_err("the local wrapper must not coerce an all-scope request");
+        assert!(discover_error
+            .to_string()
+            .contains("use discover_sessions_scoped_at"));
+        assert!(!db.exists());
+    }
+
+    #[test]
+    fn resume_requires_local_or_legacy_local_evidence() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let entry = HistoryEntry {
+            id: 1,
+            source: "codex".into(),
+            session_id: Some("cloud-session".into()),
+            project: None,
+            prompt: "continue".into(),
+            prompt_hash: None,
+            timestamp_ms: 1,
+        };
+
+        // Legacy rows without a presence retain the old local resume behavior,
+        // while output truthfully reports no observed location.
+        let (locations, command) = super::local_resume_details(&conn, &entry).unwrap();
+        assert!(locations.is_empty());
+        assert!(command.is_some());
+
+        ai_hist_core::mark_session_presence(
+            &conn,
+            "codex",
+            "cloud-session",
+            super::SessionLocation::Remote,
+        )
+        .unwrap();
+        let (locations, command) = super::local_resume_details(&conn, &entry).unwrap();
+        assert_eq!(locations, vec!["remote"]);
+        assert!(command.is_none());
+
+        ai_hist_core::mark_session_presence(
+            &conn,
+            "codex",
+            "cloud-session",
+            super::SessionLocation::Local,
+        )
+        .unwrap();
+        let (locations, command) = super::local_resume_details(&conn, &entry).unwrap();
+        assert_eq!(locations, vec!["local", "remote"]);
+        assert!(command.is_some());
+    }
+
+    #[test]
+    fn normalized_local_evidence_records_local_presence() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        super::insert_session_event(
+            &conn,
+            "claude",
+            "event-session",
+            None,
+            None,
+            None,
+            "message-1",
+            None,
+            1,
+            "user",
+            "text",
+            Some("hello"),
+            None,
+            None,
+            "event-1",
+        )
+        .unwrap();
+        super::insert_tool_call(
+            &conn,
+            "claude",
+            "tool-session",
+            "message-2",
+            "tool-1",
+            "Read",
+            Some("README.md"),
+            "{}",
+            None,
+            2,
+        )
+        .unwrap();
+        super::upsert_file_edit_from_call(
+            &conn,
+            "claude",
+            "edit-session",
+            "message-3",
+            "tool-2",
+            "src/lib.rs",
+            "Edit",
+            3,
+            None,
+            None,
+        )
+        .unwrap();
+
+        for session_id in ["event-session", "tool-session", "edit-session"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_presences \
+                     WHERE source = 'claude' AND session_id = ? AND location = 'local'",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing local presence for {session_id}");
+        }
+    }
+
+    #[test]
+    fn codex_subagent_cleanup_preserves_remote_session_and_local_evidence() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (source, session_id) VALUES ('codex', 'subagent')",
+            [],
+        )
+        .unwrap();
+        ai_hist_core::mark_session_presence(
+            &conn,
+            "codex",
+            "subagent",
+            super::SessionLocation::Local,
+        )
+        .unwrap();
+        ai_hist_core::mark_session_presence(
+            &conn,
+            "codex",
+            "subagent",
+            super::SessionLocation::Remote,
+        )
+        .unwrap();
+
+        super::cleanup_codex_subagent_registration(&conn, "subagent").unwrap();
+
+        let locations: Vec<String> = conn
+            .prepare(
+                "SELECT location FROM session_presences \
+                 WHERE source = 'codex' AND session_id = 'subagent' ORDER BY location",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(locations, vec!["local", "remote"]);
+        let session_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions \
+                 WHERE source = 'codex' AND session_id = 'subagent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_count, 1);
+
+        let local_page = super::list_session_catalog_page(
+            &conn,
+            &super::CatalogListOptions {
+                scope: super::SessionScope::Local,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(local_page.sessions.len(), 1);
+        assert_eq!(local_page.sessions[0].session_id, "subagent");
     }
 
     #[test]
@@ -8965,6 +9513,15 @@ mod tests {
         let evidence: Value = serde_json::from_str(&evidence).unwrap();
         assert_eq!(evidence["candidate"]["branch_match"], true);
         assert_eq!(evidence["candidate"]["file_overlap"], 1);
+        let local_presence: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_presences \
+                 WHERE source = 'claude' AND session_id = 's-link' AND location = 'local'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(local_presence, 1);
     }
 
     #[test]
@@ -9453,6 +10010,211 @@ mod tests {
             .query_row("SELECT text FROM session_events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(text, "first");
+    }
+
+    fn write_codex_subagent_rollout(path: &std::path::Path, session_id: &str) {
+        fs::write(
+            path,
+            format!(
+                concat!(
+                    r#"{{"timestamp":"2026-08-01T10:01:00.000Z","type":"session_meta","payload":{{"id":"{}","session_id":"parent","parent_thread_id":"parent","thread_source":"subagent","source":{{"subagent":{{"other":"guardian"}}}},"cwd":"/tmp/proj"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-08-01T10:01:01.000Z","type":"event_msg","payload":{{"type":"agent_message","message":"Reviewing."}}}}"#,
+                    "\n",
+                ),
+                session_id
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unchanged_subagent_state_still_repairs_migrated_local_catalog_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/08/01");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-unchanged-sub.jsonl");
+        write_codex_subagent_rollout(&rollout, "sess-unchanged-sub");
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) \
+             VALUES ('sess-unchanged-sub', 'codex', '/tmp/proj')",
+            [],
+        )
+        .unwrap();
+        ai_hist_core::mark_session_presence(
+            &conn,
+            "codex",
+            "sess-unchanged-sub",
+            super::SessionLocation::Local,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('codex', 'sess-unchanged-sub', 'stale task', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1')",
+            [],
+        )
+        .unwrap();
+
+        let key = rollout.to_string_lossy().to_string();
+        let mut state = Map::new();
+        state.insert(
+            "codex_rollouts_v4".into(),
+            json!({
+                (key): {
+                    "stamp": file_stamp(&rollout).unwrap(),
+                    "session": "sess-unchanged-sub",
+                    "subagent": true
+                }
+            }),
+        );
+        state.insert(
+            "codex_session_cwds".into(),
+            json!({"sess-unchanged-sub": "/tmp/proj"}),
+        );
+        state.insert(
+            "codex_session_branches".into(),
+            json!({"sess-unchanged-sub": "main"}),
+        );
+
+        let (cwds, branches, inserted) =
+            super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(inserted, 0);
+        assert!(!cwds.contains_key("sess-unchanged-sub"));
+        assert!(!branches.contains_key("sess-unchanged-sub"));
+        let stale_rows: i64 = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM sessions WHERE source='codex' AND session_id='sess-unchanged-sub') + \
+                   (SELECT COUNT(*) FROM session_presences WHERE source='codex' AND session_id='sess-unchanged-sub') + \
+                   (SELECT COUNT(*) FROM history WHERE source='codex' AND session_id='sess-unchanged-sub')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_rows, 0);
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE source='codex' AND session_id='sess-unchanged-sub'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+    }
+
+    #[test]
+    fn local_subagent_sync_preserves_history_for_a_remote_canonical_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/08/01");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-remote-sub.jsonl");
+        write_codex_subagent_rollout(&rollout, "sess-remote-sub");
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) \
+             VALUES ('sess-remote-sub', 'codex', '/remote/project')",
+            [],
+        )
+        .unwrap();
+        ai_hist_core::insert_history_at_location(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "codex".into(),
+                session_id: Some("sess-remote-sub".into()),
+                project: Some("/remote/project".into()),
+                prompt: "remote canonical prompt".into(),
+                prompt_hash: None,
+                timestamp_ms: 1,
+            },
+            super::SessionLocation::Remote,
+        )
+        .unwrap();
+
+        super::sync_codex_rollouts(&conn, &mut Map::new(), home).unwrap();
+
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history \
+                 WHERE source='codex' AND session_id='sess-remote-sub'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(prompts, vec!["remote canonical prompt"]);
+        let locations: Vec<String> = conn
+            .prepare(
+                "SELECT location FROM session_presences \
+                 WHERE source='codex' AND session_id='sess-remote-sub' ORDER BY location",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(locations, vec!["local", "remote"]);
+    }
+
+    #[test]
+    fn failed_subagent_ingest_still_cleans_local_catalog_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/08/01");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-failing-sub.jsonl");
+        write_codex_subagent_rollout(&rollout, "sess-failing-sub");
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source) VALUES ('sess-failing-sub', 'codex')",
+            [],
+        )
+        .unwrap();
+        ai_hist_core::mark_session_presence(
+            &conn,
+            "codex",
+            "sess-failing-sub",
+            super::SessionLocation::Local,
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_subagent_event \
+             BEFORE INSERT ON session_events \
+             BEGIN SELECT RAISE(FAIL, 'forced subagent ingest failure'); END;",
+        )
+        .unwrap();
+
+        let error = super::sync_codex_rollouts(&conn, &mut Map::new(), home)
+            .expect_err("the trigger must fail ingestion");
+        assert!(error.to_string().contains("forced subagent ingest failure"));
+        let stale_rows: i64 = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM sessions WHERE source='codex' AND session_id='sess-failing-sub') + \
+                   (SELECT COUNT(*) FROM session_presences WHERE source='codex' AND session_id='sess-failing-sub')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_rows, 0);
     }
 
     #[test]
