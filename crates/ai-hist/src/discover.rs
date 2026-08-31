@@ -78,7 +78,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 1;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 1;
+pub const SHALLOW_SCANNER_VERSION: u32 = 2;
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
@@ -892,19 +892,7 @@ impl ShallowSessionProvider for CodexProvider {
 }
 
 fn codex_substantive_prompt(value: &Value) -> Option<String> {
-    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
-        return None;
-    }
-    let payload = value.get("payload")?;
-    if payload.get("type").and_then(Value::as_str) != Some("user_message") {
-        return None;
-    }
-    let message = payload.get("message").and_then(Value::as_str)?;
-    let trimmed = message.trim();
-    if trimmed.is_empty() || crate::is_codex_control_context(trimmed) {
-        return None;
-    }
-    Some(excerpt(trimmed))
+    crate::codex::human_message(value).map(|message| excerpt(&message.text))
 }
 
 fn string_list(value: Option<&Value>) -> Vec<String> {
