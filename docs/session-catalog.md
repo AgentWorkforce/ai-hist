@@ -308,9 +308,12 @@ How each adapter works:
 - **opencode** — the SQLite store at `$OPENCODE_DB` (default
   `~/.local/share/opencode/opencode.db`). The database is snapshotted once per
   run with SQLite's backup API, exactly as the full sync does, so an in-flight
-  WAL never yields a torn read. Enumeration is one query over `session`; the
-  shallow read adds two bounded single-row lookups for the first user text part
-  and a model id, rather than the full session/message/part join the sync does.
+  WAL never yields a torn read. The snapshot stays open on one connection for
+  the whole run and — being a private throwaway copy — is indexed by
+  `session_id` up front when the live store isn't. Enumeration is one query
+  over `session`; the shallow read adds two bounded single-row seeks for the
+  first user text part and a model id, rather than the full
+  session/message/part join the sync does.
 - **relay** — a **network** source with no local transcript, and discovery must
   work offline. The adapter therefore derives rows only from `history` rows a
   previous `ai-hist sync` already stored locally; it opens no socket. If nothing
@@ -433,8 +436,10 @@ the schema is current: it cannot block the writer and cannot be blocked by it.
 The catalog lives in the existing `sessions` table, extended with
 `first_prompt`, `models_json`, `originator`, `agent_version`, `repo_url`,
 `initial_commit`, `workspace_roots_json`, `source_stamp` and `discovery_state`,
-plus the `idx_sessions_source_last`, `idx_sessions_raw_path`,
-`idx_sessions_recency` and `idx_sessions_source_recency` indexes. A companion
+plus the `idx_sessions_raw_path`, `idx_sessions_recency` and
+`idx_sessions_source_recency` indexes — every extra index on `sessions` is one
+more btree a discovery upsert must update, so only indexes a query actually
+reads exist. A companion
 `discovery_skips` table remembers sources already examined and found not to be
 sessions (a codex subagent thread, a Claude subagent sidecar), keyed by
 `(source, locator)` with the stamp, so a rescan costs a primary-key lookup

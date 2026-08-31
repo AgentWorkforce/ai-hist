@@ -78,3 +78,23 @@ Notable changes to the native `ai-hist` CLI are documented here.
   collapsed without removing intentionally repeated prompts.
 - Replace Python-based installer and end-to-end verification with shell,
   SQLite, Node.js, and the public Rust CLI interfaces.
+- The opencode adapter holds its snapshot open on one connection for the whole
+  run and indexes the private copy by `session_id` when the live store isn't,
+  so the per-session excerpt and model queries seek instead of scanning
+  `message` and `part` once per candidate. Cold shallow discovery of 1,000
+  opencode sessions into a fresh database runs in ~43 ms in the native
+  benchmark (was ~290 ms).
+- Shallow discovery's per-candidate catalog statements (candidate
+  classification, skip markers, the discovery upsert) execute through the
+  prepared-statement cache, and the upsert hands back the merged catalog row
+  via `RETURNING` instead of a second lookup. Discovery's catalog
+  transactions commit at WAL's NORMAL durability, scoped to each transaction
+  and restored before rows are emitted: discovery writes only catalog rows a
+  provider rescan reproduces, while user-created records (tags, commit
+  links) — including any an `on_row` callback writes through the same
+  connection — keep the database's default FULL durability.
+- `init_db` applies the schema in one transaction when the database needs it,
+  and takes no write lock at all when the schema is already current. The
+  unused `idx_sessions_cwd`, `idx_sessions_branch`, `idx_sessions_last`, and
+  `idx_sessions_source_last` indexes are dropped — nothing queries them, and
+  each was one more btree per catalog write.

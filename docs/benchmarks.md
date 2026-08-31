@@ -75,32 +75,32 @@ event queries against it.
 ## 2026-08-31 baseline
 
 Measured on macOS arm64 (Apple M2 Max) with Node.js 22.22.2 against a real
-3,131,932,672 byte RelayHistory database with an active WAL:
+3,151,933,440 byte RelayHistory database with an active WAL:
 
 | Operation | Time | Rows/work |
 |---|---:|---:|
-| cold shallow discovery | 13.94 ms | 20 rows |
-| cold shallow discovery | 18.26 ms | 100 rows |
-| cold shallow discovery | 79.66 ms | 1,000 rows |
-| unchanged shallow discovery | 4.36 ms | 20 rows; zero files opened |
-| unchanged shallow discovery | 5.11 ms | 100 rows; zero files opened |
-| unchanged shallow discovery | 17.26 ms | 1,000 rows; zero files opened |
-| cold->changed shallow discovery | 6.29 ms | 20 changed rows |
-| cold->changed shallow discovery | 12.58 ms | 100 changed rows |
-| cold->changed shallow discovery | 77.61 ms | 1,000 changed rows |
-| opencode cold shallow discovery | 13.61 ms | 20 rows |
-| opencode cold shallow discovery | 36.77 ms | 100 rows |
-| opencode cold shallow discovery | 284.92 ms | 1,000 rows |
-| opencode unchanged shallow discovery | 2.15 ms | 20 rows; zero shallow reads |
-| opencode unchanged shallow discovery | 6.61 ms | 100 rows; zero shallow reads |
-| opencode unchanged shallow discovery | 12.44 ms | 1,000 rows; zero shallow reads |
-| opencode cold->changed shallow discovery | 7.60 ms | 20 changed rows |
-| opencode cold->changed shallow discovery | 32.84 ms | 100 changed rows |
-| opencode cold->changed shallow discovery | 372.95 ms | 1,000 changed rows |
-| warm session events | 0.66 ms | 20 rows |
-| warm session events | 1.32 ms | 200 rows |
-| CLI startup + cold shallow discovery | 48.62 ms | 20 rows |
-| MCP cold shallow discovery | 20.02 ms | 20 rows |
+| cold shallow discovery | 9.19 ms | 20 rows |
+| cold shallow discovery | 10.29 ms | 100 rows |
+| cold shallow discovery | 47.67 ms | 1,000 rows |
+| unchanged shallow discovery | 4.72 ms | 20 rows; zero files opened |
+| unchanged shallow discovery | 5.69 ms | 100 rows; zero files opened |
+| unchanged shallow discovery | 17.69 ms | 1,000 rows; zero files opened |
+| cold->changed shallow discovery | 5.77 ms | 20 changed rows |
+| cold->changed shallow discovery | 9.43 ms | 100 changed rows |
+| cold->changed shallow discovery | 55.22 ms | 1,000 changed rows |
+| opencode cold shallow discovery | 6.94 ms | 20 rows |
+| opencode cold shallow discovery | 8.18 ms | 100 rows |
+| opencode cold shallow discovery | 43.76 ms | 1,000 rows |
+| opencode unchanged shallow discovery | 3.18 ms | 20 rows; zero shallow reads |
+| opencode unchanged shallow discovery | 3.33 ms | 100 rows; zero shallow reads |
+| opencode unchanged shallow discovery | 12.20 ms | 1,000 rows; zero shallow reads |
+| opencode cold->changed shallow discovery | 3.90 ms | 20 changed rows |
+| opencode cold->changed shallow discovery | 7.29 ms | 100 changed rows |
+| opencode cold->changed shallow discovery | 60.46 ms | 1,000 changed rows |
+| warm session events | 0.61 ms | 20 rows |
+| warm session events | 1.53 ms | 200 rows |
+| CLI startup + cold shallow discovery | 46.73 ms | 20 rows |
+| MCP cold shallow discovery | 16.23 ms | 20 rows |
 
 The event queries did not load or copy the 2.9 GiB database: Rust opened it
 directly and returned a bounded indexed page. Every opencode run, including
