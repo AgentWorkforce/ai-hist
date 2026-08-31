@@ -27,6 +27,14 @@ produces `0.6.1` and `minor` produces `0.7.0`. `custom_version` is available for
 an explicit version and overrides the selected bump type. Leave `dry_run`
 enabled to build and validate without publishing packages or creating a tag.
 
+Before a non-dry release publishes any package, the workflow verifies that the
+selected branch has not advanced and pushes a version-only commit containing
+the updated package manifests and lockfiles. This makes partial publication
+recovery deterministic and prevents a late non-fast-forward push from leaving
+published packages without source metadata. Dry runs never change the checked-in
+version baseline. After registry validation, the workflow creates the GitHub tag
+and Release from the persisted version commit.
+
 ## Supported matrix
 
 - Node.js: minimum 20; tested 20 and 22.
