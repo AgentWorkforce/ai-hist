@@ -1,7 +1,8 @@
 import { execFile, spawn } from 'node:child_process';
-import { appendFile, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { appendFile, copyFile, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { arch, cpus, platform, release, tmpdir } from 'node:os';
 import { dirname, extname, join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { performance } from 'node:perf_hooks';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -124,24 +125,32 @@ async function createDiscoveryFixture(home, count) {
   }
 }
 
-async function withHome(home, operation) {
-  const previousHome = process.env.HOME;
-  const previousProfile = process.env.USERPROFILE;
-  process.env.HOME = home;
-  process.env.USERPROFILE = home;
+async function withEnvironment(overrides, operation) {
+  const saved = {};
+  for (const [key, value] of Object.entries(overrides)) {
+    saved[key] = process.env[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   try {
     return await operation();
   } finally {
-    if (previousHome === undefined) delete process.env.HOME;
-    else process.env.HOME = previousHome;
-    if (previousProfile === undefined) delete process.env.USERPROFILE;
-    else process.env.USERPROFILE = previousProfile;
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 }
 
-async function discoverFixture(home, benchmarkDbPath, limit) {
+// OPENCODE_DB would point discovery past the fixture home at a real store.
+const withHome = (home, operation) => withEnvironment(
+  { HOME: home, USERPROFILE: home, OPENCODE_DB: undefined },
+  operation,
+);
+
+async function discoverFixture(home, benchmarkDbPath, source, limit) {
   return withHome(home, () => discoverSessions({
-    dbPath: benchmarkDbPath, sources: ['claude'], limit,
+    dbPath: benchmarkDbPath, sources: [source], limit,
   }));
 }
 
@@ -175,37 +184,123 @@ async function restoreFixtureSessions(originals) {
   }
 }
 
+// The minimal subset of opencode's store that discovery reads: sessions carry
+// the change stamp, and message/part rows feed the excerpt and model queries.
+async function createOpencodeFixture(home, count) {
+  const databasePath = join(home, '.local', 'share', 'opencode', 'opencode.db');
+  await mkdir(dirname(databasePath), { recursive: true });
+  const db = new DatabaseSync(databasePath);
+  try {
+    db.exec(
+      'CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER, time_updated INTEGER);'
+      + 'CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);'
+      + 'CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);',
+    );
+    const insertSession = db.prepare('INSERT INTO session VALUES (?, ?, ?, ?)');
+    const insertMessage = db.prepare('INSERT INTO message VALUES (?, ?, ?, ?)');
+    const insertPart = db.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)');
+    const baseTimestamp = Date.UTC(2026, 0, 1);
+    db.exec('BEGIN');
+    for (let index = 0; index < count; index++) {
+      const sessionId = `benchmark-oc-${String(index).padStart(4, '0')}`;
+      const timestampMs = baseTimestamp + index * 1_000;
+      insertSession.run(sessionId, '/benchmark/project', timestampMs, timestampMs);
+      insertMessage.run(`m-${index}`, sessionId, timestampMs, '{"role":"user","modelID":"benchmark-model"}');
+      insertPart.run(`p-${index}`, `m-${index}`, sessionId, timestampMs, JSON.stringify({ type: 'text', text: `benchmark prompt ${index}` }));
+    }
+    db.exec('COMMIT');
+  } finally {
+    db.close();
+  }
+  return databasePath;
+}
+
+// A changed opencode session is a bumped `time_updated` stamp plus a new
+// assistant message, mirroring the appended record in the Claude fixture.
+// Restoration is a byte copy of the pristine store, not reversed rows: a
+// DELETE leaves the inserted pages on the freelist, so later cases would
+// snapshot a larger store than the one the first cold case measured.
+function changeOpencodeSessions(databasePath, sessions) {
+  const timestampMs = Date.now();
+  const db = new DatabaseSync(databasePath);
+  try {
+    const bumpStamp = db.prepare('UPDATE session SET time_updated = ? WHERE id = ?');
+    const insertMessage = db.prepare('INSERT INTO message VALUES (?, ?, ?, ?)');
+    const insertPart = db.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)');
+    db.exec('BEGIN');
+    for (const session of sessions) {
+      bumpStamp.run(timestampMs, session.sessionId);
+      insertMessage.run(`changed-m-${session.sessionId}`, session.sessionId, timestampMs, '{"role":"assistant","modelID":"benchmark-model"}');
+      insertPart.run(`changed-p-${session.sessionId}`, `changed-m-${session.sessionId}`, session.sessionId, timestampMs, '{"type":"text","text":"changed benchmark response"}');
+    }
+    db.exec('COMMIT');
+  } finally {
+    db.close();
+  }
+}
+
+function discoveryMeasurement(measurement) {
+  return {
+    name: measurement.name,
+    ms: measurement.ms,
+    rows: measurement.value.sessions.length,
+    counters: measurement.value.counters,
+  };
+}
+
+async function measureDiscoveryScaling({ prefix, source, home, temporary, change, restore }) {
+  const coldResults = [];
+  const unchangedResults = [];
+  const changedResults = [];
+  for (const limit of discoveryLimits) {
+    const coldDb = join(temporary, `${source}-cold-${limit}.db`);
+    coldResults.push(discoveryMeasurement(await timed(
+      `${prefix}cold shallow discovery ${limit}`,
+      () => discoverFixture(home, coldDb, source, limit),
+    )));
+
+    const unchangedDb = join(temporary, `${source}-unchanged-${limit}.db`);
+    await discoverFixture(home, unchangedDb, source, limit);
+    unchangedResults.push(discoveryMeasurement(await timed(
+      `${prefix}unchanged shallow discovery ${limit}`,
+      () => discoverFixture(home, unchangedDb, source, limit),
+    )));
+
+    const changedDb = join(temporary, `${source}-changed-${limit}.db`);
+    const seeded = await discoverFixture(home, changedDb, source, limit);
+    const originals = await change(seeded.sessions);
+    try {
+      changedResults.push(discoveryMeasurement(await timed(
+        `${prefix}cold->changed shallow discovery ${limit}`,
+        () => discoverFixture(home, changedDb, source, limit),
+      )));
+    } finally {
+      await restore(originals);
+    }
+  }
+  return [...coldResults, ...unchangedResults, ...changedResults];
+}
+
 const info = await stat(dbPath);
 const results = [];
 const temporary = await mkdtemp(join(tmpdir(), 'relayhistory-benchmark-'));
 try {
   const fixtureHome = join(temporary, 'home');
   await createDiscoveryFixture(fixtureHome, Math.max(...discoveryLimits));
+  const opencodeDb = await createOpencodeFixture(fixtureHome, Math.max(...discoveryLimits));
+  const opencodePristine = join(temporary, 'opencode-pristine.db');
+  await copyFile(opencodeDb, opencodePristine);
 
-  const coldResults = [];
-  const unchangedResults = [];
-  const changedResults = [];
-  for (const limit of discoveryLimits) {
-    const coldDb = join(temporary, `cold-${limit}.db`);
-    const cold = await timed(`cold shallow discovery ${limit}`, () => discoverFixture(fixtureHome, coldDb, limit));
-    coldResults.push({ name: cold.name, ms: cold.ms, rows: cold.value.sessions.length, counters: cold.value.counters });
-
-    const unchangedDb = join(temporary, `unchanged-${limit}.db`);
-    await discoverFixture(fixtureHome, unchangedDb, limit);
-    const unchanged = await timed(`unchanged shallow discovery ${limit}`, () => discoverFixture(fixtureHome, unchangedDb, limit));
-    unchangedResults.push({ name: unchanged.name, ms: unchanged.ms, rows: unchanged.value.sessions.length, counters: unchanged.value.counters });
-
-    const changedDb = join(temporary, `changed-${limit}.db`);
-    const seeded = await discoverFixture(fixtureHome, changedDb, limit);
-    const originals = await changeDiscoveredSessions(seeded.sessions);
-    try {
-      const changed = await timed(`cold->changed shallow discovery ${limit}`, () => discoverFixture(fixtureHome, changedDb, limit));
-      changedResults.push({ name: changed.name, ms: changed.ms, rows: changed.value.sessions.length, counters: changed.value.counters });
-    } finally {
-      await restoreFixtureSessions(originals);
-    }
-  }
-  results.push(...coldResults, ...unchangedResults, ...changedResults);
+  results.push(...await measureDiscoveryScaling({
+    prefix: '', source: 'claude', home: fixtureHome, temporary,
+    change: changeDiscoveredSessions,
+    restore: restoreFixtureSessions,
+  }));
+  results.push(...await measureDiscoveryScaling({
+    prefix: 'opencode ', source: 'opencode', home: fixtureHome, temporary,
+    change: (sessions) => changeOpencodeSessions(opencodeDb, sessions),
+    restore: () => copyFile(opencodePristine, opencodeDb),
+  }));
 
   const firstPage = await listSessionCatalogPage({ dbPath, limit: 20 });
   const candidate = firstPage.sessions.find((session) => session.discoveryState === 'full') ?? firstPage.sessions[0];

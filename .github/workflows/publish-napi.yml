@@ -24,7 +24,7 @@ on:
       dry_run:
         description: 'Dry run (build only, no publish)'
         required: true
-        default: true
+        default: false
         type: boolean
 
 # Least privilege: the build matrix needs neither repo writes nor OIDC.
@@ -147,7 +147,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          persist-credentials: false
+          # A real release persists its version commit once publishing and
+          # the registry smoke tests succeed.
+          persist-credentials: true
       - uses: actions/setup-node@v6
         with:
           node-version: '22.14.0'
@@ -164,8 +166,8 @@ jobs:
           if [ -n "$CUSTOM_VERSION" ]; then
             VERSION="$CUSTOM_VERSION"
           else
-            # The registry is the durable source of truth between manual runs;
-            # package.json is kept at the latest checked-in release baseline.
+            # The registry determines the next version. A successful release
+            # persists that version back to the checked-in manifests below.
             CURRENT_VERSION=$(npm view ai-hist version)
             VERSION=$(node -e '
               const [current, bump] = process.argv.slice(1);
@@ -195,6 +197,33 @@ jobs:
             npm version "$VERSION" --no-git-tag-version --allow-same-version
             npm pkg set dependencies.ai-hist="$VERSION"
           )
+          node - "$VERSION" <<'NODE'
+          const fs = require("node:fs");
+          const version = process.argv[2];
+          const sdkLockPath = "../../sdk-ts/package-lock.json";
+          const sdkLock = JSON.parse(fs.readFileSync(sdkLockPath, "utf8"));
+          const nativeLink = sdkLock.packages["../crates/ai-hist-napi"];
+          if (!nativeLink) {
+            throw new Error("SDK lockfile is missing its local ai-hist-native package");
+          }
+          nativeLink.version = version;
+          fs.writeFileSync(sdkLockPath, JSON.stringify(sdkLock, null, 2) + "\n");
+
+          const files = [
+            ["../../crates/ai-hist-napi/Cargo.toml", /(\[package\]\nname = "ai-hist-napi"\nversion = ")[^"]+("\n)/],
+            ["../../Cargo.lock", /(\[\[package\]\]\nname = "ai-hist-napi"\nversion = ")[^"]+("\n)/],
+          ];
+          for (const [path, pattern] of files) {
+            const contents = fs.readFileSync(path, "utf8");
+            if (!pattern.test(contents)) {
+              throw new Error("Could not find ai-hist-napi version in " + path);
+            }
+            fs.writeFileSync(
+              path,
+              contents.replace(pattern, (_, prefix, suffix) => prefix + version + suffix),
+            );
+          }
+          NODE
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing version $VERSION"
 
@@ -221,8 +250,55 @@ jobs:
             if (manifests[2][1].dependencies["ai-hist"] !== process.env.VERSION) {
               throw new Error("ai-hist-mcp must pin ai-hist at the release version");
             }
+            const lockVersions = [
+              ["crates/ai-hist-napi/package-lock.json", ["", null]],
+              ["sdk-ts/package-lock.json", ["", "../crates/ai-hist-napi"]],
+            ];
+            for (const [path, packageKeys] of lockVersions) {
+              const lock = JSON.parse(fs.readFileSync(path, "utf8"));
+              if (lock.version !== process.env.VERSION) {
+                throw new Error(path + " has root version " + lock.version);
+              }
+              for (const key of packageKeys) {
+                if (key !== null && lock.packages[key]?.version !== process.env.VERSION) {
+                  throw new Error(path + " package " + key + " is not aligned");
+                }
+              }
+            }
+            for (const path of ["crates/ai-hist-napi/Cargo.toml", "Cargo.lock"]) {
+              const contents = fs.readFileSync(path, "utf8");
+              const pattern = path.endsWith("Cargo.toml")
+                ? /\[package\]\nname = "ai-hist-napi"\nversion = "([^"]+)"/
+                : /\[\[package\]\]\nname = "ai-hist-napi"\nversion = "([^"]+)"/;
+              const version = pattern.exec(contents)?.[1];
+              if (version !== process.env.VERSION) {
+                throw new Error(path + " has ai-hist-napi version " + version);
+              }
+            }
             console.log("All packages aligned at " + process.env.VERSION);
           '
+      - name: Prepare release version commit
+        if: ${{ !inputs.dry_run }}
+        working-directory: .
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            Cargo.lock \
+            crates/ai-hist-napi/Cargo.toml \
+            crates/ai-hist-napi/package.json \
+            crates/ai-hist-napi/package-lock.json \
+            sdk-ts/package.json \
+            sdk-ts/package-lock.json \
+            mcp-package/package.json
+          if git diff --cached --quiet; then
+            echo "Version metadata is already committed at $VERSION"
+          else
+            git commit -m "chore: release $VERSION"
+          fi
       - uses: actions/download-artifact@v4
         with:
           path: crates/ai-hist-napi/artifacts
@@ -326,6 +402,29 @@ jobs:
             );
           '
 
+      # The branch only advances once every package is published and the
+      # registry smoke tests pass, so a failed release never persists its
+      # version bump. The commit itself was prepared before the publish-only
+      # sdk-ts/package.json rewrite, so it stays version-only.
+      - name: Persist release version
+        id: persist-version
+        if: ${{ !inputs.dry_run }}
+        working-directory: .
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != refs/heads/* ]]; then
+            echo "Release versions can only be persisted from a branch checkout" >&2
+            exit 1
+          fi
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          git fetch origin "$BRANCH"
+          REMOTE_SHA=$(git rev-parse "origin/$BRANCH")
+          if [[ "$REMOTE_SHA" != "$GITHUB_SHA" ]]; then
+            echo "The release branch advanced from $GITHUB_SHA to $REMOTE_SHA; rerun from the new tip" >&2
+            exit 1
+          fi
+          git push origin "HEAD:$GITHUB_REF"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Create GitHub Release and tag
         if: ${{ !inputs.dry_run }}
         env:
@@ -334,6 +433,6 @@ jobs:
         run: |
           set -euo pipefail
           gh release create "sdk-ts-v$VERSION" \
-            --target "$GITHUB_SHA" \
+            --target "${{ steps.persist-version.outputs.sha }}" \
             --title "ai-hist@$VERSION" \
             --generate-notes

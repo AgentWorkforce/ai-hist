@@ -72,5 +72,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Changed
 
+- Recognize current Codex Desktop `response_item/message` user turns in both
+  bounded session discovery and full ingestion. Existing Codex rollout indexes
+  are repaired automatically, while adjacent legacy/current mirror records are
+  collapsed without removing intentionally repeated prompts.
 - Replace Python-based installer and end-to-end verification with shell,
   SQLite, Node.js, and the public Rust CLI interfaces.

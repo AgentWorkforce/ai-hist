@@ -574,6 +574,34 @@ fn codex_session_meta_supplies_originator_version_and_git_provenance() {
 }
 
 #[test]
+fn codex_desktop_response_items_supply_the_first_substantive_prompt() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    codex_rollout(
+        home.path(),
+        "codex-desktop",
+        concat!(
+            r#"{"timestamp":"2026-08-31T11:00:00.000Z","type":"session_meta","payload":{"id":"codex-desktop","cwd":"/work/api","thread_source":"user","source":"vscode","originator":"Codex Desktop"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-31T11:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>injected</environment_context>"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-31T11:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg-human","content":[{"type":"input_text","text":"repair"},{"type":"input_text","text":"the parser"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-31T11:00:02.100Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"message"}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-31T11:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"working"}]}}"#,
+            "\n",
+        ),
+        1_788_200_000_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["codex"]));
+    let row = found.row("codex-desktop");
+    assert_eq!(row.first_prompt.as_deref(), Some("repair\nthe parser"));
+    assert_eq!(row.originator.as_deref(), Some("Codex Desktop"));
+}
+
+#[test]
 fn codex_subagent_threads_are_not_sessions() {
     let conn = catalog();
     let home = tempfile::tempdir().unwrap();

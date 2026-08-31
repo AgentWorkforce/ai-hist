@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod cloud;
+mod codex;
 /// Fast, shallow coding-agent session discovery and the cache-only catalog
 /// listing that backs it.
 pub mod discover;
@@ -5183,9 +5184,10 @@ fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) ->
 /// conversation into `session_events` / `tool_calls` / `file_edits`.
 ///
 /// Replaces the earlier split walks (state keys `codex_rollouts` and
-/// `codex_rollout_user_messages_v2`) with one stamp map, `codex_rollouts_v3`,
-/// whose per-file record also carries the session id so a wiped database
-/// forces re-ingestion even when the file stamp is unchanged.
+/// `codex_rollout_user_messages_v2`) with one stamp map. The current
+/// `codex_rollouts_v4` generation repairs the user-message parser change by
+/// re-reading unchanged files once. Its per-file record carries the session id
+/// so a wiped database forces re-ingestion even when the file stamp is unchanged.
 /// (session cwds, session branches, prompts inserted).
 type CodexRolloutWalk = (HashMap<String, String>, HashMap<String, String>, usize);
 
@@ -5248,8 +5250,9 @@ fn sync_codex_rollouts(
 ) -> Result<CodexRolloutWalk> {
     let mut cwds = load_state_string_map(state, "codex_session_cwds");
     let mut branches = load_state_string_map(state, "codex_session_branches");
+    let repair_user_messages = !state.contains_key("codex_rollouts_v4");
     let mut seen = state
-        .get("codex_rollouts_v3")
+        .get("codex_rollouts_v4")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
@@ -5323,7 +5326,11 @@ fn sync_codex_rollouts(
                     branches.insert(meta.session_id.clone(), branch.clone());
                 }
             }
-            let outcome = ingest_codex_rollout(conn, &rollout, &meta);
+            let outcome = if repair_user_messages {
+                repair_codex_rollout_user_messages(conn, &rollout, &meta)
+            } else {
+                ingest_codex_rollout(conn, &rollout, &meta)
+            };
             let cleanup = meta
                 .is_subagent
                 .then(|| cleanup_codex_subagent_registration(conn, &meta.session_id));
@@ -5359,6 +5366,13 @@ fn sync_codex_rollouts(
                         outcome.last_assistant_text.as_deref(),
                         Some(&rollout.to_string_lossy()),
                     )?;
+                    if let Some(first_prompt) = outcome.first_prompt.as_deref() {
+                        conn.execute(
+                            "UPDATE sessions SET first_prompt = ? \
+                             WHERE source = 'codex' AND session_id = ?",
+                            params![first_prompt, meta.session_id],
+                        )?;
+                    }
                 }
             }
             seen.insert(
@@ -5384,7 +5398,8 @@ fn sync_codex_rollouts(
                 .collect::<Map<_, _>>(),
         ),
     );
-    state.insert("codex_rollouts_v3".to_string(), Value::Object(seen));
+    state.remove("codex_rollouts_v3");
+    state.insert("codex_rollouts_v4".to_string(), Value::Object(seen));
     if scanned > 0 {
         sync_note!(
             "  [codex-rollouts] scanned {scanned} files; +{inserted} prompts, +{events} events"
@@ -5486,6 +5501,7 @@ struct CodexIngestOutcome {
     events: usize,
     first_ts: Option<i64>,
     last_ts: Option<i64>,
+    first_prompt: Option<String>,
     last_assistant_text: Option<String>,
 }
 
@@ -5579,14 +5595,41 @@ impl CodexTokenTotals {
 /// `tool_calls`, and `file_edits`, and its user prompts into `history`.
 ///
 /// Format notes (verified against rollouts spanning cli 0.36 to 0.148):
-/// message text is taken from the `event_msg` stream only — the
-/// `response_item/message` rows duplicate it, and `response_item/reasoning`
-/// carries encrypted content while the readable stream is
-/// `event_msg/agent_reasoning`. Tool calls are `response_item` rows
-/// correlated by `call_id`. Token usage arrives as cumulative
+/// user text can arrive as either `event_msg/user_message` or
+/// `response_item/message`; adjacent mirrored encodings of one turn are
+/// collapsed. `response_item/reasoning` carries encrypted content while the
+/// readable stream is `event_msg/agent_reasoning`. Tool calls are
+/// `response_item` rows correlated by `call_id`. Token usage arrives as cumulative
 /// `token_count` snapshots; consecutive strictly-advancing snapshots are
 /// diffed into per-request deltas and attached to the nearest assistant
 /// event, so summing `token_json` over a session equals the session total.
+fn repair_codex_rollout_user_messages(
+    conn: &Connection,
+    path: &Path,
+    meta: &CodexSessionMeta,
+) -> Result<CodexIngestOutcome> {
+    // One bounded transaction per rollout makes an interrupted parser upgrade
+    // leave either the old user rows or the fully rebuilt ones. Assistant,
+    // tool, and file-edit evidence is retained and idempotently upserted.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM session_events \
+         WHERE source = 'codex' AND session_id = ? AND role = 'user'",
+        [meta.session_id.as_str()],
+    )?;
+    if meta.is_subagent {
+        cleanup_codex_subagent_history(&tx, &meta.session_id)?;
+    } else {
+        tx.execute(
+            "DELETE FROM history WHERE source = 'codex' AND session_id = ?",
+            [meta.session_id.as_str()],
+        )?;
+    }
+    let outcome = ingest_codex_rollout(&tx, path, meta)?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
 fn ingest_codex_rollout(
     conn: &Connection,
     path: &Path,
@@ -5602,6 +5645,7 @@ fn ingest_codex_rollout(
     let mut pending_delta: Option<CodexTokenTotals> = None;
     let mut untokened_assistant_uid: Option<String> = None;
     let mut saw_model_output = false;
+    let mut human_messages = codex::HumanMessageDeduper::default();
     let mut reader = BufReader::new(file);
     let mut raw = Vec::new();
     let mut line_index = 0usize;
@@ -5638,6 +5682,49 @@ fn ingest_codex_rollout(
         }
         let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
         let payload_str = |key: &str| payload.get(key).and_then(Value::as_str);
+        if let Some(message) = human_messages.observe(&value) {
+            let suffix = match message.format {
+                codex::HumanMessageFormat::EventMessage => "user_message",
+                codex::HumanMessageFormat::ResponseItem => "response_item_user_message",
+            };
+            let uid = format!("{index}:{suffix}");
+            let message_id = message.message_id.as_deref().unwrap_or(uid.as_str());
+            insert_codex_event(
+                conn,
+                session_id,
+                cwd,
+                branch,
+                ts_ms,
+                "user",
+                "text",
+                &message.text,
+                &uid,
+                message_id,
+                None,
+                None,
+            )?;
+            outcome.events += 1;
+            // A subagent's "user" turns are the parent agent's task prompts;
+            // only human threads feed prompt history and session discovery.
+            if !meta.is_subagent {
+                outcome
+                    .first_prompt
+                    .get_or_insert_with(|| message.text.chars().take(4096).collect());
+                outcome.prompts += insert_history(
+                    conn,
+                    &HistoryEntry {
+                        id: 0,
+                        source: "codex".into(),
+                        session_id: Some(meta.session_id.clone()),
+                        project: Some(meta.cwd.clone()),
+                        prompt_hash: Some(prompt_hash(&message.text)),
+                        prompt: message.text,
+                        timestamp_ms: ts_ms,
+                    },
+                )?;
+            }
+            continue;
+        }
         match line_type {
             "turn_context" => {
                 if let Some(m) = payload_str("model") {
@@ -5645,37 +5732,7 @@ fn ingest_codex_rollout(
                 }
             }
             "event_msg" => match payload_type {
-                "user_message" => {
-                    for prompt in codex_rollout_user_prompts(&value) {
-                        if is_codex_control_context(&prompt) {
-                            continue;
-                        }
-                        let uid = format!("{index}:user_message");
-                        insert_codex_event(
-                            conn, session_id, cwd, branch, ts_ms, "user", "text", &prompt, &uid,
-                            &uid, None, None,
-                        )?;
-                        outcome.events += 1;
-                        // A subagent's "user" turns are the parent agent's
-                        // task prompts; only human threads feed the prompt
-                        // history that session discovery is built on.
-                        if meta.is_subagent {
-                            continue;
-                        }
-                        outcome.prompts += insert_history(
-                            conn,
-                            &HistoryEntry {
-                                id: 0,
-                                source: "codex".into(),
-                                session_id: Some(meta.session_id.clone()),
-                                project: Some(meta.cwd.clone()),
-                                prompt_hash: Some(prompt_hash(&prompt)),
-                                prompt,
-                                timestamp_ms: ts_ms,
-                            },
-                        )?;
-                    }
-                }
+                "user_message" => {}
                 "agent_message" => {
                     if let Some(message) = payload_str("message").filter(|m| !m.trim().is_empty()) {
                         let uid = format!("{index}:agent_message");
@@ -5970,9 +6027,9 @@ fn ingest_codex_rollout(
                 // Readable reasoning arrives as event_msg/agent_reasoning;
                 // this row is encrypted, but it still marks model output.
                 "reasoning" => saw_model_output = true,
-                // `response_item` messages duplicate the event_msg text
-                // stream; ingesting both would double every message. An
-                // assistant one still marks model output for token baselines.
+                // Assistant `response_item` messages still duplicate the
+                // readable event_msg stream, but mark model output for token
+                // baselines. User messages were handled canonically above.
                 "message" if payload_str("role") == Some("assistant") => saw_model_output = true,
                 _ => {}
             },
@@ -6069,40 +6126,6 @@ fn count_unified_diff_lines(diff: &str) -> (i64, i64) {
         }
     }
     (added, removed)
-}
-
-fn codex_rollout_user_prompts(value: &Value) -> Vec<String> {
-    let mut prompts = Vec::new();
-    let payload = value.get("payload").and_then(Value::as_object);
-    if value.get("type").and_then(Value::as_str) == Some("event_msg")
-        && payload.and_then(|p| p.get("type")).and_then(Value::as_str) == Some("user_message")
-    {
-        if let Some(message) = payload
-            .and_then(|p| p.get("message"))
-            .and_then(Value::as_str)
-        {
-            if !message.trim().is_empty() {
-                prompts.push(message.trim().to_string());
-            }
-        }
-    }
-    prompts
-}
-
-fn is_codex_control_context(prompt: &str) -> bool {
-    let value = prompt.trim_start();
-    [
-        "<environment_context",
-        "<permissions instructions",
-        "<app-context",
-        "<skills_instructions",
-        "<collaboration_mode",
-        "<INSTRUCTIONS>",
-        "<user_instructions",
-        "# AGENTS.md",
-    ]
-    .iter()
-    .any(|prefix| value.starts_with(prefix))
 }
 
 fn backfill_codex_metadata(
@@ -7904,10 +7927,10 @@ fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpoint_sync_state, cleanup_stale_sync_state_temps, codex_rollout_user_prompts,
-        cron_schedule, doctor_report, export_history, file_stamp, git_commit_time_ms, git_stdout,
-        import_history, ingest_claude_transcript, is_sqlite_contention, link_git_commit,
-        load_sync_state, parse_trajectory_file, paths_overlap, prepare_sync_and_push_db,
+        checkpoint_sync_state, cleanup_stale_sync_state_temps, cron_schedule, doctor_report,
+        export_history, file_stamp, git_commit_time_ms, git_stdout, import_history,
+        ingest_claude_transcript, is_sqlite_contention, link_git_commit, load_sync_state,
+        parse_trajectory_file, paths_overlap, prepare_sync_and_push_db,
         process_status_with_programs, save_sync_state, search_all, service_command_args,
         shell_single_quote, source_database_path, strip_url_credentials,
         sync_claude_session_metadata, sync_exclusive, sync_local_at, sync_opencode_exclusive,
@@ -7953,34 +7976,6 @@ mod tests {
             super::DecodedFileCursor::Typed(cursor) => cursor,
             super::DecodedFileCursor::Legacy(_) => panic!("expected typed cursor"),
         }
-    }
-
-    #[test]
-    fn codex_rollout_prompts_normalize_desktop_user_turns() {
-        let event = json!({
-            "type": "event_msg",
-            "payload": {"type": "user_message", "message": "  fix the importer  "}
-        });
-        assert_eq!(codex_rollout_user_prompts(&event), vec!["fix the importer"]);
-
-        let mirrored_response_item = json!({
-            "type": "response_item",
-            "payload": {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "summarize this task"},
-                    {"type": "image", "url": "ignored"}
-                ]
-            }
-        });
-        assert!(codex_rollout_user_prompts(&mirrored_response_item).is_empty());
-
-        let assistant = json!({
-            "type": "response_item",
-            "payload": {"type": "message", "role": "assistant", "content": "ignored"}
-        });
-        assert!(codex_rollout_user_prompts(&assistant).is_empty());
     }
 
     #[test]
@@ -9587,6 +9582,109 @@ mod tests {
         super::read_codex_session_meta(path).unwrap().unwrap()
     }
 
+    fn response_user(ts: &str, text: &str) -> String {
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}]
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn ingests_current_codex_desktop_user_messages_and_filters_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-current.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n",
+                r#"{"timestamp":"2026-08-31T10:00:00.000Z","type":"session_meta","payload":{"id":"sess-current","cwd":"/tmp/proj","thread_source":"user","source":"vscode","originator":"Codex Desktop"}}"#,
+                response_user(
+                    "2026-08-31T10:00:01.000Z",
+                    "<environment_context>injected</environment_context>"
+                ),
+                serde_json::json!({
+                    "timestamp": "2026-08-31T10:00:02.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "user", "id": "msg_user_1",
+                        "content": [
+                            {"type": "input_text", "text": "fix"},
+                            {"type": "input_text", "text": "the scanner"}
+                        ]
+                    }
+                }),
+                r#"{"timestamp":"2026-08-31T10:00:02.100Z","type":"event_msg","payload":{"type":"item_completed"}}"#,
+                r#"{"timestamp":"2026-08-31T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"duplicate assistant stream"}]}}"#,
+                r#"{"timestamp":"2026-08-31T10:00:03.100Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let outcome = super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+        assert_eq!(outcome.prompts, 1);
+        assert_eq!(outcome.events, 2);
+        assert_eq!(outcome.first_prompt.as_deref(), Some("fix\nthe scanner"));
+        let rows: Vec<(String, String, String)> = conn
+            .prepare("SELECT role, text, message_id FROM session_events ORDER BY ts_ms")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "user".into(),
+                    "fix\nthe scanner".into(),
+                    "msg_user_1".into()
+                ),
+                ("assistant".into(), "Done.".into(), "5:agent_message".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_user_mirrors_dedupe_but_repeated_turns_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-mirrors.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n{}\n{}\n",
+                r#"{"timestamp":"2026-08-31T10:00:00.000Z","type":"session_meta","payload":{"id":"sess-mirror","cwd":"/tmp/proj"}}"#,
+                response_user("2026-08-31T10:00:01.000Z", "retry"),
+                r#"{"timestamp":"2026-08-31T10:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"retry"}}"#,
+                r#"{"timestamp":"2026-08-31T10:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Try one."}}"#,
+                response_user("2026-08-31T10:00:03.000Z", "retry"),
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let outcome = super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+        assert_eq!(outcome.prompts, 2);
+        let user_rows: Vec<(i64, String)> = conn
+            .prepare("SELECT ts_ms, text FROM session_events WHERE role='user' ORDER BY ts_ms")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(user_rows.len(), 2);
+        assert_eq!(user_rows[0].1, "retry");
+        assert_eq!(user_rows[1].1, "retry");
+    }
+
     #[test]
     fn ingests_codex_rollout_events_tools_edits_and_token_deltas() {
         let dir = tempfile::tempdir().unwrap();
@@ -9757,6 +9855,111 @@ mod tests {
     }
 
     #[test]
+    fn codex_v4_repair_restores_users_without_duplicating_existing_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/08/31");
+        fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout-2026-08-31T10-00-00-repair.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                r#"{"timestamp":"2026-08-31T10:00:00.000Z","type":"session_meta","payload":{"id":"sess-repair","cwd":"/tmp/proj"}}"#,
+                response_user("2026-08-31T10:00:01.000Z", "restore my prompt"),
+                r#"{"timestamp":"2026-08-31T10:00:02.000Z","type":"response_item","payload":{"type":"function_call","id":"fc_1","name":"exec_command","arguments":"{\"cmd\":\"git status\"}","call_id":"call_1"}}"#,
+                r#"{"timestamp":"2026-08-31T10:00:03.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd, first_activity_ms, last_activity_ms) \
+             VALUES ('sess-repair', 'codex', '/tmp/proj', 1, 2)",
+            [],
+        )
+        .unwrap();
+        super::insert_session_event(
+            &conn,
+            "codex",
+            "sess-repair",
+            Some("/tmp/proj"),
+            Some("/tmp/proj"),
+            None,
+            "3:agent_message",
+            None,
+            1_788_176_403_000,
+            "assistant",
+            "text",
+            Some("Done."),
+            None,
+            None,
+            "3:agent_message",
+        )
+        .unwrap();
+        super::insert_tool_call(
+            &conn,
+            "codex",
+            "sess-repair",
+            "fc_1",
+            "call_1",
+            "exec_command",
+            Some("git status"),
+            r#"{"cmd":"git status"}"#,
+            None,
+            1_788_176_402_000,
+        )
+        .unwrap();
+
+        let mut state = Map::new();
+        state.insert(
+            "codex_rollouts_v3".into(),
+            json!({path.to_string_lossy().to_string(): {
+                "stamp": super::file_stamp(&path).unwrap(),
+                "session": "sess-repair"
+            }}),
+        );
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let counts: (i64, i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT \
+                 (SELECT COUNT(*) FROM history WHERE session_id='sess-repair'), \
+                 (SELECT COUNT(*) FROM session_events WHERE session_id='sess-repair' AND role='user'), \
+                 (SELECT COUNT(*) FROM session_events WHERE session_id='sess-repair' AND role='assistant'), \
+                 (SELECT first_prompt FROM sessions WHERE session_id='sess-repair')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1, 2, Some("restore my prompt".into())));
+        let tool_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_calls WHERE session_id='sess-repair'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tool_count, 1);
+        assert!(state.get("codex_rollouts_v3").is_none());
+        assert!(state.get("codex_rollouts_v4").is_some());
+
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let second_counts: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT \
+                 (SELECT COUNT(*) FROM history WHERE session_id='sess-repair'), \
+                 (SELECT COUNT(*) FROM session_events WHERE session_id='sess-repair' AND role='user'), \
+                 (SELECT COUNT(*) FROM session_events WHERE session_id='sess-repair' AND role='assistant'), \
+                 (SELECT COUNT(*) FROM tool_calls WHERE session_id='sess-repair')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(second_counts, (1, 1, 2, 1));
+    }
+
+    #[test]
     fn resumed_codex_rollout_treats_first_snapshot_as_carried_baseline() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout-resumed.jsonl");
@@ -9866,7 +10069,7 @@ mod tests {
         let key = rollout.to_string_lossy().to_string();
         let mut state = Map::new();
         state.insert(
-            "codex_rollouts_v3".into(),
+            "codex_rollouts_v4".into(),
             json!({
                 (key): {
                     "stamp": file_stamp(&rollout).unwrap(),
@@ -10033,6 +10236,7 @@ mod tests {
             day.join("rollout-2026-08-01T10-01-00-sub.jsonl"),
             concat!(
                 r#"{"timestamp":"2026-08-01T10:01:00.000Z","type":"session_meta","payload":{"id":"sess-sub","session_id":"sess-top","parent_thread_id":"sess-top","thread_source":"subagent","source":{"subagent":{"other":"guardian"}},"cwd":"/tmp/proj"}}"#, "\n",
+                r#"{"timestamp":"2026-08-01T10:01:00.500Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Review the implementation."}]}}"#, "\n",
                 r#"{"timestamp":"2026-08-01T10:01:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Reviewing."}}"#, "\n",
             ),
         )
@@ -10098,6 +10302,14 @@ mod tests {
             event_sessions,
             vec!["sess-sub".to_string(), "sess-top".to_string()]
         );
+        let sub_user_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE session_id='sess-sub' AND role='user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sub_user_events, 1);
 
         // A second walk with unchanged stamps ingests nothing new.
         let before: i64 = conn
