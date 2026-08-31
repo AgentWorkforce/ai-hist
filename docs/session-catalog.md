@@ -141,6 +141,7 @@ types, in this order:
   "type": "summary",
   "contract_version": 2,
   "scope": "local",
+  "locations_run": ["local"],
   "discovered": 2,
   "skipped_unchanged": 0,
   "providers": {
@@ -167,10 +168,13 @@ types, in this order:
 `counters` is the run's bill of work, and it is the honest way to check that
 discovery stayed cheap — `bytes_read` and `files_opened` are what a bounded
 request bounds, and `shallow_reads` is `0` on a rescan where nothing changed.
-Summary `scope` echoes the requested acquisition scope. It does not enumerate
-connector locations that executed, and `providers` groups source adapters
-rather than local/remote locations. Today an `all` summary accompanies
-local-only connector work; row `locations` still report observed presences.
+Summary `scope` echoes the requested acquisition scope, and `locations_run`
+enumerates the connector locations that actually executed — `["local"]` on a
+machine with no remote connector configured, `["local", "remote"]` when an
+`all` run also executed one. `providers` groups source adapters rather than
+locations, so under `all` a source served by a local adapter and a remote
+connector reports their merged tallies; row `locations` still report observed
+presences.
 
 Diagnostics are their own lines and never appear inside the `summary` object,
 so a consumer that only wants the tally can read the last line and stop. In
@@ -201,7 +205,7 @@ contract:
 | `git_branch` | observed | last branch the provider recorded |
 | `first_activity_ms` | observed | `null` when the provider records no timestamps at all |
 | `last_activity_ms` | observed, or filesystem-derived | file mtime for providers that record no timestamps |
-| `first_prompt` | **derived** | bounded excerpt (≤ 4096 chars) of the first *substantive* human turn; provider control/meta/sidechain turns are skipped |
+| `first_prompt` | **derived** | bounded excerpt (≤ 4096 chars) of the first *substantive* human turn; provider control/meta/sidechain turns are skipped. For remote rows it is the provider's own session/task title — the listing's only human-readable identifier, which both providers derive from the opening prompt |
 | `last_assistant_text` | observed | **only** written by full indexing — always `null` on a shallow-only row |
 | `models` | observed, best effort | model ids seen inside the bounded read; empty means "not seen cheaply", not "no model" |
 | `originator` | observed | the client that started the session (codex only) |
@@ -209,7 +213,7 @@ contract:
 | `repo_url` | observed | remote URL, when the provider records one |
 | `initial_commit` | observed | commit the session started from |
 | `workspace_roots` | observed | extra workspace roots, when the provider records them |
-| `raw_path` | observed | provider file this row came from; `null` for database- and network-backed sources |
+| `raw_path` | observed | provider file this row came from; the session/task URL for remote rows; `null` for database-backed sources |
 | `source_stamp` | internal | change marker; see [rescan behaviour](#rescans-and-source-stamps) |
 | `discovery_state` | internal | `"shallow"` or `"full"` |
 | `locations` | derived | sorted presences from `session_presences`: `"local"`, `"remote"`, or both |
@@ -231,7 +235,8 @@ These require a full `ai-hist sync` through an available provider connector:
 run for that session, `"shallow"` means catalog metadata only. Full ingest
 always wins — a shallow rescan refreshes a `full` row's metadata and stamp but
 never downgrades its state. Local connectors provide full sync today; remote
-rows remain shallow until remote connectors ship.
+rows stay shallow because neither provider serves full transcripts through a
+supported listing interface (see [Remote connectors](remote-connectors.md)).
 
 ### Product boundary
 
@@ -246,14 +251,18 @@ statistics, packs, and resume selection: `local` selects sessions with a local p
 with a remote presence, and `all` returns their deduplicated union. These are
 cache-only queries over the same ledger.
 
-Discovery and sync are acquisition operations. Local adapters are available
-today. Explicit remote acquisition is reserved but unsupported until provider
-connectors ship, and returns an error rather than silently doing local work.
-`--all` means every configured adapter; today that is the local adapters, and
-remote adapters will join the same operation when implemented.
+Discovery and sync are acquisition operations. Local adapters are always
+available; remote acquisition runs through provider connectors —
+`claude-web` for claude.ai/code web sessions and `codex-cloud` for Codex
+cloud tasks — that are configured by the provider CLI's own stored sign-in
+(see [Remote connectors](remote-connectors.md)). Explicit remote acquisition
+on a machine with no connector configured returns an error rather than
+silently doing local work. `--all` means every configured adapter: the local
+adapters plus whichever connectors are configured.
 
-The discovery summary preserves the requested scope, so `--all` reports
-`scope: "all"` even while connector-location execution is local-only. That is
+The discovery summary preserves the requested scope and reports the executed
+locations separately in `locations_run`, so `--all` reports `scope: "all"`
+with `locations_run: ["local"]` on a machine without connectors. That is
 different from each row's observed `locations`. A remote-only session can be
 selected by resume search, but it cannot yield a usable local resume command;
 materialize it locally first. Sessions with both presences remain locally

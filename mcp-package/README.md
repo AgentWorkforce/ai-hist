@@ -14,8 +14,9 @@ Tools: `search_history`, `recent_history`, `list_sessions`,
 `sync`. Search, recent history, session listing, discovery, statistics, and sync accept a
 `scope` of `local`, `remote`, or `all`; scope defaults to `local`.
 
-Cached reads support all three scopes. Remote discovery and sync connectors are
-not available yet: explicit `remote` acquisition returns
-`UNSUPPORTED_OPERATION`, while `all` runs the configured local connectors.
-Consequently, the current discovery and sync tools are annotated as local,
-closed-world writes; their annotations will change when remote connectors ship.
+Cached reads support all three scopes. Remote acquisition runs through
+provider connectors (claude.ai/code web sessions, Codex cloud tasks) that are
+configured by the provider CLI's own sign-in on the machine; explicit `remote`
+acquisition returns `UNSUPPORTED_OPERATION` when none is configured, while
+`all` runs local adapters plus every configured connector. The discovery and
+sync tools are therefore annotated as open-world writes.

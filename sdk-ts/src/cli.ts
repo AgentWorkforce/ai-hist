@@ -220,7 +220,7 @@ function outputDiscovery(value: Awaited<ReturnType<typeof discoverSessions>>, js
     process.stdout.write(
       `${value.sessions.length} session(s): ${value.discovered} discovered, ${value.skippedUnchanged} unchanged ` +
       `(${value.counters.filesOpened} file(s) opened, ${value.counters.shallowReads} shallow read(s)); ` +
-      `requested scope: ${value.scope}, connector locations run: local\n`,
+      `requested scope: ${value.scope}, connector locations run: ${value.locationsRun.length > 0 ? value.locationsRun.join(', ') : 'none'}\n`,
     );
     return;
   }

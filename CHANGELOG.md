@@ -23,6 +23,23 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Added
 
+- Add remote provider connectors behind the existing `--remote` / `--all`
+  acquisition scopes: `claude-web` lists claude.ai/code web sessions with the
+  OAuth sign-in the Claude Code CLI stored (`~/.claude/.credentials.json`,
+  overridable with `RELAYHISTORY_CLAUDE_CREDENTIALS`; honors
+  `ANTHROPIC_BASE_URL` with an https-or-loopback guard), and `codex-cloud`
+  lists Codex cloud tasks through `codex cloud list --json`
+  (`~/.codex/auth.json` marks it configured). Connector rows land in the
+  shared ledger as shallow catalog rows with a `remote` presence, participate
+  in stamp-guarded rescans, and dedupe against local presences of the same
+  session. `sessions discover --remote`, `sync --remote`, and the remote half
+  of `--all` now execute configured connectors; a remote-only request on a
+  machine with no connector configured keeps failing with the established
+  `no remote provider connectors are configured` error, now naming each
+  connector's reason. Discovery summaries gain `locations_run`, the connector
+  locations that actually executed (the native-addon contract is now 4), and
+  the human summary line reports it in place of the hardcoded `local`. See
+  `docs/remote-connectors.md`.
 - Add a consistent session location scope to collection operations: `--local`,
   `--remote`, and `--all` are mutually exclusive, with local as the default.
   Listing, search, recent history, statistics, packs, and resume selection

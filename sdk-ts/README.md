@@ -41,14 +41,18 @@ offline behavior and making provider-cloud access explicit. The CLI exposes the
 same mutually exclusive `--local`, `--remote`, and `--all` flags; omitting them
 is equivalent to `--local`.
 
-Cached reads already support every scope. Remote acquisition connectors are not
-shipped yet, so `discoverSessions({ scope: 'remote' })` and
+Cached reads already support every scope. Remote acquisition runs through
+provider connectors — claude.ai/code web sessions and Codex cloud tasks —
+that are configured by the provider CLI's own sign-in on the machine (see the
+repository's `docs/remote-connectors.md`). On a machine with no connector
+configured, `discoverSessions({ scope: 'remote' })` and
 `sync({ scope: 'remote' })` fail with `UnsupportedOperationError` and the stable
 code `UNSUPPORTED_OPERATION`; they never fall back to local acquisition.
-`scope: 'all'` runs every configured connector, which currently means local
-connectors only.
+`scope: 'all'` runs the local adapters plus every configured connector.
 
-Catalog pages, discovery results, statistics, and sync results echo the requested `scope`.
+Catalog pages, discovery results, statistics, and sync results echo the requested `scope`,
+and discovery results additionally report `locationsRun` — the connector
+locations that actually executed.
 History and catalog rows have `locations`, containing `local`, `remote`, or both, so an
 `all` query still returns one logical session while preserving where it was
 found. `resumeCommand()` returns `null` for a remote-only history row rather

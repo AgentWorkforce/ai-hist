@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Support remote acquisition through the engine's provider connectors:
+  `discoverSessions`/`sync` with `scope: 'remote'` (and the remote half of
+  `'all'`) run the claude.ai/code and Codex cloud connectors when the provider
+  CLI is signed in on the machine, and keep throwing the stable
+  `UNSUPPORTED_OPERATION` error when no connector is configured.
+  `DiscoverResult` gains `locationsRun` — the connector locations that
+  actually executed — the CLI's human discovery summary prints it, and the
+  MCP `discover_sessions`/`sync` tools are now declared open-world. This
+  advances the native-addon contract to 4.
 - Add the shared `SessionScope` (`local`, `remote`, or `all`) to session
   discovery, listing, search, recent history, statistics, and sync. The SDK and CLI default
   to local scope; the CLI exposes mutually exclusive `--local`, `--remote`, and

@@ -9,7 +9,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const NATIVE_CONTRACT_VERSION = 3;
+export const NATIVE_CONTRACT_VERSION = 4;
 export const SESSION_CATALOG_CONTRACT_VERSION = 2;
 
 export type Source = 'claude' | 'codex' | 'cursor' | 'grok' | 'relay' | 'trajectory' | 'opencode';
@@ -140,6 +140,10 @@ export interface DiscoverSessionsOptions {
 export interface DiscoverResult {
   contractVersion: number;
   scope: SessionScope;
+  /** Connector locations that actually executed. `scope` records the ask;
+   * this records what ran — an `all` request executes remote connectors only
+   * where one is configured on this machine. */
+  locationsRun: SessionLocation[];
   sessions: CatalogSession[];
   discovered: number;
   skippedUnchanged: number;
@@ -462,6 +466,9 @@ export async function discoverSessions(options: DiscoverSessionsOptions = {}): P
     return {
       contractVersion,
       scope: validateNativeScope(result.scope),
+      locationsRun: Array.isArray(result.locationsRun)
+        ? (result.locationsRun as unknown[]).filter((location): location is SessionLocation => location === 'local' || location === 'remote')
+        : [],
       sessions: Array.isArray(result.sessions) ? (result.sessions as UnknownRecord[]).map(catalogSession) : [],
       discovered: Number(result.discovered),
       skippedUnchanged: Number(result.skippedUnchanged),

@@ -11,7 +11,9 @@ import {
 } from './index.js';
 
 const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
-const LOCAL_WRITE = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
+// Acquisition can reach provider services when a remote scope is requested
+// (claude.ai/code web sessions, Codex cloud tasks), so it is open-world.
+const ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint: true } as const;
 const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode']);
 const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode']);
 const SESSION_SCOPE = z.enum(['local', 'remote', 'all']);
@@ -62,7 +64,7 @@ server.tool('list_sessions', 'Cache-only indexed session catalog listing. This n
 server.tool('discover_sessions', 'Explicit shallow provider discovery. Updates only the session catalog.', {
   sources: z.array(CATALOG_SOURCE).optional(), limit: z.number().int().min(1).max(10000).optional(),
   scope: SESSION_SCOPE.optional().default('local'),
-}, LOCAL_WRITE, (args) => call(() => discoverSessions(args)));
+}, ACQUIRE, (args) => call(() => discoverSessions(args)));
 
 server.tool('get_session', 'Get indexed prompts for one session.', {
   session_id: z.string(), source: SOURCE.optional(), tag: z.string().optional(),
@@ -80,6 +82,6 @@ server.tool('history_stats', 'Statistics for already-indexed RelayHistory data.'
 
 server.tool('sync', 'Explicit full provider ingestion into RelayHistory.', {
   scope: SESSION_SCOPE.optional().default('local'),
-}, LOCAL_WRITE, ({ scope }) => call(() => sync({ scope })));
+}, ACQUIRE, ({ scope }) => call(() => sync({ scope })));
 
 await server.connect(new StdioServerTransport());

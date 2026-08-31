@@ -181,6 +181,7 @@ export interface SourceExemption {
 export interface DiscoverResult {
   contractVersion: number
   scope: string
+  locationsRun: Array<string>
   sessions: Array<CatalogSession>
   discovered: number
   skippedUnchanged: number

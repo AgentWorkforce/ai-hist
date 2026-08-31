@@ -26,13 +26,14 @@ enough. The CLI spelling is the mutually exclusive `--local`, `--remote`, and
 cached ledger and never contact a provider. Direct `getSession()` and event-page
 lookups are identity-based and scope-independent.
 
-Remote discovery and remote sync are reserved but unsupported until provider
-connectors ship. Integrations must surface that error for explicit `remote`
-acquisition rather than retrying locally. `all` runs every configured adapter,
-which means local adapters only until remote connectors are available.
-Acquisition result `scope` echoes the request; use session `locations` for
-observed presences rather than treating that summary field as proof that a
-connector executed at each requested location.
+Remote discovery and remote sync run through provider connectors
+(claude.ai/code web sessions and Codex cloud tasks — see
+[Remote connectors](remote-connectors.md)); with no connector configured on
+the machine they fail explicitly, and integrations must surface that error
+rather than retrying locally. `all` runs local adapters plus every configured
+connector. Acquisition result `scope` echoes the request and `locationsRun`
+reports which connector locations executed; use session `locations` for
+observed presences.
 
 The CLI equivalents are `sessions list`, `sessions discover`, `search`,
 `recent`, `session`, `events`, `stats`, and `sync`. See

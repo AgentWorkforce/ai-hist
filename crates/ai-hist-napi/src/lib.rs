@@ -17,7 +17,7 @@ use ai_hist_core::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 3;
+pub const NATIVE_CONTRACT_VERSION: u32 = 4;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -72,14 +72,13 @@ fn scope_name(scope: SessionScope) -> String {
     .to_string()
 }
 
+/// Reject remote-only acquisition when no remote connector is configured on
+/// this machine, keeping the SDK's stable `UNSUPPORTED_OPERATION` taxonomy.
+/// The engine re-validates; this pre-check only classifies the error.
 fn ensure_acquisition_scope_supported(scope: SessionScope, operation: &str) -> napi::Result<()> {
     if scope == SessionScope::Remote {
-        return Err(native_error(
-            "UNSUPPORTED_OPERATION",
-            format!(
-                "remote session {operation} is not available: no remote provider connectors are configured"
-            ),
-        ));
+        ai_hist_engine::remote::ensure_remote_connectors_configured(operation)
+            .map_err(|error| native_error("UNSUPPORTED_OPERATION", format!("{error:#}")))?;
     }
     Ok(())
 }
@@ -656,6 +655,7 @@ pub struct SourceExemption {
 pub struct DiscoverResult {
     pub contract_version: u32,
     pub scope: String,
+    pub locations_run: Vec<String>,
     pub sessions: Vec<CatalogSession>,
     pub discovered: u32,
     pub skipped_unchanged: u32,
@@ -691,6 +691,7 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
     Ok(DiscoverResult {
         contract_version: summary.contract_version,
         scope: scope_name(scope),
+        locations_run: summary.locations_run,
         sessions: sessions.into_iter().map(CatalogSession::from).collect(),
         discovered: summary.discovered as u32,
         skipped_unchanged: summary.skipped_unchanged as u32,
