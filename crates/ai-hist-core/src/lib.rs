@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, DatabaseName, OpenFlags};
+use rusqlite::{params, Connection, DatabaseName, OpenFlags, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -540,7 +540,44 @@ pub fn open_db_readonly(path: &Path) -> Result<Connection> {
 }
 
 pub fn init_db(conn: &Connection) -> Result<()> {
+    let mut attempts = 0;
+    loop {
+        match init_db_once(conn) {
+            Ok(()) => return Ok(()),
+            Err(error) if migration_lock_error(&error) && busy_retry_handler(attempts) => {
+                attempts += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn migration_lock_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let Some(rusqlite::Error::SqliteFailure(failure, _)) =
+            cause.downcast_ref::<rusqlite::Error>()
+        else {
+            return false;
+        };
+        matches!(
+            failure.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        )
+    })
+}
+
+fn init_db_once(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // Serialize the complete DDL/backfill pass. SQLite busy handlers do not
+    // cover every SQLITE_LOCKED schema race, so `init_db` also retries the
+    // whole rollback-safe attempt above.
+    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    init_db_locked(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn init_db_locked(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     conn.execute_batch(
         r#"
@@ -606,9 +643,8 @@ END;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
     // Before the presence model every identity in the local evidence ledger
     // was local. Check the marker before attempting a write so an
-    // already-current database remains readable while another process writes.
-    // The transaction rechecks after acquiring the write lock, making two
-    // concurrent first opens both safe and crash-atomic.
+    // already-current database remains cheap to check. The outer immediate
+    // transaction makes concurrent first opens safe and crash-atomic.
     let presence_backfilled = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = 'session_presences_local_backfill_v1')",
         [],
@@ -617,7 +653,6 @@ END;
     if !presence_backfilled {
         conn.execute_batch(
             r#"
-BEGIN IMMEDIATE;
 INSERT OR IGNORE INTO session_presences
     (source, session_id, location, raw_locator, source_stamp, discovery_state)
 SELECT source, session_id, 'local', raw_path, source_stamp, discovery_state
@@ -642,7 +677,6 @@ WHERE NOT EXISTS (
 );
 INSERT OR IGNORE INTO schema_migrations (name)
 VALUES ('session_presences_local_backfill_v1');
-COMMIT;
 "#,
         )?;
     }
@@ -762,10 +796,10 @@ COMMIT;
 
 /// Add only columns that are actually absent.
 ///
-/// A read-before-write keeps an already-current open lock-free. The second
-/// check runs after `BEGIN IMMEDIATE`, so concurrent first opens cannot both
-/// attempt the same `ALTER TABLE`; this avoids both guaranteed failing ALTERs
-/// and locale/version-sensitive matching on SQLite error strings.
+/// The caller holds the migration write lock, so only genuinely missing
+/// columns are altered and concurrent opens cannot race the same statement.
+/// This avoids both guaranteed failing ALTERs and locale/version-sensitive
+/// matching on SQLite error strings.
 fn ensure_text_columns(conn: &Connection, table: &str, required: &[&str]) -> Result<()> {
     let missing = |conn: &Connection| -> Result<Vec<&str>> {
         let existing: HashSet<String> = conn
@@ -779,26 +813,11 @@ fn ensure_text_columns(conn: &Connection, table: &str, required: &[&str]) -> Res
             .collect())
     };
 
-    if missing(conn)?.is_empty() {
-        return Ok(());
-    }
-
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let migration = (|| -> Result<()> {
-        for column in missing(conn)? {
-            // `table` and `column` come exclusively from internal constant
-            // lists, never from user input.
-            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])
-                .with_context(|| format!("adding column {table}.{column}"))?;
-        }
-        Ok(())
-    })();
-    match migration {
-        Ok(()) => conn.execute_batch("COMMIT")?,
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(error);
-        }
+    for column in missing(conn)? {
+        // `table` and `column` come exclusively from internal constant lists,
+        // never from user input.
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])
+            .with_context(|| format!("adding column {table}.{column}"))?;
     }
     Ok(())
 }
