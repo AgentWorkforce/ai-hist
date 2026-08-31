@@ -32,6 +32,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
   migrations. Existing databases upgrade in place on their next writable open.
 - Add bounded live OpenCode hydration queries keyed by session ID; targeted
   hydration never copies or scans the complete OpenCode database.
+- Add a real-catalog hydration benchmark that selects provider-diverse local
+  sessions and reports first-call plus unchanged-checkpoint latency.
 
 - Add a consistent session location scope to collection operations: `--local`,
   `--remote`, and `--all` are mutually exclusive, with local as the default.
