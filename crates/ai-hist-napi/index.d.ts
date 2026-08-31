@@ -191,6 +191,44 @@ export interface DiscoverResult {
 }
 /** Explicit bounded provider discovery. It updates only the session catalog. */
 export declare function discoverSessions(options?: DiscoverOptions | undefined | null): Promise<DiscoverResult>
+export interface HydrateSessionOptions {
+  source: string
+  sessionId: string
+  scope?: string
+  dbPath?: string
+  includeRelated?: boolean
+}
+export interface HydrationIndexedThrough {
+  sourceStamp?: string
+  lastEventAtMs?: number
+}
+export interface HydrationEvidence {
+  prompts: number
+  events: number
+  toolCalls: number
+  relatedSessions: number
+}
+export interface HydrationDiagnostic {
+  code: string
+  message: string
+  durationMs?: number
+  sourceBytes?: number
+  recordsParsed?: number
+}
+export interface HydrateSessionResult {
+  contractVersion: number
+  source: string
+  sessionId: string
+  status: string
+  discoveryState: string
+  presence: string
+  indexedThrough: HydrationIndexedThrough
+  evidence: HydrationEvidence
+  relatedSessionIds: Array<string>
+  diagnostics: Array<HydrationDiagnostic>
+}
+/** Fully index one cataloged session without enumerating unrelated sessions. */
+export declare function hydrateSession(options: HydrateSessionOptions): Promise<HydrateSessionResult>
 export interface SyncOptions {
   dbPath?: string
   scope?: string

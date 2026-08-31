@@ -3,7 +3,7 @@
 import { readFile } from 'node:fs/promises';
 
 import {
-  discoverSessions, getSession, getSessionEventsPage, listSessionCatalogPage,
+  discoverSessions, getSession, getSessionEventsPage, hydrateSession, listSessionCatalogPage,
   recent, search, stats, sync, type CatalogCursor, type SessionScope,
 } from './index.js';
 
@@ -11,7 +11,7 @@ type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> }
 
 type PackageMetadata = { version?: string };
 
-const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-warning', 'remote', 'version']);
+const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-related', 'no-warning', 'remote', 'version']);
 const VALUE_FLAGS = new Set([
   'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
   'project', 'source', 'tag',
@@ -189,6 +189,7 @@ function usage(message?: string): never {
   process.stderr.write(`Usage:
   ai-hist sessions list [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
   ai-hist sessions discover [--local | --remote | --all] [--source SOURCE] [--limit N] [--json]
+  ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--no-related] [--db PATH] [--json]
   ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--limit N] [--json]
   ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--json]
   ai-hist session SESSION_ID [--source SOURCE] [--json]
@@ -231,6 +232,24 @@ function outputDiscovery(value: Awaited<ReturnType<typeof discoverSessions>>, js
   output({ type: 'summary', ...summary, providers }, true);
 }
 
+function outputHydration(value: Awaited<ReturnType<typeof hydrateSession>>, json: boolean): void {
+  if (json) {
+    output(value, true);
+    return;
+  }
+  process.stdout.write(`${value.source}/${value.sessionId}: ${value.status}\n`);
+  process.stdout.write(
+    `evidence: ${value.evidence.prompts} prompt(s), ${value.evidence.events} event(s), ` +
+    `${value.evidence.toolCalls} tool call(s)\n`,
+  );
+  if (value.relatedSessionIds.length) {
+    process.stdout.write(`related sessions: ${value.relatedSessionIds.join(', ')}\n`);
+  }
+  for (const diagnostic of value.diagnostics) {
+    process.stdout.write(`${diagnostic.code}: ${diagnostic.message}\n`);
+  }
+}
+
 async function main(): Promise<void> {
   const rawArgs = process.argv.slice(2);
   const versionArgs = rawArgs.filter((arg) => arg !== '--no-warning');
@@ -265,6 +284,20 @@ async function main(): Promise<void> {
     outputDiscovery(await discoverSessions({
       dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sources: sources.length ? sources as never : undefined,
       limit: numberFlag(args, 'limit'),
+    }), json);
+    return;
+  }
+  if (command === 'sessions' && subcommand === 'hydrate') {
+    validateFlags(args, 'sessions hydrate', ['all', 'db', 'json', 'local', 'no-related', 'remote']);
+    const [source, sessionId, ...surplus] = rest;
+    if (!source || !sessionId) usage('sessions hydrate requires SOURCE and SESSION_ID');
+    rejectSurplusPositionals(surplus, 'sessions hydrate');
+    outputHydration(await hydrateSession({
+      source: source as never,
+      sessionId,
+      scope: scopeFlag(args),
+      dbPath: textFlag(args, 'db'),
+      includeRelated: !args.flags.has('no-related'),
     }), json);
     return;
   }

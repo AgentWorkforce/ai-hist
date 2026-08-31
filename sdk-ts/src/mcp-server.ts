@@ -6,7 +6,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import {
-  discoverSessions, getSession, getSessionEventsPage, listSessionCatalogPage,
+  discoverSessions, getSession, getSessionEventsPage, hydrateSession, listSessionCatalogPage,
   recent, search, stats, sync,
 } from './index.js';
 
@@ -63,6 +63,15 @@ server.tool('discover_sessions', 'Explicit shallow provider discovery. Updates o
   sources: z.array(CATALOG_SOURCE).optional(), limit: z.number().int().min(1).max(10000).optional(),
   scope: SESSION_SCOPE.optional().default('local'),
 }, LOCAL_WRITE, (args) => call(() => discoverSessions(args)));
+
+server.tool('hydrate_session', 'Fully index one cataloged session without global sync.', {
+  source: CATALOG_SOURCE,
+  session_id: z.string().min(1),
+  scope: SESSION_SCOPE.optional().default('local'),
+  include_related: z.boolean().optional().default(true),
+}, LOCAL_WRITE, ({ source, session_id, scope, include_related }) => call(() => hydrateSession({
+  source, sessionId: session_id, scope, includeRelated: include_related,
+})));
 
 server.tool('get_session', 'Get indexed prompts for one session.', {
   session_id: z.string(), source: SOURCE.optional(), tag: z.string().optional(),

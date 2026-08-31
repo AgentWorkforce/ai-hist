@@ -9,8 +9,9 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const NATIVE_CONTRACT_VERSION = 3;
+export const NATIVE_CONTRACT_VERSION = 4;
 export const SESSION_CATALOG_CONTRACT_VERSION = 2;
+export const SESSION_HYDRATION_CONTRACT_VERSION = 1;
 
 export type Source = 'claude' | 'codex' | 'cursor' | 'grok' | 'relay' | 'trajectory' | 'opencode';
 export type CatalogSource = Exclude<Source, 'trajectory'>;
@@ -31,6 +32,11 @@ export class NativeContractMismatchError extends RelayHistoryError {}
 export class DatabaseOpenError extends RelayHistoryError {}
 export class InvalidArgumentError extends RelayHistoryError {}
 export class UnsupportedOperationError extends RelayHistoryError {}
+export class SessionNotFoundError extends RelayHistoryError {}
+export class SessionSourceUnavailableError extends RelayHistoryError {}
+export class SessionSourceMismatchError extends RelayHistoryError {}
+export class HydrationUnsupportedError extends RelayHistoryError {}
+export class HydrationFailedError extends RelayHistoryError {}
 
 export interface HistoryEntry {
   id: number;
@@ -149,6 +155,46 @@ export interface DiscoverResult {
   counters: DiscoveryCounters;
 }
 
+export interface SessionRef {
+  source: CatalogSource;
+  sessionId: string;
+  scope?: SessionScope;
+}
+
+export interface HydrateSessionOptions extends SessionRef {
+  dbPath?: string;
+  includeRelated?: boolean;
+}
+
+export interface HydrationDiagnostic {
+  code: string;
+  message: string;
+  durationMs: number | null;
+  sourceBytes: number | null;
+  recordsParsed: number | null;
+}
+
+export interface HydrateSessionResult {
+  contractVersion: number;
+  source: CatalogSource;
+  sessionId: string;
+  status: 'hydrated' | 'updated' | 'unchanged';
+  discoveryState: 'full';
+  presence: SessionLocation;
+  indexedThrough: {
+    sourceStamp: string | null;
+    lastEventAtMs: number | null;
+  };
+  evidence: {
+    prompts: number;
+    events: number;
+    toolCalls: number;
+    relatedSessions: number;
+  };
+  relatedSessionIds: string[];
+  diagnostics: HydrationDiagnostic[];
+}
+
 export interface SessionEvent {
   id: number;
   source: Source;
@@ -207,6 +253,7 @@ interface NativeBinding {
   listSessionCatalog(options?: object): Promise<UnknownRecord[]>;
   listSessionCatalogPage(options?: object): Promise<UnknownRecord>;
   discoverSessions(options?: object): Promise<UnknownRecord>;
+  hydrateSession(options: object): Promise<UnknownRecord>;
   sync(options?: object): Promise<UnknownRecord>;
 }
 
@@ -307,6 +354,21 @@ async function nativeCall<T>(call: (binding: NativeBinding) => Promise<T>): Prom
     }
     if (native.code === 'UNSUPPORTED_OPERATION') {
       throw new UnsupportedOperationError(native.message, native.code, { cause: error });
+    }
+    if (native.code === 'SESSION_NOT_FOUND') {
+      throw new SessionNotFoundError(native.message, native.code, { cause: error });
+    }
+    if (native.code === 'SESSION_SOURCE_UNAVAILABLE') {
+      throw new SessionSourceUnavailableError(native.message, native.code, { cause: error });
+    }
+    if (native.code === 'SESSION_SOURCE_MISMATCH') {
+      throw new SessionSourceMismatchError(native.message, native.code, { cause: error });
+    }
+    if (native.code === 'HYDRATION_UNSUPPORTED') {
+      throw new HydrationUnsupportedError(native.message, native.code, { cause: error });
+    }
+    if (native.code === 'HYDRATION_FAILED') {
+      throw new HydrationFailedError(native.message, native.code, { cause: error });
     }
     throw new RelayHistoryError(native.message, native.code, { cause: error });
   }
@@ -471,6 +533,66 @@ export async function discoverSessions(options: DiscoverSessionsOptions = {}): P
         source: String(item.source), locator: nullableString(item.locator), error: String(item.error),
       })) : [],
       counters: result.counters as unknown as DiscoveryCounters,
+    };
+  });
+}
+
+export async function hydrateSession(options: HydrateSessionOptions): Promise<HydrateSessionResult> {
+  if (!options || typeof options !== 'object') {
+    throw new InvalidArgumentError('hydrateSession options are required', 'INVALID_ARGUMENT');
+  }
+  if (!['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode'].includes(options.source)) {
+    throw new InvalidArgumentError(`invalid catalog source: ${String(options.source)}`, 'INVALID_ARGUMENT');
+  }
+  if (typeof options.sessionId !== 'string' || options.sessionId.trim() === '') {
+    throw new InvalidArgumentError('sessionId must not be empty', 'INVALID_ARGUMENT');
+  }
+  return nativeCall(async (native) => {
+    const value = await native.hydrateSession({
+      ...options,
+      scope: options.scope ?? 'local',
+      includeRelated: options.includeRelated ?? true,
+    });
+    const contractVersion = Number(value.contractVersion);
+    if (contractVersion !== SESSION_HYDRATION_CONTRACT_VERSION) {
+      throw new NativeContractMismatchError(
+        `ai-hist expects hydration contract ${SESSION_HYDRATION_CONTRACT_VERSION}, but native returned ${contractVersion}.`,
+        'NATIVE_CONTRACT_MISMATCH',
+      );
+    }
+    if (!['hydrated', 'updated', 'unchanged'].includes(String(value.status)) || value.discoveryState !== 'full') {
+      throw new NativeContractMismatchError(
+        'ai-hist-native returned an invalid hydration result.',
+        'NATIVE_CONTRACT_MISMATCH',
+      );
+    }
+    const indexed = (value.indexedThrough ?? {}) as UnknownRecord;
+    const evidence = (value.evidence ?? {}) as UnknownRecord;
+    return {
+      contractVersion,
+      source: String(value.source) as CatalogSource,
+      sessionId: String(value.sessionId),
+      status: String(value.status) as HydrateSessionResult['status'],
+      discoveryState: 'full',
+      presence: value.presence === 'remote' ? 'remote' : 'local',
+      indexedThrough: {
+        sourceStamp: nullableString(indexed.sourceStamp),
+        lastEventAtMs: typeof indexed.lastEventAtMs === 'number' ? indexed.lastEventAtMs : null,
+      },
+      evidence: {
+        prompts: Number(evidence.prompts),
+        events: Number(evidence.events),
+        toolCalls: Number(evidence.toolCalls),
+        relatedSessions: Number(evidence.relatedSessions),
+      },
+      relatedSessionIds: Array.isArray(value.relatedSessionIds) ? value.relatedSessionIds.map(String) : [],
+      diagnostics: Array.isArray(value.diagnostics) ? (value.diagnostics as UnknownRecord[]).map((item) => ({
+        code: String(item.code),
+        message: String(item.message),
+        durationMs: typeof item.durationMs === 'number' ? item.durationMs : null,
+        sourceBytes: typeof item.sourceBytes === 'number' ? item.sourceBytes : null,
+        recordsParsed: typeof item.recordsParsed === 'number' ? item.recordsParsed : null,
+      })) : [],
     };
   });
 }

@@ -23,6 +23,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Added
 
+- Add transactional targeted session hydration through Rust, N-API, the typed
+  `hydrateSession()` SDK API, `ai-hist sessions hydrate`, and MCP
+  `hydrate_session`. The result reports indexed-through state, evidence counts,
+  related sessions, and bounded-work diagnostics without returning a transcript.
+- Add automatic `session_hydration_checkpoints` and `session_relationships`
+  migrations. Existing databases upgrade in place on their next writable open.
+- Add bounded live OpenCode hydration queries keyed by session ID; targeted
+  hydration never copies or scans the complete OpenCode database.
+
 - Add a consistent session location scope to collection operations: `--local`,
   `--remote`, and `--all` are mutually exclusive, with local as the default.
   Listing, search, recent history, statistics, packs, and resume selection
@@ -36,7 +45,7 @@ Notable changes to the native `ai-hist` CLI are documented here.
   connector ran at every requested location.
 - Add native search, recent, session, paged events, statistics, discovery,
   catalog listing, and explicit sync operations. The native-addon contract is
-  now version 3.
+  now version 4.
 - Add deterministic bounded event pagination using `(ts_ms, id)`.
 
 - Add `ai-hist sessions list` and `ai-hist sessions discover`: a shallow session

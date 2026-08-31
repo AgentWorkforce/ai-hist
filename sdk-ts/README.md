@@ -11,6 +11,7 @@ npm install ai-hist
 ```ts
 import {
   discoverSessions,
+  hydrateSession,
   listSessionCatalogPage,
   getSession,
   getSessionEventsPage,
@@ -25,6 +26,7 @@ await discoverSessions({ scope: 'all', limit: 100 });
 const page = await listSessionCatalogPage({ scope: 'all', limit: 20 });
 const first = page.sessions[0];
 if (first) {
+  await hydrateSession({ source: first.source, sessionId: first.sessionId });
   const prompts = await getSession(first.sessionId);
   const events = await getSessionEventsPage(first.sessionId, { limit: 200 });
   for await (const event of sessionEvents(first.sessionId)) consume(event);
@@ -32,7 +34,10 @@ if (first) {
 ```
 
 All APIs are async. `listSessionCatalog` and `listSessionCatalogPage` are
-cache-only. `discoverSessions` is shallow discovery. `sync` is full ingestion.
+cache-only. `discoverSessions` is shallow discovery. `hydrateSession` is
+targeted evidence acquisition for one existing catalog row. It returns
+`hydrated`, `updated`, or `unchanged`, an indexed source stamp, evidence counts,
+related native session IDs, and bounded-work metrics. `sync` is full ingestion.
 Missing databases return empty read results; they do not trigger provider I/O.
 
 Session discovery, listing, search, recent history, statistics, and sync accept

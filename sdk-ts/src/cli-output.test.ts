@@ -84,6 +84,41 @@ test('sessions list keeps human and JSON output contracts distinct', async () =>
   }
 });
 
+test('sessions hydrate uses the SDK contract and is idempotent', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-hydrate-'));
+  const home = join(root, 'home');
+  const claude = join(home, '.claude', 'projects', 'project');
+  const db = join(root, 'history.db');
+  await mkdir(claude, { recursive: true });
+  await writeFile(join(claude, 'claude-hydrate.jsonl'), `${JSON.stringify({
+    sessionId: 'claude-hydrate', uuid: 'user-1', cwd: '/work/claude', type: 'user',
+    message: { role: 'user', content: 'hydrate this session' }, timestamp: '2026-08-30T10:00:00.000Z',
+  })}\n`);
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  try {
+    await run(process.execPath, [
+      cli, 'sessions', 'discover', '--source', 'claude', '--db', db, '--no-warning',
+    ], { env });
+    const first = await run(process.execPath, [
+      cli, 'sessions', 'hydrate', 'claude', 'claude-hydrate', '--db', db, '--json', '--no-warning',
+    ], { env });
+    const hydrated = JSON.parse(first.stdout) as Record<string, unknown>;
+    assert.equal(hydrated.contract_version, 1);
+    assert.equal(hydrated.status, 'hydrated');
+    assert.equal(hydrated.discovery_state, 'full');
+    assert.deepEqual(hydrated.evidence, {
+      prompts: 1, events: 1, tool_calls: 0, related_sessions: 0,
+    });
+
+    const second = await run(process.execPath, [
+      cli, 'sessions', 'hydrate', 'claude', 'claude-hydrate', '--db', db, '--json', '--no-warning',
+    ], { env });
+    assert.equal((JSON.parse(second.stdout) as Record<string, unknown>).status, 'unchanged');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('scope flags are boolean, default to local, and are mutually exclusive', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-scope-'));
   const db = join(root, 'missing.db');

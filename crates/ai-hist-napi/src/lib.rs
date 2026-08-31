@@ -17,7 +17,7 @@ use ai_hist_core::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 3;
+pub const NATIVE_CONTRACT_VERSION: u32 = 4;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -729,6 +729,117 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
             files_opened: summary.counters.files_opened as i64,
             bytes_read: summary.counters.bytes_read as i64,
         },
+    })
+}
+
+#[napi(object)]
+pub struct HydrateSessionOptions {
+    pub source: String,
+    pub session_id: String,
+    pub scope: Option<String>,
+    pub db_path: Option<String>,
+    pub include_related: Option<bool>,
+}
+
+#[napi(object)]
+pub struct HydrationIndexedThrough {
+    pub source_stamp: Option<String>,
+    pub last_event_at_ms: Option<i64>,
+}
+
+#[napi(object)]
+pub struct HydrationEvidence {
+    pub prompts: i64,
+    pub events: i64,
+    pub tool_calls: i64,
+    pub related_sessions: i64,
+}
+
+#[napi(object)]
+pub struct HydrationDiagnostic {
+    pub code: String,
+    pub message: String,
+    pub duration_ms: Option<i64>,
+    pub source_bytes: Option<i64>,
+    pub records_parsed: Option<i64>,
+}
+
+#[napi(object)]
+pub struct HydrateSessionResult {
+    pub contract_version: u32,
+    pub source: String,
+    pub session_id: String,
+    pub status: String,
+    pub discovery_state: String,
+    pub presence: String,
+    pub indexed_through: HydrationIndexedThrough,
+    pub evidence: HydrationEvidence,
+    pub related_session_ids: Vec<String>,
+    pub diagnostics: Vec<HydrationDiagnostic>,
+}
+
+fn hydration_error(error: anyhow::Error) -> napi::Error {
+    let message = format!("{error:#}");
+    for code in [
+        "SESSION_NOT_FOUND",
+        "SESSION_SOURCE_UNAVAILABLE",
+        "SESSION_SOURCE_MISMATCH",
+        "HYDRATION_UNSUPPORTED",
+        "INVALID_ARGUMENT",
+    ] {
+        if let Some(detail) = message.strip_prefix(&format!("{code}: ")) {
+            return native_error(code, detail);
+        }
+    }
+    native_error("HYDRATION_FAILED", message)
+}
+
+/// Fully index one cataloged session without enumerating unrelated sessions.
+#[napi]
+pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<HydrateSessionResult> {
+    let scope = parse_scope(options.scope)?;
+    let path = db_path(options.db_path);
+    let request = ai_hist_engine::HydrateSessionOptions {
+        source: options.source,
+        session_id: options.session_id,
+        scope,
+        include_related: options.include_related.unwrap_or(true),
+    };
+    let result = napi::tokio::task::spawn_blocking(move || {
+        ai_hist_engine::hydrate_session_at(&path, &request)
+    })
+    .await
+    .map_err(worker_error)?
+    .map_err(hydration_error)?;
+    Ok(HydrateSessionResult {
+        contract_version: result.contract_version,
+        source: result.source,
+        session_id: result.session_id,
+        status: result.status,
+        discovery_state: result.discovery_state,
+        presence: result.presence,
+        indexed_through: HydrationIndexedThrough {
+            source_stamp: result.indexed_through.source_stamp,
+            last_event_at_ms: result.indexed_through.last_event_at_ms,
+        },
+        evidence: HydrationEvidence {
+            prompts: result.evidence.prompts as i64,
+            events: result.evidence.events as i64,
+            tool_calls: result.evidence.tool_calls as i64,
+            related_sessions: result.evidence.related_sessions as i64,
+        },
+        related_session_ids: result.related_session_ids,
+        diagnostics: result
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| HydrationDiagnostic {
+                code: diagnostic.code,
+                message: diagnostic.message,
+                duration_ms: diagnostic.duration_ms,
+                source_bytes: diagnostic.source_bytes,
+                records_parsed: diagnostic.records_parsed,
+            })
+            .collect(),
     })
 }
 
