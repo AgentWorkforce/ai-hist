@@ -24,7 +24,7 @@ on:
       dry_run:
         description: 'Dry run (build only, no publish)'
         required: true
-        default: true
+        default: false
         type: boolean
 
 # Least privilege: the build matrix needs neither repo writes nor OIDC.
