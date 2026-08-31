@@ -459,6 +459,17 @@ const REQUIRED_SESSIONS_INDEXES: &[&str] = &[
     "idx_session_presences_locator",
 ];
 
+/// Indexes retired from `sessions`: nothing queries them, and each was one
+/// more btree per catalog write. [`init_db`] drops them so existing databases
+/// shed the write amplification too; while one is still present the database
+/// has outstanding migration work, and the lock-free fast path must not run.
+const RETIRED_SESSIONS_INDEXES: &[&str] = &[
+    "idx_sessions_cwd",
+    "idx_sessions_branch",
+    "idx_sessions_last",
+    "idx_sessions_source_last",
+];
+
 const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
     "idx_sessions_recency",
     "idx_sessions_source_recency",
@@ -554,6 +565,18 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     Ok(true)
 }
 
+/// Whether any [`RETIRED_SESSIONS_INDEXES`] entry still exists.
+fn retired_indexes_present(conn: &Connection) -> Result<bool> {
+    let mut index =
+        conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1")?;
+    for name in RETIRED_SESSIONS_INDEXES {
+        if index.exists([name])? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Open the database for reading only.
 ///
 /// A read-only handle cannot acquire the write lock, so a query can neither
@@ -583,8 +606,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
 fn init_db_once(conn: &Connection) -> Result<()> {
     // A current database needs no write lock. Besides keeping ordinary opens
     // cheap, this lets sync reach its per-source contention handling when a
-    // different writer already owns the ledger lock.
-    if schema_is_current(conn)? {
+    // different writer already owns the ledger lock. A leftover retired index
+    // counts as outstanding migration work: its DROP is a real write, so it
+    // routes through the serialized pass below instead of this lock-free path.
+    if schema_is_current(conn)? && !retired_indexes_present(conn)? {
         return Ok(());
     }
     enable_wal_for_migration(conn)?;
@@ -595,7 +620,7 @@ fn init_db_once(conn: &Connection) -> Result<()> {
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Another first opener may have completed the migration while this
     // connection waited for the lock.
-    if !schema_is_current(&transaction)? {
+    if !schema_is_current(&transaction)? || retired_indexes_present(&transaction)? {
         init_db_locked(&transaction)?;
     }
     transaction.commit()?;
@@ -726,25 +751,11 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_tags_tag ON session_tags(tag_id)",
         [],
     )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_sessions_branch ON sessions(git_branch)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_activity_ms DESC)",
-        [],
-    )?;
-    // Recency inside one source. Superseded for the source-filtered catalog
-    // listing (`sessions list --source codex`) by `idx_sessions_source_recency`
-    // below, which carries that listing's whole ORDER BY.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_sessions_source_last ON sessions(source, last_activity_ms DESC)",
-        [],
-    )?;
+    // The write cost of the retired indexes showed up directly in
+    // cold-discovery profiles; see RETIRED_SESSIONS_INDEXES.
+    for name in RETIRED_SESSIONS_INDEXES {
+        conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])?;
+    }
     // The catalog's total order is (last_activity_ms DESC, source, session_id):
     // recency alone ties constantly, because every mtime-derived session in one
     // scan can share a timestamp, and a keyset paginator that cannot break
@@ -1122,7 +1133,9 @@ pub fn upsert_session_presence(
     source_stamp: Option<&str>,
     discovery_state: Option<&str>,
 ) -> Result<()> {
-    conn.execute(
+    // Discovery runs this once per freshly read session; the prepared
+    // statement rides the connection's cache.
+    conn.prepare_cached(
         "INSERT INTO session_presences \
          (source, session_id, location, raw_locator, source_stamp, discovery_state) \
          VALUES (?, ?, ?, ?, ?, ?) \
@@ -1133,15 +1146,15 @@ pub fn upsert_session_presence(
              WHEN session_presences.discovery_state = 'full' THEN 'full' \
              ELSE COALESCE(excluded.discovery_state, session_presences.discovery_state) \
          END",
-        params![
-            source,
-            session_id,
-            location.as_str(),
-            raw_locator,
-            source_stamp,
-            discovery_state
-        ],
-    )?;
+    )?
+    .execute(params![
+        source,
+        session_id,
+        location.as_str(),
+        raw_locator,
+        source_stamp,
+        discovery_state
+    ])?;
     Ok(())
 }
 
@@ -2519,6 +2532,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sessions_exists, 1);
+    }
+
+    /// A database that is schema-current but still carries a retired index
+    /// has outstanding migration work: the drop must run (inside the
+    /// transactional pass, not the lock-free fast path) so existing databases
+    /// shed the write amplification on their next open.
+    #[test]
+    fn retired_sessions_indexes_are_dropped_from_a_current_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("CREATE INDEX idx_sessions_cwd ON sessions(cwd)", [])
+            .unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        assert!(retired_indexes_present(&conn).unwrap());
+
+        init_db(&conn).unwrap();
+        assert!(!retired_indexes_present(&conn).unwrap());
     }
 
     /// The catalog columns must reach a database that predates them, and a

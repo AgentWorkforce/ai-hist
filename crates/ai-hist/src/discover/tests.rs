@@ -991,6 +991,39 @@ fn one_broken_provider_does_not_block_the_others() {
     assert_eq!(found.summary.diagnostics[0].source, "opencode");
 }
 
+/// A streaming caller may write its own records (a tag, a commit link)
+/// through the same connection from `on_row`. Discovery's durability
+/// relaxation covers only its own catalog transactions, so the callback — and
+/// the caller after the run — must observe the connection's configured
+/// synchronous level, not discovery's.
+#[test]
+fn on_row_callbacks_run_at_the_configured_durability_not_discoverys() {
+    let conn = catalog();
+    conn.pragma_update(None, "synchronous", "FULL").unwrap();
+    let full: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    claude_session(home.path(), "claude-1", CLAUDE_BODY, 1_750_000_000_000);
+
+    let mut seen = Vec::new();
+    let env = env_at(&conn, home.path());
+    discover_sessions_with_env(&env, &only(&["claude"]), |_| {
+        seen.push(
+            conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+        );
+    })
+    .unwrap();
+
+    assert!(!seen.is_empty(), "the fixture session must be emitted");
+    assert_eq!(seen, vec![full; seen.len()]);
+    let after: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after, full);
+}
+
 #[test]
 fn a_run_fails_only_when_every_provider_fails() {
     let conn = catalog();

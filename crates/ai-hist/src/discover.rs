@@ -57,7 +57,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use ai_hist_core::{upsert_session_presence, SessionLocation, SessionScope, SOURCE_CHOICES};
@@ -1119,42 +1119,86 @@ impl ShallowSessionProvider for GrokProvider {
 /// session/message/part join. The database is snapshotted once per run with
 /// `Connection::backup`, exactly as the full sync does, so an in-flight WAL
 /// never yields a torn read.
+///
+/// The snapshot is held open on one connection for the whole run, and —
+/// because it is a private throwaway copy — indexed by `session_id` up
+/// front when the live store isn't: the per-candidate excerpt and model
+/// queries then seek instead of scanning `message` and `part` once per
+/// session, which made a cold discovery quadratic in store size.
 #[derive(Default)]
 struct OpencodeProvider {
-    snapshot: Mutex<Option<tempfile::TempPath>>,
+    snapshot: Mutex<Option<OpencodeSnapshot>>,
+}
+
+/// One run's open snapshot: the connection, plus per-store facts that are
+/// invariant across candidates and so are read exactly once.
+struct OpencodeSnapshot {
+    conn: Connection,
+    session_columns: BTreeSet<String>,
+    /// Keeps the snapshot file on disk for as long as the connection lives.
+    _file: tempfile::TempPath,
 }
 
 impl OpencodeProvider {
-    fn ensure_snapshot(&self, scan: &ScanEnv<'_>) -> Result<bool> {
+    /// The run's snapshot, created on first use. `None` inside the guard
+    /// means there is no opencode store on this machine.
+    fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<OpencodeSnapshot>>> {
         let mut guard = self.snapshot.lock().expect("opencode snapshot lock");
-        if guard.is_some() {
-            return Ok(true);
+        if guard.is_none() && scan.opencode_db.exists() {
+            let file = tempfile::NamedTempFile::new()?.into_temp_path();
+            let live = Connection::open_with_flags(
+                scan.opencode_db,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )
+            .with_context(|| format!("opening {}", scan.opencode_db.display()))?;
+            live.busy_timeout(Duration::from_secs(5))?;
+            live.backup(DatabaseName::Main, &file, None)
+                .with_context(|| format!("snapshotting {}", scan.opencode_db.display()))?;
+            scan.note_open();
+            scan.note_bytes(fs::metadata(scan.opencode_db).map(|m| m.len()).unwrap_or(0));
+            let conn = Connection::open(&file)?;
+            index_opencode_snapshot(&conn)?;
+            let session_columns = table_columns(&conn, "session");
+            *guard = Some(OpencodeSnapshot {
+                conn,
+                session_columns,
+                _file: file,
+            });
         }
-        if !scan.opencode_db.exists() {
-            return Ok(false);
-        }
-        let tmp = tempfile::NamedTempFile::new()?.into_temp_path();
-        let live = Connection::open_with_flags(
-            scan.opencode_db,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
-        .with_context(|| format!("opening {}", scan.opencode_db.display()))?;
-        live.busy_timeout(Duration::from_secs(5))?;
-        live.backup(DatabaseName::Main, &tmp, None)
-            .with_context(|| format!("snapshotting {}", scan.opencode_db.display()))?;
-        scan.note_open();
-        scan.note_bytes(fs::metadata(scan.opencode_db).map(|m| m.len()).unwrap_or(0));
-        *guard = Some(tmp);
-        Ok(true)
+        Ok(guard)
     }
+}
 
-    fn open_snapshot(&self) -> Result<Connection> {
-        let guard = self.snapshot.lock().expect("opencode snapshot lock");
-        let path = guard
-            .as_ref()
-            .context("opencode snapshot was not prepared")?;
-        Ok(Connection::open(path)?)
+/// Give the snapshot the `session_id` seeks the per-candidate queries need,
+/// unless the store already ships an equivalent index. Nobody else reads the
+/// snapshot and it never outlives the run, so durability is turned off: the
+/// build costs one scan per table instead of one scan per candidate.
+fn index_opencode_snapshot(conn: &Connection) -> Result<()> {
+    let mut ddl = String::new();
+    for table in ["message", "part"] {
+        if table_columns(conn, table).contains("session_id") && !has_session_id_index(conn, table) {
+            ddl.push_str(&format!(
+                "CREATE INDEX ai_hist_{table}_session ON {table}(session_id);"
+            ));
+        }
     }
+    if !ddl.is_empty() {
+        conn.execute_batch(&format!(
+            "PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; {ddl}"
+        ))?;
+    }
+    Ok(())
+}
+
+/// Whether `table` already has an index whose leading column is `session_id`.
+fn has_session_id_index(conn: &Connection, table: &str) -> bool {
+    conn.prepare(&format!(
+        "SELECT 1 FROM pragma_index_list('{table}') indexes \
+         JOIN pragma_index_info(indexes.name) columns \
+         WHERE columns.seqno = 0 AND columns.name = 'session_id' LIMIT 1"
+    ))
+    .and_then(|mut stmt| stmt.query_row([], |_| Ok(())))
+    .is_ok()
 }
 
 fn table_columns(conn: &Connection, table: &str) -> BTreeSet<String> {
@@ -1172,11 +1216,11 @@ impl ShallowSessionProvider for OpencodeProvider {
     }
 
     fn enumerate(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
-        if !self.ensure_snapshot(&env.scan())? {
+        let guard = self.snapshot(&env.scan())?;
+        let Some(snapshot) = guard.as_ref() else {
             return Ok(Vec::new());
-        }
-        let conn = self.open_snapshot()?;
-        let columns = table_columns(&conn, "session");
+        };
+        let columns = &snapshot.session_columns;
         if !columns.contains("id") {
             return Ok(Vec::new());
         }
@@ -1193,7 +1237,7 @@ impl ShallowSessionProvider for OpencodeProvider {
         let sql = format!(
             "SELECT id, {created}, {updated} FROM session WHERE id IS NOT NULL AND id <> ''"
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = snapshot.conn.prepare(&sql)?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -1223,11 +1267,12 @@ impl ShallowSessionProvider for OpencodeProvider {
         _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
-        if !self.ensure_snapshot(scan)? {
+        let guard = self.snapshot(scan)?;
+        let Some(snapshot) = guard.as_ref() else {
             return Ok(None);
-        }
-        let conn = self.open_snapshot()?;
-        let columns = table_columns(&conn, "session");
+        };
+        let conn = &snapshot.conn;
+        let columns = &snapshot.session_columns;
         let directory = if columns.contains("directory") {
             "directory"
         } else {
@@ -1245,12 +1290,15 @@ impl ShallowSessionProvider for OpencodeProvider {
         };
         let sql = format!("SELECT {directory}, {created}, {updated} FROM session WHERE id = ?");
         let row = conn
-            .query_row(&sql, [&candidate.locator], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                ))
+            .prepare_cached(&sql)
+            .and_then(|mut stmt| {
+                stmt.query_row([&candidate.locator], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                })
             })
             .ok();
         let Some((directory, created, updated)) = row else {
@@ -1261,26 +1309,33 @@ impl ShallowSessionProvider for OpencodeProvider {
         // first 4096 characters would break the bounded-read promise for a
         // catalog entry.
         let first_prompt = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT substr(json_extract(p.data, '$.text'), 1, ?) \
                  FROM part p JOIN message m ON m.id = p.message_id \
                  WHERE p.session_id = ? AND json_extract(m.data, '$.role') = 'user' \
                  AND json_extract(p.data, '$.type') = 'text' \
                  ORDER BY COALESCE(p.time_created, m.time_created) ASC LIMIT 1",
-                params![EXCERPT_MAX_CHARS as i64, &candidate.locator],
-                |row| row.get::<_, Option<String>>(0),
             )
+            .and_then(|mut stmt| {
+                stmt.query_row(
+                    params![EXCERPT_MAX_CHARS as i64, &candidate.locator],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+            })
             .ok()
             .flatten()
             .map(|text| excerpt(&text))
             .filter(|text| !text.is_empty());
         let mut models = Vec::new();
-        if let Ok(model) = conn.query_row(
-            "SELECT json_extract(data, '$.modelID') FROM message \
-             WHERE session_id = ? AND json_extract(data, '$.modelID') IS NOT NULL LIMIT 1",
-            [&candidate.locator],
-            |row| row.get::<_, Option<String>>(0),
-        ) {
+        if let Ok(model) = conn
+            .prepare_cached(
+                "SELECT json_extract(data, '$.modelID') FROM message \
+                 WHERE session_id = ? AND json_extract(data, '$.modelID') IS NOT NULL LIMIT 1",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_row([&candidate.locator], |row| row.get::<_, Option<String>>(0))
+            })
+        {
             push_unique(&mut models, model.as_deref());
         }
         Ok(Some(ShallowSession {
@@ -1620,14 +1675,20 @@ pub fn list_session_catalog_page(
     })
 }
 
+// Classification runs these once per candidate; the SQL strings are built
+// once and the prepared statements ride the connection's cache, because
+// re-preparing them dominated a cold discovery of a large catalog.
+static CATALOG_ROW_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE source = ? AND session_id = ?")
+});
 fn fetch_catalog_row(
     conn: &Connection,
     source: &str,
     session_id: &str,
 ) -> Result<Option<ShallowSession>> {
-    let sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE source = ? AND session_id = ?");
     Ok(conn
-        .query_row(&sql, params![source, session_id], row_to_session)
+        .prepare_cached(&CATALOG_ROW_SQL)
+        .and_then(|mut stmt| stmt.query_row(params![source, session_id], row_to_session))
         .ok())
 }
 
@@ -1645,17 +1706,16 @@ fn fetch_catalog_row_at_location(
         SessionLocation::Remote => "remote",
     };
     let presence = conn
-        .query_row(
+        .prepare_cached(
             "SELECT raw_locator, source_stamp FROM session_presences \
              WHERE source = ? AND session_id = ? AND location = ?",
-            params![source, session_id, location],
-            |result| {
-                Ok((
-                    result.get::<_, Option<String>>(0)?,
-                    result.get::<_, Option<String>>(1)?,
-                ))
-            },
-        )
+        )?
+        .query_row(params![source, session_id, location], |result| {
+            Ok((
+                result.get::<_, Option<String>>(0)?,
+                result.get::<_, Option<String>>(1)?,
+            ))
+        })
         .optional()?;
     let Some((raw_locator, source_stamp)) = presence else {
         return Ok(None);
@@ -1671,12 +1731,11 @@ fn fetch_catalog_row_by_path(
     raw_path: &str,
 ) -> Result<Option<ShallowSession>> {
     let session_id = conn
-        .query_row(
+        .prepare_cached(
             "SELECT session_id FROM session_presences \
              WHERE location = 'local' AND source = ? AND raw_locator = ? LIMIT 1",
-            params![source, raw_path],
-            |row| row.get::<_, String>(0),
-        )
+        )?
+        .query_row(params![source, raw_path], |row| row.get::<_, String>(0))
         .optional()?;
     match session_id {
         Some(session_id) => {
@@ -1699,33 +1758,28 @@ fn is_known_non_session(
     stamp: &str,
 ) -> Result<bool> {
     let known: Option<String> = conn
-        .query_row(
-            "SELECT stamp FROM discovery_skips WHERE source = ? AND locator = ?",
-            params![source, locator],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT stamp FROM discovery_skips WHERE source = ? AND locator = ?")
+        .and_then(|mut stmt| stmt.query_row(params![source, locator], |row| row.get(0)))
         .ok();
     Ok(known.as_deref() == Some(stamp))
 }
 
 /// Remember that this source, at this stamp, is not a session.
 fn record_non_session(conn: &Connection, source: &str, locator: &str, stamp: &str) -> Result<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO discovery_skips (source, locator, stamp, reason, updated_ms) \
          VALUES (?, ?, ?, 'not-a-session', ?) \
          ON CONFLICT(source, locator) DO UPDATE SET \
          stamp = excluded.stamp, reason = excluded.reason, updated_ms = excluded.updated_ms",
-        params![source, locator, stamp, now_ms()],
-    )?;
+    )?
+    .execute(params![source, locator, stamp, now_ms()])?;
     Ok(())
 }
 
 /// Drop a stale non-session marker once a source does resolve to a session.
 fn clear_non_session(conn: &Connection, source: &str, locator: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM discovery_skips WHERE source = ? AND locator = ?",
-        params![source, locator],
-    )?;
+    conn.prepare_cached("DELETE FROM discovery_skips WHERE source = ? AND locator = ?")?
+        .execute(params![source, locator])?;
     Ok(())
 }
 
@@ -1736,39 +1790,8 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-/// Write a shallow row into the catalog.
-///
-/// Never nulls out a value the catalog already holds, never lowers
-/// `first_activity_ms` past what a fuller pass observed, and never downgrades
-/// a fully indexed row to `'shallow'` — including a row from a database that
-/// predates `discovery_state`, whose NULL readers deliberately interpret as
-/// `'full'`. A shallow rescan of such a row still refreshes its metadata and
-/// stamp.
-pub fn upsert_shallow_session(conn: &Connection, session: &ShallowSession) -> Result<()> {
-    upsert_shallow_session_at_location(conn, session, SessionLocation::Local)
-}
-
-/// Upsert shallow canonical metadata and connector-specific presence state.
-pub fn upsert_shallow_session_at_location(
-    conn: &Connection,
-    session: &ShallowSession,
-    location: SessionLocation,
-) -> Result<()> {
-    if conn.is_autocommit() {
-        let transaction = conn.unchecked_transaction()?;
-        upsert_shallow_session_in_transaction(&transaction, session, location)?;
-        transaction.commit()?;
-        return Ok(());
-    }
-    upsert_shallow_session_in_transaction(conn, session, location)
-}
-
-fn upsert_shallow_session_in_transaction(
-    conn: &Connection,
-    session: &ShallowSession,
-    location: SessionLocation,
-) -> Result<()> {
-    conn.execute(
+static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
         "INSERT INTO sessions \
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, \
           last_assistant_text, raw_path, parser_version, first_prompt, models_json, originator, \
@@ -1798,7 +1821,63 @@ fn upsert_shallow_session_in_transaction(
          source_stamp = COALESCE(excluded.source_stamp, sessions.source_stamp), \
          discovery_state = CASE \
              WHEN sessions.discovery_state IS NULL OR sessions.discovery_state = 'full' \
-             THEN 'full' ELSE 'shallow' END",
+             THEN 'full' ELSE 'shallow' END \
+         RETURNING {SESSION_COLUMNS}"
+    )
+});
+
+/// Write a shallow row into the catalog, returning the merged row as stored.
+///
+/// Never nulls out a value the catalog already holds, never lowers
+/// `first_activity_ms` past what a fuller pass observed, and never downgrades
+/// a fully indexed row to `'shallow'` — including a row from a database that
+/// predates `discovery_state`, whose NULL readers deliberately interpret as
+/// `'full'`. A shallow rescan of such a row still refreshes its metadata and
+/// stamp.
+///
+/// The returned row is what the catalog now holds (including a preserved
+/// `full` state), read back through the write's own `RETURNING` clause so the
+/// merge costs no second lookup.
+pub fn upsert_shallow_session(
+    conn: &Connection,
+    session: &ShallowSession,
+) -> Result<ShallowSession> {
+    upsert_shallow_session_at_location(conn, session, SessionLocation::Local)
+}
+
+/// Upsert shallow canonical metadata and connector-specific presence state.
+pub fn upsert_shallow_session_at_location(
+    conn: &Connection,
+    session: &ShallowSession,
+    location: SessionLocation,
+) -> Result<ShallowSession> {
+    if conn.is_autocommit() {
+        let transaction = conn.unchecked_transaction()?;
+        let row = upsert_shallow_session_in_transaction(&transaction, session, location)?;
+        transaction.commit()?;
+        return Ok(row);
+    }
+    upsert_shallow_session_in_transaction(conn, session, location)
+}
+
+fn upsert_shallow_session_in_transaction(
+    conn: &Connection,
+    session: &ShallowSession,
+    location: SessionLocation,
+) -> Result<ShallowSession> {
+    // The presence lands first: the sessions upsert's RETURNING clause
+    // computes `locations` from `session_presences`, so this run's own
+    // presence must already be visible when the merged row is read back.
+    upsert_session_presence(
+        conn,
+        &session.source,
+        &session.session_id,
+        location,
+        session.raw_path.as_deref(),
+        session.source_stamp.as_deref(),
+        Some(&session.discovery_state),
+    )?;
+    let mut row = conn.prepare_cached(&UPSERT_SESSION_SQL)?.query_row(
         params![
             session.session_id,
             session.source,
@@ -1817,17 +1896,10 @@ fn upsert_shallow_session_in_transaction(
             json_array_or_none(&session.workspace_roots),
             session.source_stamp,
         ],
+        row_to_session,
     )?;
-    upsert_session_presence(
-        conn,
-        &session.source,
-        &session.session_id,
-        location,
-        session.raw_path.as_deref(),
-        session.source_stamp.as_deref(),
-        Some(&session.discovery_state),
-    )?;
-    Ok(())
+    row.from_cache = false;
+    Ok(row)
 }
 
 // ---------------------------------------------------------------------------
@@ -2165,9 +2237,22 @@ pub fn discover_sessions_with_env(
         // costs one commit per window instead of one per row. Cached-only
         // windows stay read-only, and rows are not exposed to callers until
         // every write they describe has committed successfully.
+        //
+        // The transaction writes only stamp-guarded `sessions` rows and
+        // `discovery_skips` markers — data a rescan of the provider sources
+        // reproduces — so it commits at WAL's NORMAL durability instead of
+        // paying FULL's fsync. The relaxation covers exactly this
+        // transaction: the guard restores the previous level before the
+        // window's rows are emitted, so an `on_row` callback that writes its
+        // own records through this connection (a tag, a commit link) commits
+        // at the database's configured durability.
         let has_writes = entries
             .iter()
             .any(|entry| matches!(entry, WindowEntry::Read { .. }));
+        let synchronous = match has_writes {
+            true => Some(RelaxedSynchronous::new(conn)?),
+            false => None,
+        };
         if has_writes {
             conn.execute_batch("BEGIN IMMEDIATE")?;
         }
@@ -2229,34 +2314,26 @@ pub fn discover_sessions_with_env(
             let mut session = session;
             session.source_stamp = Some(expected);
             session.discovery_state = "shallow".to_string();
-            if let Err(error) = upsert_shallow_session(conn, &session) {
-                summary.diagnostics.push(DiscoveryDiagnostic {
-                    source: candidate.source.to_string(),
-                    locator: Some(candidate.locator.clone()),
-                    error: format!("{error:#}"),
-                });
-                continue;
-            }
+            // The upsert's RETURNING clause hands back the merged catalog row,
+            // so what a caller sees is exactly what the catalog now holds
+            // (including a preserved `full` state).
+            let row = match upsert_shallow_session(conn, &session) {
+                Ok(row) => row,
+                Err(error) => {
+                    summary.diagnostics.push(DiscoveryDiagnostic {
+                        source: candidate.source.to_string(),
+                        locator: Some(candidate.locator.clone()),
+                        error: format!("{error:#}"),
+                    });
+                    continue;
+                }
+            };
             // A file that used to be skipped as a non-session (or was never one)
             // must not keep a stale marker once it resolves to a session.
             if let Err(error) = clear_non_session(conn, candidate.source, &candidate.locator) {
                 window_error = Some(error);
                 break 'apply;
             }
-            // Emit the merged catalog row, so what a caller sees is exactly what
-            // the catalog now holds (including a preserved `full` state).
-            let row = match fetch_catalog_row(conn, &session.source, &session.session_id) {
-                Ok(row) => row
-                    .map(|mut row| {
-                        row.from_cache = false;
-                        row
-                    })
-                    .unwrap_or(session),
-                Err(error) => {
-                    window_error = Some(error);
-                    break 'apply;
-                }
-            };
             window_discovered += 1;
             *window_discovered_by_source
                 .entry(candidate.source.to_string())
@@ -2272,6 +2349,7 @@ pub fn discover_sessions_with_env(
                 return Err(error.into());
             }
         }
+        drop(synchronous);
 
         summary.discovered += window_discovered;
         for (source, discovered) in window_discovered_by_source {
@@ -2297,6 +2375,35 @@ pub fn discover_sessions_with_env(
 const MAX_READ_WINDOW: usize = 256;
 /// Most worker threads one window's filesystem reads fan out across.
 const MAX_READ_WORKERS: usize = 16;
+
+/// Scoped `PRAGMA synchronous = NORMAL` for one discovery write transaction.
+///
+/// Constructed around each window's catalog transaction in
+/// [`discover_sessions_with_env`] and restores the connection's previous
+/// synchronous level when dropped — before the window's rows reach `on_row` —
+/// so only discovery's own commits (reconstructible catalog rows and skip
+/// markers) run at the relaxed durability, never a callback's writes through
+/// the same connection.
+struct RelaxedSynchronous<'a> {
+    conn: &'a Connection,
+    previous: i64,
+}
+
+impl<'a> RelaxedSynchronous<'a> {
+    fn new(conn: &'a Connection) -> Result<Self> {
+        let previous = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(Self { conn, previous })
+    }
+}
+
+impl Drop for RelaxedSynchronous<'_> {
+    fn drop(&mut self) {
+        // Best effort: a connection that cannot take the pragma any more is
+        // being torn down anyway.
+        let _ = self.conn.pragma_update(None, "synchronous", self.previous);
+    }
+}
 
 /// One classified candidate in a read window.
 enum WindowEntry<'c> {
