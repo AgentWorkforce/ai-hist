@@ -2039,27 +2039,29 @@ fn select_providers(
             SOURCE_CHOICES.join(", ")
         );
     }
+    // Same loud refusal `validate_discovery_scope` gives before the ledger
+    // opens, re-checked here for callers that skip it — and source-aware: a
+    // filter that leaves a remote-only request with nothing configured is
+    // the same unsupported request, scoped down.
+    if options.scope == SessionScope::Remote {
+        crate::remote::ensure_remote_connectors_configured_for_at(
+            "discovery",
+            home,
+            &options.sources,
+        )?;
+    }
     let mut providers: Vec<Box<dyn ShallowSessionProvider>> = Vec::new();
     if matches!(options.scope, SessionScope::Local | SessionScope::All) {
         providers.extend(shallow_providers());
     }
     if matches!(options.scope, SessionScope::Remote | SessionScope::All) {
-        let remote = crate::remote::configured_remote_providers(home, options.limit);
-        if options.scope == SessionScope::Remote && remote.is_empty() {
-            // Same loud refusal `validate_discovery_scope` gives before the
-            // ledger opens, re-checked here for callers that skip it.
-            crate::remote::ensure_remote_connectors_configured_at("discovery", home)?;
-        }
-        providers.extend(remote);
+        providers.extend(crate::remote::configured_remote_providers(
+            home,
+            options.limit,
+        ));
     }
     if !options.sources.is_empty() {
         providers.retain(|provider| options.sources.iter().any(|s| s == provider.source()));
-        // A source filter that leaves a remote-only request with nothing
-        // configured is the same unsupported request, scoped down.
-        anyhow::ensure!(
-            !providers.is_empty() || options.scope != SessionScope::Remote,
-            "remote session discovery is not available for the requested source(s): no matching remote provider connectors are configured"
-        );
     }
     Ok(providers)
 }

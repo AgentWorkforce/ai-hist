@@ -34,11 +34,20 @@ connectors shipped, now including the per-connector reason. `--all` runs
 whatever is configured and never errors on absence — the acquisition
 summary's `locations_run` says what executed.
 
-`claude-web` talks to `https://api.anthropic.com` by default and honors
-`ANTHROPIC_BASE_URL`. Plain `http://` is refused except for loopback
-addresses, so the stored OAuth token cannot be sent over cleartext to a
-remote host. An expired token is reported before any request is made; running
-the Claude Code CLI once refreshes it.
+`claude-web` talks to `https://api.anthropic.com` only. It deliberately does
+**not** honor `ANTHROPIC_BASE_URL` — that variable redirects generic
+Anthropic API traffic (LLM gateways, dev proxies), and following it here
+would send the stored claude.ai OAuth token to whatever host it names.
+Redirecting the session-list endpoint is its own explicit decision via
+`RELAYHISTORY_CLAUDE_API_BASE_URL`, and plain `http://` is refused except for
+loopback addresses, so the token cannot travel cleartext to a remote host. An
+expired token is reported before any request is made; running the Claude Code
+CLI once refreshes it.
+
+`codex-cloud` pages through the CLI's listing window: `codex cloud list`
+accepts `--limit` values of 1–20, so the connector requests bounded pages and
+follows the returned `cursor` until the listing (or a requested row cap) is
+exhausted.
 
 ## What remote rows carry
 

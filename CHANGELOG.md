@@ -26,9 +26,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - Add remote provider connectors behind the existing `--remote` / `--all`
   acquisition scopes: `claude-web` lists claude.ai/code web sessions with the
   OAuth sign-in the Claude Code CLI stored (`~/.claude/.credentials.json`,
-  overridable with `RELAYHISTORY_CLAUDE_CREDENTIALS`; honors
-  `ANTHROPIC_BASE_URL` with an https-or-loopback guard), and `codex-cloud`
-  lists Codex cloud tasks through `codex cloud list --json`
+  overridable with `RELAYHISTORY_CLAUDE_CREDENTIALS`; the endpoint moves only
+  via the connector-specific `RELAYHISTORY_CLAUDE_API_BASE_URL`, guarded to
+  https-or-loopback, never via the generic `ANTHROPIC_BASE_URL`), and
+  `codex-cloud` lists Codex cloud tasks through `codex cloud list --json`,
+  paging with `--cursor` inside the CLI's 1–20 `--limit` window
   (`~/.codex/auth.json` marks it configured). Connector rows land in the
   shared ledger as shallow catalog rows with a `remote` presence, participate
   in stamp-guarded rescans, and dedupe against local presences of the same

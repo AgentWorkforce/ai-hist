@@ -258,15 +258,36 @@ fn claude_transport_refuses_plaintext_off_loopback() {
 // codex-cloud
 // ---------------------------------------------------------------------------
 
+/// Serves a fixed sequence of listing pages and records each (limit, cursor)
+/// the provider asked for.
 struct ScriptedLister {
-    payload: String,
-    limits: Mutex<Vec<Option<usize>>>,
+    pages: Vec<String>,
+    calls: Mutex<Vec<(usize, Option<String>)>>,
+    next: AtomicUsize,
+}
+
+impl ScriptedLister {
+    fn new(pages: Vec<String>) -> Self {
+        Self {
+            pages,
+            calls: Mutex::new(Vec::new()),
+            next: AtomicUsize::new(0),
+        }
+    }
 }
 
 impl CodexCloudLister for Arc<ScriptedLister> {
-    fn list_json(&self, limit: Option<usize>) -> Result<String> {
-        self.limits.lock().unwrap().push(limit);
-        Ok(self.payload.clone())
+    fn list_json(&self, limit: usize, cursor: Option<&str>) -> Result<String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((limit, cursor.map(str::to_string)));
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        Ok(self
+            .pages
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| r#"{"tasks":[],"cursor":null}"#.to_string()))
     }
 }
 
@@ -291,20 +312,22 @@ const CODEX_LISTING: &str = r#"{
 
 #[test]
 fn codex_listing_parses_both_documented_shapes() {
-    assert_eq!(parse_codex_cloud_listing(CODEX_LISTING).unwrap().len(), 2);
-    assert_eq!(
-        parse_codex_cloud_listing(r#"[{"id":"task_e_1"}]"#)
-            .unwrap()
-            .len(),
-        1
-    );
+    let page = parse_codex_cloud_listing(CODEX_LISTING).unwrap();
+    assert_eq!(page.tasks.len(), 2);
+    assert_eq!(page.cursor, None);
+    let bare = parse_codex_cloud_listing(r#"[{"id":"task_e_1"}]"#).unwrap();
+    assert_eq!(bare.tasks.len(), 1);
+    assert_eq!(bare.cursor, None, "a bare array carries no continuation");
+    let continued =
+        parse_codex_cloud_listing(r#"{"tasks":[{"id":"task_e_2"}],"cursor":"page-2"}"#).unwrap();
+    assert_eq!(continued.cursor.as_deref(), Some("page-2"));
     assert!(parse_codex_cloud_listing("not json").is_err());
     assert!(parse_codex_cloud_listing(r#"{"cursor":null}"#).is_err());
 }
 
 #[test]
 fn codex_mapping_carries_the_task_listing_and_stamps_on_status() {
-    let tasks = parse_codex_cloud_listing(CODEX_LISTING).unwrap();
+    let tasks = parse_codex_cloud_listing(CODEX_LISTING).unwrap().tasks;
     let (candidate, session) = map_codex_cloud_task(&tasks[0]).expect("a mappable task");
     assert_eq!(session.source, "codex");
     assert_eq!(session.session_id, "task_e_123");
@@ -323,18 +346,54 @@ fn codex_mapping_carries_the_task_listing_and_stamps_on_status() {
 }
 
 #[test]
-fn codex_provider_forwards_the_row_limit_to_the_cli() {
-    let lister = Arc::new(ScriptedLister {
-        payload: CODEX_LISTING.to_string(),
-        limits: Mutex::new(Vec::new()),
-    });
+fn codex_provider_forwards_a_bounded_page_limit_to_the_cli() {
+    let lister = Arc::new(ScriptedLister::new(vec![CODEX_LISTING.to_string()]));
     let provider = CodexCloudProvider::new(Box::new(Arc::clone(&lister)), Some(7));
     let home = tempfile::tempdir().unwrap();
     let conn = catalog();
     let env = env_at(&conn, home.path());
     let candidates = provider.enumerate(&env).unwrap();
     assert_eq!(candidates.len(), 1);
-    assert_eq!(*lister.limits.lock().unwrap(), vec![Some(7)]);
+    assert_eq!(*lister.calls.lock().unwrap(), vec![(7, None)]);
+
+    // A global limit above the CLI's window is clamped per page, never
+    // forwarded verbatim (the CLI rejects --limit values over 20).
+    let lister = Arc::new(ScriptedLister::new(vec![CODEX_LISTING.to_string()]));
+    let provider = CodexCloudProvider::new(Box::new(Arc::clone(&lister)), Some(500));
+    let env = env_at(&conn, home.path());
+    provider.enumerate(&env).unwrap();
+    assert_eq!(*lister.calls.lock().unwrap(), vec![(20, None)]);
+}
+
+#[test]
+fn codex_provider_follows_the_cursor_across_pages() {
+    let page_one = r#"{"tasks":[{"id":"task_e_1","title":"one","status":"ready","updated_at":"2026-06-22T09:00:00Z"}],"cursor":"page-2"}"#;
+    let page_two = r#"{"tasks":[{"id":"task_e_2","title":"two","status":"ready","updated_at":"2026-06-21T09:00:00Z"}],"cursor":null}"#;
+    let lister = Arc::new(ScriptedLister::new(vec![
+        page_one.to_string(),
+        page_two.to_string(),
+    ]));
+    let provider = CodexCloudProvider::new(Box::new(Arc::clone(&lister)), None);
+    let home = tempfile::tempdir().unwrap();
+    let conn = catalog();
+    let env = env_at(&conn, home.path());
+    let candidates = provider.enumerate(&env).unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(
+        *lister.calls.lock().unwrap(),
+        vec![(20, None), (20, Some("page-2".to_string()))]
+    );
+
+    // A satisfied row limit ends the walk without following the cursor.
+    let lister = Arc::new(ScriptedLister::new(vec![
+        page_one.to_string(),
+        page_two.to_string(),
+    ]));
+    let provider = CodexCloudProvider::new(Box::new(Arc::clone(&lister)), Some(1));
+    let env = env_at(&conn, home.path());
+    let candidates = provider.enumerate(&env).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(*lister.calls.lock().unwrap(), vec![(1, None)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -364,16 +423,49 @@ fn statuses_report_missing_credentials_with_the_paths_looked_at() {
     assert!(ensure_remote_connectors_configured_at("discovery", home.path()).is_ok());
 }
 
+#[test]
+fn a_source_filter_that_excludes_every_configured_connector_is_unsupported() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+    std::fs::write(home.path().join(".codex/auth.json"), "{}").unwrap();
+
+    let ok = |sources: &[&str]| {
+        ensure_remote_connectors_configured_for_at(
+            "discovery",
+            home.path(),
+            &sources.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+    };
+    assert!(ok(&[]).is_ok());
+    assert!(ok(&["codex"]).is_ok());
+    assert!(
+        ok(&["codex", "claude"]).is_ok(),
+        "one configured match is enough"
+    );
+
+    // Only codex is configured, so a claude-only request is unsupported…
+    let error = ok(&["claude"]).unwrap_err().to_string();
+    assert!(
+        error.contains("no remote provider connectors are configured"),
+        "{error}"
+    );
+    assert!(error.contains("claude-web"), "{error}");
+    assert!(!error.contains("codex-cloud"), "{error}");
+    // …and a source no connector will ever serve says so distinctly.
+    let error = ok(&["cursor"]).unwrap_err().to_string();
+    assert!(
+        error.contains("no matching remote provider connectors exist"),
+        "{error}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // engine integration
 // ---------------------------------------------------------------------------
 
 fn remote_codex_provider(payload: &str, limit: Option<usize>) -> Box<dyn ShallowSessionProvider> {
     Box::new(CodexCloudProvider::new(
-        Box::new(Arc::new(ScriptedLister {
-            payload: payload.to_string(),
-            limits: Mutex::new(Vec::new()),
-        })),
+        Box::new(Arc::new(ScriptedLister::new(vec![payload.to_string()]))),
         limit,
     ))
 }

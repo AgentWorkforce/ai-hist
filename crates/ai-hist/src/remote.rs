@@ -153,7 +153,34 @@ pub fn ensure_remote_connectors_configured(operation: &str) -> Result<()> {
 
 /// [`ensure_remote_connectors_configured`] under an explicit home directory.
 pub fn ensure_remote_connectors_configured_at(operation: &str, home: &Path) -> Result<()> {
-    let statuses = remote_connector_statuses_at(home);
+    ensure_remote_connectors_configured_for_at(operation, home, &[])
+}
+
+/// Reject a remote-only acquisition that no configured connector can serve
+/// once a source filter is applied, using the process home directory.
+///
+/// An empty `sources` filter means "every source". A filter that names only
+/// sources without a remote connector (or whose connectors are not signed
+/// in) is the same unsupported request, scoped down — callers classify both
+/// as unsupported-operation, never as a runtime discovery failure.
+pub fn ensure_remote_connectors_configured_for(operation: &str, sources: &[String]) -> Result<()> {
+    ensure_remote_connectors_configured_for_at(operation, &crate::home_dir(), sources)
+}
+
+/// [`ensure_remote_connectors_configured_for`] under an explicit home directory.
+pub fn ensure_remote_connectors_configured_for_at(
+    operation: &str,
+    home: &Path,
+    sources: &[String],
+) -> Result<()> {
+    let statuses: Vec<RemoteConnectorStatus> = remote_connector_statuses_at(home)
+        .into_iter()
+        .filter(|status| sources.is_empty() || sources.iter().any(|s| s == status.source))
+        .collect();
+    anyhow::ensure!(
+        !statuses.is_empty(),
+        "remote session {operation} is not available for the requested source(s): no matching remote provider connectors exist"
+    );
     anyhow::ensure!(
         statuses.iter().any(|status| status.configured),
         unconfigured_message(operation, &statuses)
@@ -256,7 +283,12 @@ impl ClaudeSessionsTransport for UreqClaudeTransport {
 }
 
 fn claude_api_base_url() -> String {
-    let raw = std::env::var("ANTHROPIC_BASE_URL").unwrap_or_default();
+    // Deliberately NOT `ANTHROPIC_BASE_URL`: that variable redirects generic
+    // Anthropic API traffic (LLM gateways, dev proxies), and following it here
+    // would hand the claude.ai OAuth token to whatever host it happens to
+    // name. Redirecting the session-list endpoint — and with it the stored
+    // credential — must be its own explicit decision.
+    let raw = std::env::var("RELAYHISTORY_CLAUDE_API_BASE_URL").unwrap_or_default();
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         "https://api.anthropic.com".to_string()
@@ -516,10 +548,17 @@ fn excerpt_one_line(raw: &str) -> String {
 // codex-cloud
 // ---------------------------------------------------------------------------
 
-/// The process side of `codex cloud list --json`, abstracted so parsing and
-/// mapping are testable without the Codex CLI installed.
+/// The Codex CLI accepts `--limit` values of 1–20 only (20 is also its
+/// default), so every page request stays inside that window and larger
+/// requests paginate with `--cursor` instead.
+const CODEX_PAGE_LIMIT: usize = 20;
+
+/// The process side of `codex cloud list --json`, abstracted so parsing,
+/// mapping, and pagination are testable without the Codex CLI installed.
+/// `limit` is a per-page cap (at most [`CODEX_PAGE_LIMIT`]); `cursor`
+/// continues a previous page's listing.
 pub(crate) trait CodexCloudLister: Send + Sync {
-    fn list_json(&self, limit: Option<usize>) -> Result<String>;
+    fn list_json(&self, limit: usize, cursor: Option<&str>) -> Result<String>;
 }
 
 /// Runs the real `codex` CLI. Its `--json` output is Codex's documented
@@ -528,11 +567,12 @@ pub(crate) trait CodexCloudLister: Send + Sync {
 struct ExecCodexCli;
 
 impl CodexCloudLister for ExecCodexCli {
-    fn list_json(&self, limit: Option<usize>) -> Result<String> {
+    fn list_json(&self, limit: usize, cursor: Option<&str>) -> Result<String> {
         let mut command = std::process::Command::new("codex");
-        command.args(["cloud", "list", "--json"]);
-        if let Some(limit) = limit {
-            command.arg("--limit").arg(limit.to_string());
+        command.args(["cloud", "list", "--json", "--limit"]);
+        command.arg(limit.clamp(1, CODEX_PAGE_LIMIT).to_string());
+        if let Some(cursor) = cursor {
+            command.arg("--cursor").arg(cursor);
         }
         let output = command
             .stdin(std::process::Stdio::null())
@@ -588,21 +628,33 @@ fn map_codex_cloud_task(value: &Value) -> Option<(Candidate, ShallowSession)> {
     Some((candidate, session))
 }
 
+/// One page of `codex cloud list --json` output.
+struct CodexCloudPage {
+    tasks: Vec<Value>,
+    /// Continuation cursor, when the payload carries one.
+    cursor: Option<String>,
+}
+
 /// Accept both documented shapes: `{"tasks": […], "cursor": …}` and a bare
-/// task array.
-fn parse_codex_cloud_listing(raw: &str) -> Result<Vec<Value>> {
+/// task array (which carries no cursor and therefore ends the walk).
+fn parse_codex_cloud_listing(raw: &str) -> Result<CodexCloudPage> {
     let payload: Value =
         serde_json::from_str(raw).context("`codex cloud list --json` output is not JSON")?;
-    let tasks = match &payload {
-        Value::Array(tasks) => tasks.clone(),
-        Value::Object(_) => payload
-            .get("tasks")
-            .and_then(Value::as_array)
-            .cloned()
-            .context("`codex cloud list --json` output has no tasks array")?,
+    match &payload {
+        Value::Array(tasks) => Ok(CodexCloudPage {
+            tasks: tasks.clone(),
+            cursor: None,
+        }),
+        Value::Object(_) => Ok(CodexCloudPage {
+            tasks: payload
+                .get("tasks")
+                .and_then(Value::as_array)
+                .cloned()
+                .context("`codex cloud list --json` output has no tasks array")?,
+            cursor: string_field(&payload, "cursor"),
+        }),
         _ => anyhow::bail!("`codex cloud list --json` output has no tasks array"),
-    };
-    Ok(tasks)
+    }
 }
 
 /// Shallow adapter over the Codex cloud task list.
@@ -632,14 +684,30 @@ impl ShallowSessionProvider for CodexCloudProvider {
     }
 
     fn enumerate(&self, _env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
-        let raw = self.lister.list_json(self.limit)?;
-        let tasks = parse_codex_cloud_listing(&raw)?;
         let mut candidates = Vec::new();
         let mut rows = BTreeMap::new();
-        for task in &tasks {
-            if let Some((candidate, session)) = map_codex_cloud_task(task) {
-                rows.insert(candidate.locator.clone(), session);
-                candidates.push(candidate);
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_LIST_PAGES {
+            let page_limit = match self.limit {
+                Some(limit) => limit
+                    .saturating_sub(candidates.len())
+                    .clamp(1, CODEX_PAGE_LIMIT),
+                None => CODEX_PAGE_LIMIT,
+            };
+            let raw = self.lister.list_json(page_limit, cursor.as_deref())?;
+            let page = parse_codex_cloud_listing(&raw)?;
+            for task in &page.tasks {
+                if let Some((candidate, session)) = map_codex_cloud_task(task) {
+                    rows.insert(candidate.locator.clone(), session);
+                    candidates.push(candidate);
+                }
+            }
+            cursor = page.cursor;
+            let done = cursor.is_none()
+                || page.tasks.is_empty()
+                || self.limit.is_some_and(|limit| candidates.len() >= limit);
+            if done {
+                break;
             }
         }
         *self.fetched.lock().expect("remote connector row cache") = rows;

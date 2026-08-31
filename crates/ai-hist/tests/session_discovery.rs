@@ -23,7 +23,7 @@ fn isolated(temp: &tempfile::TempDir, db_path: &Path, args: &[&str]) -> Command 
         .env_remove("AI_HIST_DB")
         .env_remove("RELAYCAST_API_KEY")
         .env_remove("RELAYCAST_WORKSPACE_ID")
-        .env_remove("ANTHROPIC_BASE_URL")
+        .env_remove("RELAYHISTORY_CLAUDE_API_BASE_URL")
         .env_remove("RELAYHISTORY_CLAUDE_CREDENTIALS");
     command
 }
@@ -571,10 +571,11 @@ fn discovery_leaves_a_fully_synced_session_marked_full() {
 // ---------------------------------------------------------------------------
 
 /// Sign this fake home in to Codex and put a scripted `codex` binary on PATH
-/// that answers `cloud list --json` with the given payload. Returns the bin
-/// directory to prepend to PATH.
+/// that answers `cloud list --json`: `first` for the opening page, `next`
+/// whenever a `--cursor` is passed. Returns the bin directory to prepend to
+/// PATH.
 #[cfg(unix)]
-fn fake_codex_cloud(temp: &tempfile::TempDir, payload: &str) -> std::path::PathBuf {
+fn fake_codex_cloud(temp: &tempfile::TempDir, first: &str, next: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     fs::create_dir_all(temp.path().join(".codex")).unwrap();
     fs::write(temp.path().join(".codex/auth.json"), "{}").unwrap();
@@ -582,17 +583,22 @@ fn fake_codex_cloud(temp: &tempfile::TempDir, payload: &str) -> std::path::PathB
     fs::create_dir_all(&bin).unwrap();
     let script = format!(
         "#!/bin/sh\n\
-         if [ \"$1\" = cloud ] && [ \"$2\" = list ]; then\n\
-           cat <<'PAYLOAD'\n{payload}\nPAYLOAD\n\
-         else\n\
+         if [ \"$1\" != cloud ] || [ \"$2\" != list ]; then\n\
            echo \"unexpected codex invocation: $*\" >&2; exit 2\n\
-         fi\n"
+         fi\n\
+         case \" $* \" in\n\
+           *\" --cursor \"*) cat <<'PAYLOAD2'\n{next}\nPAYLOAD2\n;;\n\
+           *) cat <<'PAYLOAD1'\n{first}\nPAYLOAD1\n;;\n\
+         esac\n"
     );
     let path = bin.join("codex");
     fs::write(&path, script).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     bin
 }
+
+#[cfg(unix)]
+const CODEX_CLOUD_EMPTY_PAGE: &str = r#"{"tasks":[],"cursor":null}"#;
 
 #[cfg(unix)]
 fn prepend_path(command: &mut Command, bin: &Path) {
@@ -610,7 +616,7 @@ const CODEX_CLOUD_LISTING: &str = r#"{"tasks":[{"id":"task_e_42","url":"https://
 fn codex_cloud_tasks_discover_through_the_codex_cli() {
     let temp = fake_home();
     let db_path = temp.path().join("history.db");
-    let bin = fake_codex_cloud(&temp, CODEX_CLOUD_LISTING);
+    let bin = fake_codex_cloud(&temp, CODEX_CLOUD_LISTING, CODEX_CLOUD_EMPTY_PAGE);
 
     let mut command = isolated(
         &temp,
@@ -664,7 +670,7 @@ fn codex_cloud_tasks_discover_through_the_codex_cli() {
 fn an_all_scope_run_executes_local_and_remote_connectors_together() {
     let temp = fake_home();
     let db_path = temp.path().join("history.db");
-    let bin = fake_codex_cloud(&temp, CODEX_CLOUD_LISTING);
+    let bin = fake_codex_cloud(&temp, CODEX_CLOUD_LISTING, CODEX_CLOUD_EMPTY_PAGE);
 
     let mut command = isolated(
         &temp,
@@ -710,7 +716,7 @@ fn an_all_scope_run_executes_local_and_remote_connectors_together() {
 fn sync_remote_runs_configured_connectors_and_reports_them() {
     let temp = fake_home();
     let db_path = temp.path().join("history.db");
-    let bin = fake_codex_cloud(&temp, CODEX_CLOUD_LISTING);
+    let bin = fake_codex_cloud(&temp, CODEX_CLOUD_LISTING, CODEX_CLOUD_EMPTY_PAGE);
 
     let mut command = isolated(&temp, &db_path, &["sync", "--remote"]);
     prepend_path(&mut command, &bin);
@@ -807,7 +813,7 @@ fn claude_web_sessions_discover_through_the_session_list_endpoint() {
         &db_path,
         &["sessions", "discover", "--remote", "--json"],
     );
-    command.env("ANTHROPIC_BASE_URL", format!("http://{addr}"));
+    command.env("RELAYHISTORY_CLAUDE_API_BASE_URL", format!("http://{addr}"));
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -836,4 +842,60 @@ fn claude_web_sessions_discover_through_the_session_list_endpoint() {
     let summary = lines.last().unwrap();
     assert_eq!(summary["locations_run"], serde_json::json!(["remote"]));
     assert_eq!(summary["providers"]["claude"]["discovered"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_cloud_discovery_follows_the_cli_cursor_across_pages() {
+    let temp = fake_home();
+    let db_path = temp.path().join("history.db");
+    let first = r#"{"tasks":[{"id":"task_e_1","title":"one","status":"ready","updated_at":"2026-06-23T08:00:00Z"}],"cursor":"page-2"}"#;
+    let next = r#"{"tasks":[{"id":"task_e_2","title":"two","status":"ready","updated_at":"2026-06-22T08:00:00Z"}],"cursor":null}"#;
+    let bin = fake_codex_cloud(&temp, first, next);
+
+    let mut command = isolated(
+        &temp,
+        &db_path,
+        &["sessions", "discover", "--remote", "--json"],
+    );
+    prepend_path(&mut command, &bin);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = jsonl(&String::from_utf8_lossy(&output.stdout));
+    let ids: Vec<&str> = lines
+        .iter()
+        .filter(|line| line["type"] == "session")
+        .map(|line| line["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["task_e_1", "task_e_2"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_source_filter_with_no_matching_connector_is_rejected_as_unsupported() {
+    let temp = fake_home();
+    let db_path = temp.path().join("history.db");
+    // Only codex is signed in; a claude-only remote request is unsupported.
+    let bin = fake_codex_cloud(&temp, CODEX_CLOUD_LISTING, CODEX_CLOUD_EMPTY_PAGE);
+
+    let mut command = isolated(
+        &temp,
+        &db_path,
+        &[
+            "sessions", "discover", "--remote", "--source", "claude", "--json",
+        ],
+    );
+    prepend_path(&mut command, &bin);
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no remote provider connectors are configured"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("claude-web"), "{stderr}");
 }
