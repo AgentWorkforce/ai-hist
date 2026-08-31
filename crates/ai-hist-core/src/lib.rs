@@ -282,6 +282,8 @@ const BUSY_RETRY_ATTEMPTS: i32 = 65;
 const BUSY_RETRY_BASE_MS: u64 = 10;
 const BUSY_RETRY_CAP_MS: u64 = 500;
 const BUSY_RETRY_JITTER_DIVISOR: u64 = 10;
+const JOURNAL_MODE_RETRY_ATTEMPTS: i32 = 20;
+const JOURNAL_MODE_RETRY_MS: u64 = 10;
 
 fn busy_retry_backoff_ms(prior_attempts: i32) -> Option<u64> {
     if !(0..BUSY_RETRY_ATTEMPTS).contains(&prior_attempts) {
@@ -313,6 +315,34 @@ fn busy_retry_handler(prior_attempts: i32) -> bool {
 fn configure_busy_retry(conn: &Connection) -> Result<()> {
     conn.busy_handler(Some(busy_retry_handler))?;
     Ok(())
+}
+
+fn sqlite_lock_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+fn enable_wal_for_migration(conn: &Connection) -> Result<()> {
+    for attempt in 0..=JOURNAL_MODE_RETRY_ATTEMPTS {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < JOURNAL_MODE_RETRY_ATTEMPTS && sqlite_lock_error(&error) => {
+                // Changing journal mode can return SQLITE_BUSY without invoking
+                // the connection busy handler. This short retry only bridges
+                // simultaneous first opens; the migration write lock below has
+                // the normal bounded contention policy.
+                std::thread::sleep(Duration::from_millis(JOURNAL_MODE_RETRY_MS));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!("the bounded journal-mode retry loop always returns")
 }
 
 pub fn open_db(path: &Path) -> Result<Connection> {
@@ -438,6 +468,7 @@ const REQUIRED_EVENT_READ_INDEXES: &[&str] =
     &["idx_session_events_source_page", "idx_session_events_page"];
 const REQUIRED_SCOPE_READ_INDEXES: &[&str] = &["idx_session_presences_location"];
 const REQUIRED_TRIGGERS: &[&str] = &["delete_session_presences"];
+const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &["session_presences_local_backfill_v1"];
 
 /// Whether this database already has everything [`init_db`] would add.
 ///
@@ -474,6 +505,12 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     }
     for name in REQUIRED_TRIGGERS {
         if !table.exists([name])? {
+            return Ok(false);
+        }
+    }
+    let mut migration = conn.prepare("SELECT 1 FROM schema_migrations WHERE name = ? LIMIT 1")?;
+    for name in REQUIRED_SCHEMA_MIGRATIONS {
+        if !migration.exists([name])? {
             return Ok(false);
         }
     }
@@ -540,39 +577,27 @@ pub fn open_db_readonly(path: &Path) -> Result<Connection> {
 }
 
 pub fn init_db(conn: &Connection) -> Result<()> {
-    let mut attempts = 0;
-    loop {
-        match init_db_once(conn) {
-            Ok(()) => return Ok(()),
-            Err(error) if migration_lock_error(&error) && busy_retry_handler(attempts) => {
-                attempts += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn migration_lock_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        let Some(rusqlite::Error::SqliteFailure(failure, _)) =
-            cause.downcast_ref::<rusqlite::Error>()
-        else {
-            return false;
-        };
-        matches!(
-            failure.code,
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-        )
-    })
+    init_db_once(conn)
 }
 
 fn init_db_once(conn: &Connection) -> Result<()> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    // Serialize the complete DDL/backfill pass. SQLite busy handlers do not
-    // cover every SQLITE_LOCKED schema race, so `init_db` also retries the
-    // whole rollback-safe attempt above.
+    // A current database needs no write lock. Besides keeping ordinary opens
+    // cheap, this lets sync reach its per-source contention handling when a
+    // different writer already owns the ledger lock.
+    if schema_is_current(conn)? {
+        return Ok(());
+    }
+    enable_wal_for_migration(conn)?;
+    // Serialize the complete DDL/backfill pass. Acquiring the write lock before
+    // inspecting columns prevents concurrent first-open migrations from both
+    // deciding to add the same column. The connection's bounded busy handler
+    // covers ordinary writer overlap while preserving prompt lock diagnostics.
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    init_db_locked(&transaction)?;
+    // Another first opener may have completed the migration while this
+    // connection waited for the lock.
+    if !schema_is_current(&transaction)? {
+        init_db_locked(&transaction)?;
+    }
     transaction.commit()?;
     Ok(())
 }
