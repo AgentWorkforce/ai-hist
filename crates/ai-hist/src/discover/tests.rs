@@ -1102,6 +1102,11 @@ fn catalog_scope_filters_presences_without_duplicating_dual_sessions() {
     ] {
         seed_row(&conn, "codex", id, Some(recency));
     }
+    conn.execute(
+        "DELETE FROM session_presences WHERE source = 'codex' AND session_id IN ('legacy-local', 'remote-only')",
+        [],
+    )
+    .unwrap();
     mark_session_presence(&conn, "codex", "local-only", SessionLocation::Local).unwrap();
     mark_session_presence(&conn, "codex", "remote-only", SessionLocation::Remote).unwrap();
     upsert_session_presence(
@@ -1134,7 +1139,7 @@ fn catalog_scope_filters_presences_without_duplicating_dual_sessions() {
     assert_eq!(
         ids(SessionScope::Local),
         vec![
-            ("legacy-local".into(), vec!["local".into()]),
+            ("legacy-local".into(), vec![]),
             ("local-only".into(), vec!["local".into()]),
             ("dual".into(), vec!["local".into(), "remote".into()]),
         ]
@@ -1146,7 +1151,15 @@ fn catalog_scope_filters_presences_without_duplicating_dual_sessions() {
             ("dual".into(), vec!["local".into(), "remote".into()]),
         ]
     );
-    assert_eq!(ids(SessionScope::All).len(), 4);
+    assert_eq!(
+        ids(SessionScope::All),
+        vec![
+            ("legacy-local".into(), vec![]),
+            ("local-only".into(), vec!["local".into()]),
+            ("remote-only".into(), vec!["remote".into()]),
+            ("dual".into(), vec!["local".into(), "remote".into()]),
+        ]
+    );
 
     assert!(
         fetch_catalog_row_at_location(&conn, "codex", "remote-only", SessionLocation::Local,)
@@ -1165,6 +1178,48 @@ fn catalog_scope_filters_presences_without_duplicating_dual_sessions() {
         remote_cache.source_stamp.as_deref(),
         Some("v1:remote-stamp")
     );
+}
+
+#[test]
+fn remote_shallow_upsert_rolls_back_canonical_row_when_presence_write_fails() {
+    let conn = catalog();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_remote_presence BEFORE INSERT ON session_presences
+         WHEN NEW.location = 'remote'
+         BEGIN SELECT RAISE(ABORT, 'injected remote presence failure'); END;",
+    )
+    .unwrap();
+    let session = ShallowSession {
+        source: "codex".into(),
+        session_id: "remote-atomic".into(),
+        first_prompt: Some("remote prompt".into()),
+        raw_path: Some("cloud://remote-atomic".into()),
+        source_stamp: Some("v1:remote".into()),
+        discovery_state: "shallow".into(),
+        ..Default::default()
+    };
+
+    let error = upsert_shallow_session_at_location(&conn, &session, SessionLocation::Remote)
+        .expect_err("presence failure must abort the canonical upsert");
+    assert!(error
+        .to_string()
+        .contains("injected remote presence failure"));
+    let session_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source = 'codex' AND session_id = 'remote-atomic'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let presence_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_presences WHERE source = 'codex' AND session_id = 'remote-atomic'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(session_count, 0);
+    assert_eq!(presence_count, 0);
 }
 
 #[test]
@@ -1194,6 +1249,7 @@ fn trajectory_rows_never_appear_in_a_session_listing() {
         [],
     )
     .unwrap();
+    mark_session_presence(&conn, "claude", "claude-1", SessionLocation::Local).unwrap();
     let rows = list_session_catalog(&conn, &CatalogListOptions::default()).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].source, "claude");
@@ -1207,12 +1263,7 @@ fn the_catalog_listing_filters_by_source_and_paginates_by_recency() {
         ("claude", "c2", 200),
         ("codex", "x1", 250),
     ] {
-        conn.execute(
-            "INSERT INTO sessions (session_id, source, last_activity_ms, discovery_state) \
-             VALUES (?, ?, ?, 'shallow')",
-            params![id, source, ts],
-        )
-        .unwrap();
+        seed_row(&conn, source, id, Some(ts));
     }
     let claude_only = list_session_catalog(
         &conn,
@@ -1258,6 +1309,7 @@ fn seed_row(conn: &Connection, source: &str, session_id: &str, last: Option<i64>
         params![session_id, source, last],
     )
     .unwrap();
+    mark_session_presence(conn, source, session_id, SessionLocation::Local).unwrap();
 }
 
 /// Walk the whole catalog one page at a time and assert the walk is a

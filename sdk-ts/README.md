@@ -41,10 +41,19 @@ offline behavior and making provider-cloud access explicit. The CLI exposes the
 same mutually exclusive `--local`, `--remote`, and `--all` flags; omitting them
 is equivalent to `--local`.
 
-Catalog pages, discovery results, statistics, and sync results echo the applied `scope`. Each catalog
-session also has `locations`, containing `local`, `remote`, or both, so an
+Cached reads already support every scope. Remote acquisition connectors are not
+shipped yet, so `discoverSessions({ scope: 'remote' })` and
+`sync({ scope: 'remote' })` fail with `UnsupportedOperationError` and the stable
+code `UNSUPPORTED_OPERATION`; they never fall back to local acquisition.
+`scope: 'all'` runs every configured connector, which currently means local
+connectors only.
+
+Catalog pages, discovery results, statistics, and sync results echo the requested `scope`.
+History and catalog rows have `locations`, containing `local`, `remote`, or both, so an
 `all` query still returns one logical session while preserving where it was
-found.
+found. `resumeCommand()` returns `null` for a remote-only history row rather
+than emitting a local CLI command; an empty `locations` array retains legacy
+local behavior for rows written before provenance tracking.
 
 The event primitive is page-based and uses `{ tsMs, id }` as a deterministic
 cursor. The `sessionEvents` async iterator walks pages without accumulating a
@@ -52,7 +61,8 @@ large transcript. `getSessionEvents` is an explicit collecting convenience.
 
 Native loading failures distinguish unsupported platforms, missing optional
 platform packages, addon load failures, SDK/native contract mismatches, and
-database open failures through stable `RelayHistoryError` subclasses.
+database open failures through stable `RelayHistoryError` subclasses. Provider
+capability failures use `UnsupportedOperationError`.
 
 The old synchronous `AiHist` class and `openAiHist()` API were removed in 1.0.
 See [the migration guide](https://github.com/AgentWorkforce/relayhistory/blob/main/docs/native-sdk-migration.md).

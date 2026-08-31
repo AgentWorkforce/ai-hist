@@ -1436,7 +1436,9 @@ const SESSION_COLUMNS: &str = "source, session_id, cwd, git_branch, first_activi
        THEN '[\"local\",\"remote\"]' \
        WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote') \
        THEN '[\"remote\"]' \
-       ELSE '[\"local\"]' \
+       WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
+       THEN '[\"local\"]' \
+       ELSE '[]' \
      END";
 
 fn json_string_list(raw: Option<String>) -> Vec<String> {
@@ -1760,6 +1762,20 @@ pub fn upsert_shallow_session(conn: &Connection, session: &ShallowSession) -> Re
 
 /// Upsert shallow canonical metadata and connector-specific presence state.
 pub fn upsert_shallow_session_at_location(
+    conn: &Connection,
+    session: &ShallowSession,
+    location: SessionLocation,
+) -> Result<()> {
+    if conn.is_autocommit() {
+        let transaction = conn.unchecked_transaction()?;
+        upsert_shallow_session_in_transaction(&transaction, session, location)?;
+        transaction.commit()?;
+        return Ok(());
+    }
+    upsert_shallow_session_in_transaction(conn, session, location)
+}
+
+fn upsert_shallow_session_in_transaction(
     conn: &Connection,
     session: &ShallowSession,
     location: SessionLocation,

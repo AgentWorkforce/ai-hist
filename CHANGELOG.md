@@ -9,6 +9,17 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - Retire standalone Rust CLI release assets and the curl/source installer.
   npm now distributes the public TypeScript SDK, Node CLI, MCP server, and
   mandatory Node-API engine.
+- Rust engine consumers must recompile for the scoped session API. Public
+  catalog/discovery option, page, summary, and row structs now carry scope or
+  location data, and the native/catalog contract versions are now 3 and 2.
+  The legacy-named `list_sessions_local*` and `discover_sessions_local*`
+  wrappers reject non-local options instead of silently rewriting them; use
+  their `*_scoped*` counterparts for `remote` or `all`.
+- Human-readable history and catalog rows now include observed locations, statistics print
+  the selected scope, and discovery summaries distinguish the requested scope
+  from the connector locations that ran. A remote-only resume match no longer
+  prints a local command; JSON reports it as unavailable and readable mode
+  exits with an explanation.
 
 ### Added
 
@@ -20,6 +31,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   session/event lookup remains scope-independent. Remote discovery and sync
   are reserved and report unsupported until provider connectors ship; `all`
   acquisition runs all configured adapters, which currently means local.
+  Discovery summary `scope` is the requested acquisition scope, while each
+  history/catalog row's `locations` contains observed presences; it is not a claim that a
+  connector ran at every requested location.
 - Add native search, recent, session, paged events, statistics, discovery,
   catalog listing, and explicit sync operations. The native-addon contract is
   now version 3.

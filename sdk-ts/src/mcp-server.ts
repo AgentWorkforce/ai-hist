@@ -11,7 +11,7 @@ import {
 } from './index.js';
 
 const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
-const OPEN_WORLD_WRITE = { readOnlyHint: false, idempotentHint: true, openWorldHint: true } as const;
+const LOCAL_WRITE = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
 const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode']);
 const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode']);
 const SESSION_SCOPE = z.enum(['local', 'remote', 'all']);
@@ -62,7 +62,7 @@ server.tool('list_sessions', 'Cache-only indexed session catalog listing. This n
 server.tool('discover_sessions', 'Explicit shallow provider discovery. Updates only the session catalog.', {
   sources: z.array(CATALOG_SOURCE).optional(), limit: z.number().int().min(1).max(10000).optional(),
   scope: SESSION_SCOPE.optional().default('local'),
-}, OPEN_WORLD_WRITE, (args) => call(() => discoverSessions(args)));
+}, LOCAL_WRITE, (args) => call(() => discoverSessions(args)));
 
 server.tool('get_session', 'Get indexed prompts for one session.', {
   session_id: z.string(), source: SOURCE.optional(), tag: z.string().optional(),
@@ -80,6 +80,6 @@ server.tool('history_stats', 'Statistics for already-indexed RelayHistory data.'
 
 server.tool('sync', 'Explicit full provider ingestion into RelayHistory.', {
   scope: SESSION_SCOPE.optional().default('local'),
-}, OPEN_WORLD_WRITE, ({ scope }) => call(() => sync({ scope })));
+}, LOCAL_WRITE, ({ scope }) => call(() => sync({ scope })));
 
 await server.connect(new StdioServerTransport());

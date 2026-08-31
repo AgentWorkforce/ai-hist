@@ -30,6 +30,9 @@ Remote discovery and remote sync are reserved but unsupported until provider
 connectors ship. Integrations must surface that error for explicit `remote`
 acquisition rather than retrying locally. `all` runs every configured adapter,
 which means local adapters only until remote connectors are available.
+Acquisition result `scope` echoes the request; use session `locations` for
+observed presences rather than treating that summary field as proof that a
+connector executed at each requested location.
 
 The CLI equivalents are `sessions list`, `sessions discover`, `search`,
 `recent`, `session`, `events`, `stats`, and `sync`. See

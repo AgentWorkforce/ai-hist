@@ -43,7 +43,11 @@ search, recent history, statistics, and sync. Local and remote are presences of 
 not separate catalogs: every result comes from the same session ledger. Reads
 only filter that cached ledger. Remote discovery and remote sync are reserved
 for provider connectors and currently return an unsupported-operation error;
-they never silently fall back to local work.
+they never silently fall back to local work. An acquisition summary's `scope`
+echoes the requested scope; it does not claim that connectors exist at every
+location in that scope. In particular, `--all` currently runs local connectors
+only. Each catalog row's `locations` array reports where that session was
+actually observed.
 
 No Rust toolchain, C/C++ compiler, standalone CLI, curl installer, or runtime
 binary download is used.

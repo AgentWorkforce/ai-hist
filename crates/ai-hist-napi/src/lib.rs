@@ -10,8 +10,8 @@ use ai_hist_core::{
     default_db_path, open_db, open_db_readonly, recent as core_recent,
     schema_is_catalog_read_current, schema_is_event_read_current, schema_is_read_current,
     search as core_search, session as core_session,
-    session_events_page as core_session_events_page, stats_scoped as core_stats_scoped,
-    HistoryEntry, QueryFilter, SessionEvent as CoreSessionEvent,
+    session_events_page as core_session_events_page, session_locations,
+    stats_scoped as core_stats_scoped, HistoryEntry, QueryFilter, SessionEvent as CoreSessionEvent,
     SessionEventCursor as CoreEventCursor, SessionScope,
 };
 use napi_derive::napi;
@@ -70,6 +70,18 @@ fn scope_name(scope: SessionScope) -> String {
         SessionScope::All => "all",
     }
     .to_string()
+}
+
+fn ensure_acquisition_scope_supported(scope: SessionScope, operation: &str) -> napi::Result<()> {
+    if scope == SessionScope::Remote {
+        return Err(native_error(
+            "UNSUPPORTED_OPERATION",
+            format!(
+                "remote session {operation} is not available: no remote provider connectors are configured"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Contract version implemented by this native addon.
@@ -140,18 +152,24 @@ pub struct NativeHistoryEntry {
     pub project: Option<String>,
     pub prompt: String,
     pub timestamp_ms: i64,
+    pub locations: Vec<String>,
 }
 
-impl From<HistoryEntry> for NativeHistoryEntry {
-    fn from(entry: HistoryEntry) -> Self {
-        Self {
+impl NativeHistoryEntry {
+    fn from_entry(conn: &rusqlite::Connection, entry: HistoryEntry) -> anyhow::Result<Self> {
+        let locations = match entry.session_id.as_deref() {
+            Some(session_id) => session_locations(conn, &entry.source, session_id)?,
+            None => Vec::new(),
+        };
+        Ok(Self {
             id: entry.id,
             source: entry.source,
             session_id: entry.session_id,
             project: entry.project,
             prompt: entry.prompt,
             timestamp_ms: entry.timestamp_ms,
-        }
+            locations,
+        })
     }
 }
 
@@ -310,10 +328,10 @@ pub async fn search(
         .collect::<Vec<_>>();
     let raw_fts = options.raw_fts.unwrap_or(false);
     read_database(path, Vec::new(), move |conn| {
-        Ok(core_search(conn, &terms, raw_fts, &filter)?
+        core_search(conn, &terms, raw_fts, &filter)?
             .into_iter()
-            .map(NativeHistoryEntry::from)
-            .collect())
+            .map(|entry| NativeHistoryEntry::from_entry(conn, entry))
+            .collect()
     })
     .await
 }
@@ -334,10 +352,10 @@ pub async fn recent(options: Option<HistoryQueryOptions>) -> napi::Result<Vec<Na
     let path = db_path(options.db_path.clone());
     let filter = options.filter(limit)?;
     read_database(path, Vec::new(), move |conn| {
-        Ok(core_recent(conn, &filter)?
+        core_recent(conn, &filter)?
             .into_iter()
-            .map(NativeHistoryEntry::from)
-            .collect())
+            .map(|entry| NativeHistoryEntry::from_entry(conn, entry))
+            .collect()
     })
     .await
 }
@@ -355,15 +373,15 @@ pub async fn get_session(
     });
     let path = db_path(options.db_path);
     read_database(path, Vec::new(), move |conn| {
-        Ok(core_session(
+        core_session(
             conn,
             &session_id,
             options.source.as_deref(),
             options.tag.as_deref(),
         )?
         .into_iter()
-        .map(NativeHistoryEntry::from)
-        .collect())
+        .map(|entry| NativeHistoryEntry::from_entry(conn, entry))
+        .collect()
     })
     .await
 }
@@ -657,6 +675,7 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
         limit: None,
     });
     let scope = parse_scope(options.scope)?;
+    ensure_acquisition_scope_supported(scope, "discovery")?;
     let path = db_path(options.db_path);
     let request = ai_hist_engine::DiscoverOptions {
         scope,
@@ -734,6 +753,7 @@ pub async fn sync(options: Option<SyncOptions>) -> napi::Result<SyncResult> {
         scope: None,
     });
     let scope = parse_scope(options.scope)?;
+    ensure_acquisition_scope_supported(scope, "sync")?;
     let path = db_path(options.db_path);
     let result_path = path.display().to_string();
     let completed =

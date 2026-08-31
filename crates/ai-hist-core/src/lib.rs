@@ -542,8 +542,6 @@ pub fn open_db_readonly(path: &Path) -> Result<Connection> {
 pub fn init_db(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(SCHEMA)?;
-    let _ = conn.execute("ALTER TABLE history ADD COLUMN prompt_hash TEXT", []);
-    let _ = conn.execute("ALTER TABLE history ADD COLUMN git_branch TEXT", []);
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -603,32 +601,9 @@ END;
     // three declarations of the same nine names (CREATE TABLE, this loop, the
     // read-only guard) is two chances to drift, and every catalog column is
     // TEXT, so the guard list is the migration list.
-    for column in REQUIRED_SESSIONS_COLUMNS {
-        // "Already there" is the expected outcome on every run after the
-        // first, and the only error worth swallowing. Anything else -- a
-        // read-only file, a corrupt page, a locked database -- means the
-        // migration did not happen, and hiding it here turns one clear failure
-        // at init into `no such column` on the user's first listing.
-        if let Err(error) = conn.execute(
-            &format!("ALTER TABLE sessions ADD COLUMN {column} TEXT"),
-            [],
-        ) {
-            if !error.to_string().contains("duplicate column name") {
-                return Err(error).with_context(|| format!("adding column sessions.{column}"));
-            }
-        }
-    }
-    for column in REQUIRED_SESSION_PRESENCE_COLUMNS {
-        if let Err(error) = conn.execute(
-            &format!("ALTER TABLE session_presences ADD COLUMN {column} TEXT"),
-            [],
-        ) {
-            if !error.to_string().contains("duplicate column name") {
-                return Err(error)
-                    .with_context(|| format!("adding column session_presences.{column}"));
-            }
-        }
-    }
+    ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
+    ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
+    ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
     // Before the presence model every identity in the local evidence ledger
     // was local. Check the marker before attempting a write so an
     // already-current database remains readable while another process writes.
@@ -782,6 +757,49 @@ COMMIT;
         "CREATE INDEX IF NOT EXISTS idx_session_commit_links_repo ON session_commit_links(repo, branch)",
         [],
     )?;
+    Ok(())
+}
+
+/// Add only columns that are actually absent.
+///
+/// A read-before-write keeps an already-current open lock-free. The second
+/// check runs after `BEGIN IMMEDIATE`, so concurrent first opens cannot both
+/// attempt the same `ALTER TABLE`; this avoids both guaranteed failing ALTERs
+/// and locale/version-sensitive matching on SQLite error strings.
+fn ensure_text_columns(conn: &Connection, table: &str, required: &[&str]) -> Result<()> {
+    let missing = |conn: &Connection| -> Result<Vec<&str>> {
+        let existing: HashSet<String> = conn
+            .prepare("SELECT name FROM pragma_table_info(?)")?
+            .query_map([table], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(required
+            .iter()
+            .copied()
+            .filter(|column| !existing.contains(*column))
+            .collect())
+    };
+
+    if missing(conn)?.is_empty() {
+        return Ok(());
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let migration = (|| -> Result<()> {
+        for column in missing(conn)? {
+            // `table` and `column` come exclusively from internal constant
+            // lists, never from user input.
+            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])
+                .with_context(|| format!("adding column {table}.{column}"))?;
+        }
+        Ok(())
+    })();
+    match migration {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
     Ok(())
 }
 
@@ -992,12 +1010,14 @@ fn append_filters(sql: &mut String, params: &mut Vec<String>, filter: &QueryFilt
 fn append_scope_filter(sql: &mut String, scope: SessionScope, alias: &str) {
     match scope {
         SessionScope::Local => {
-            // Rows written before presences existed are local by construction.
-            // Keep that compatibility fallback only while a session has no
-            // explicit presence: a remote-only session must not leak into the
-            // default local view.
+            // A row without a session identity cannot be remote-addressed and
+            // remains part of the historical local surface. Identified rows
+            // written before the presence model (or by an older binary) also
+            // remain visible while they have no classification. Current remote
+            // writers record presence before evidence, so a remote-only row
+            // never relies on this compatibility fallback.
             sql.push_str(&format!(
-                " AND (EXISTS (SELECT 1 FROM session_presences sp_local WHERE sp_local.source = {alias}.source AND sp_local.session_id = {alias}.session_id AND sp_local.location = 'local') OR NOT EXISTS (SELECT 1 FROM session_presences sp_any WHERE sp_any.source = {alias}.source AND sp_any.session_id = {alias}.session_id))"
+                " AND ({alias}.session_id IS NULL OR EXISTS (SELECT 1 FROM session_presences sp_local WHERE sp_local.source = {alias}.source AND sp_local.session_id = {alias}.session_id AND sp_local.location = 'local') OR NOT EXISTS (SELECT 1 FROM session_presences sp_any WHERE sp_any.source = {alias}.source AND sp_any.session_id = {alias}.session_id))"
             ));
         }
         SessionScope::Remote => {
@@ -1025,6 +1045,22 @@ pub fn mark_session_presence(
         params![source, session_id, location.as_str()],
     )?;
     Ok(())
+}
+
+/// Return the observed locations for one canonical session identity.
+///
+/// An empty result is intentionally distinct from `local`: it means no
+/// provenance row was recorded (for example, by an older writer).
+pub fn session_locations(conn: &Connection, source: &str, session_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT location FROM session_presences \
+         WHERE source = ? AND session_id = ? \
+         ORDER BY CASE location WHEN 'local' THEN 0 ELSE 1 END",
+    )?;
+    let locations = stmt
+        .query_map(params![source, session_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(locations)
 }
 
 /// Record a presence together with connector-specific cache metadata.
@@ -1078,21 +1114,19 @@ pub fn insert_history_at_location(
     entry: &HistoryEntry,
     location: SessionLocation,
 ) -> Result<usize> {
-    if conn.is_autocommit() {
-        let transaction = conn.unchecked_transaction()?;
-        let inserted = insert_history_with_presence(&transaction, entry, location)?;
-        transaction.commit()?;
-        return Ok(inserted);
+    if location == SessionLocation::Remote {
+        anyhow::ensure!(
+            entry
+                .session_id
+                .as_deref()
+                .is_some_and(|session_id| !session_id.is_empty()),
+            "remote history requires a non-empty session id"
+        );
     }
-    // An existing caller transaction makes the evidence and presence atomic.
-    insert_history_with_presence(conn, entry, location)
-}
-
-fn insert_history_with_presence(
-    conn: &Connection,
-    entry: &HistoryEntry,
-    location: SessionLocation,
-) -> Result<usize> {
+    // Presence first preserves the important failure invariant without adding
+    // a transaction per imported prompt: evidence can never commit before its
+    // classification. A lone presence after a later insert failure is harmless
+    // and a duplicate evidence insert still repairs a missing presence.
     if let Some(session_id) = entry.session_id.as_deref().filter(|id| !id.is_empty()) {
         mark_session_presence(conn, &entry.source, session_id, location)?;
     }
@@ -1826,7 +1860,7 @@ mod tests {
     }
 
     #[test]
-    fn search_and_recent_apply_presence_scope_with_a_local_legacy_fallback() {
+    fn search_and_recent_preserve_unclassified_rows_as_local() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         for (session_id, timestamp_ms) in [("legacy", 1), ("local", 2), ("remote", 3), ("both", 4)]
@@ -1856,10 +1890,20 @@ mod tests {
         mark_session_presence(&conn, "claude", "both", SessionLocation::Remote).unwrap();
         // Presence writes are idempotent.
         mark_session_presence(&conn, "claude", "both", SessionLocation::Remote).unwrap();
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) VALUES ('claude', 'unclassified', 'scopeprobe', 5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) VALUES ('claude', NULL, 'scopeprobe', 6)",
+            [],
+        )
+        .unwrap();
 
         let ids = |rows: Vec<HistoryEntry>| {
             rows.into_iter()
-                .map(|row| row.session_id.unwrap())
+                .map(|row| row.session_id.unwrap_or_else(|| "<none>".into()))
                 .collect::<Vec<_>>()
         };
         for query in [false, true] {
@@ -1875,18 +1919,28 @@ mod tests {
                     recent(&conn, &filter).unwrap()
                 }
             };
-            assert_eq!(ids(run(SessionScope::Local)), ["both", "local", "legacy"]);
+            assert_eq!(
+                ids(run(SessionScope::Local)),
+                ["<none>", "unclassified", "both", "local", "legacy"]
+            );
             assert_eq!(ids(run(SessionScope::Remote)), ["both", "remote"]);
             assert_eq!(
                 ids(run(SessionScope::All)),
-                ["both", "remote", "local", "legacy"]
+                [
+                    "<none>",
+                    "unclassified",
+                    "both",
+                    "remote",
+                    "local",
+                    "legacy"
+                ]
             );
         }
         assert_eq!(
             stats_scoped(&conn, None, SessionScope::Local)
                 .unwrap()
                 .total,
-            3
+            5
         );
         assert_eq!(
             stats_scoped(&conn, None, SessionScope::Remote)
@@ -1896,7 +1950,7 @@ mod tests {
         );
         assert_eq!(
             stats_scoped(&conn, None, SessionScope::All).unwrap().total,
-            4
+            6
         );
         // Direct lookup is identity-based rather than acquisition-scoped.
         assert_eq!(
@@ -1917,7 +1971,7 @@ mod tests {
     }
 
     #[test]
-    fn history_and_presence_insert_roll_back_together() {
+    fn history_insert_failure_cannot_leave_remote_evidence_unclassified() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         conn.execute_batch(
@@ -1943,6 +1997,84 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        assert_eq!(presence_count, 1);
+        let history_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'codex' AND session_id = 'reject-me'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history_count, 0);
+    }
+
+    #[test]
+    fn duplicate_history_insert_repairs_a_missing_presence() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let entry = HistoryEntry {
+            id: 0,
+            source: "codex".into(),
+            session_id: Some("repair-me".into()),
+            project: None,
+            prompt: "already stored".into(),
+            prompt_hash: None,
+            timestamp_ms: 1,
+        };
+        assert_eq!(
+            insert_history_at_location(&conn, &entry, SessionLocation::Remote).unwrap(),
+            1
+        );
+        conn.execute(
+            "DELETE FROM session_presences WHERE source = 'codex' AND session_id = 'repair-me'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            insert_history_at_location(&conn, &entry, SessionLocation::Remote).unwrap(),
+            0
+        );
+        let locations: Vec<String> = conn
+            .prepare(
+                "SELECT location FROM session_presences WHERE source = 'codex' AND session_id = 'repair-me'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(locations, ["remote"]);
+    }
+
+    #[test]
+    fn remote_history_rejects_missing_or_empty_session_identity() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for session_id in [None, Some(String::new())] {
+            let entry = HistoryEntry {
+                id: 0,
+                source: "codex".into(),
+                session_id,
+                project: None,
+                prompt: "must have remote identity".into(),
+                prompt_hash: None,
+                timestamp_ms: 1,
+            };
+            let error = insert_history_at_location(&conn, &entry, SessionLocation::Remote)
+                .expect_err("identity-less remote history must fail closed");
+            assert!(error
+                .to_string()
+                .contains("remote history requires a non-empty session id"));
+        }
+        let history_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .unwrap();
+        let presence_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_presences", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(history_count, 0);
         assert_eq!(presence_count, 0);
     }
 

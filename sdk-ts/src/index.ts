@@ -30,6 +30,7 @@ export class NativeLoadError extends RelayHistoryError {}
 export class NativeContractMismatchError extends RelayHistoryError {}
 export class DatabaseOpenError extends RelayHistoryError {}
 export class InvalidArgumentError extends RelayHistoryError {}
+export class UnsupportedOperationError extends RelayHistoryError {}
 
 export interface HistoryEntry {
   id: number;
@@ -38,6 +39,7 @@ export interface HistoryEntry {
   project: string | null;
   prompt: string;
   timestampMs: number;
+  locations: SessionLocation[];
 }
 
 export interface ListOptions {
@@ -303,6 +305,9 @@ async function nativeCall<T>(call: (binding: NativeBinding) => Promise<T>): Prom
     if (native.code === 'INVALID_ARGUMENT') {
       throw new InvalidArgumentError(native.message, native.code, { cause: error });
     }
+    if (native.code === 'UNSUPPORTED_OPERATION') {
+      throw new UnsupportedOperationError(native.message, native.code, { cause: error });
+    }
     throw new RelayHistoryError(native.message, native.code, { cause: error });
   }
 }
@@ -319,6 +324,9 @@ function historyEntry(value: UnknownRecord): HistoryEntry {
     project: nullableString(value.project),
     prompt: String(value.prompt),
     timestampMs: Number(value.timestampMs),
+    locations: Array.isArray(value.locations)
+      ? value.locations.filter((location): location is SessionLocation => location === 'local' || location === 'remote')
+      : [],
   };
 }
 
@@ -358,8 +366,12 @@ function catalogSession(value: UnknownRecord): CatalogSession {
   };
 }
 
-function sessionScope(value: unknown): SessionScope {
-  return value === 'remote' || value === 'all' ? value : 'local';
+export function validateNativeScope(value: unknown): SessionScope {
+  if (value === 'local' || value === 'remote' || value === 'all') return value;
+  throw new NativeContractMismatchError(
+    `ai-hist-native returned an invalid session scope: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
+    'NATIVE_CONTRACT_MISMATCH',
+  );
 }
 
 function assertCatalogContract(value: number): void {
@@ -435,7 +447,7 @@ export async function listSessionCatalogPage(options: ListCatalogOptions = {}): 
     assertCatalogContract(contractVersion);
     return {
       contractVersion,
-      scope: sessionScope(page.scope),
+      scope: validateNativeScope(page.scope),
       sessions: Array.isArray(page.sessions) ? (page.sessions as UnknownRecord[]).map(catalogSession) : [],
       nextCursor: catalogCursor(page.nextCursor),
     };
@@ -449,7 +461,7 @@ export async function discoverSessions(options: DiscoverSessionsOptions = {}): P
     assertCatalogContract(contractVersion);
     return {
       contractVersion,
-      scope: sessionScope(result.scope),
+      scope: validateNativeScope(result.scope),
       sessions: Array.isArray(result.sessions) ? (result.sessions as UnknownRecord[]).map(catalogSession) : [],
       discovered: Number(result.discovered),
       skippedUnchanged: Number(result.skippedUnchanged),
@@ -503,7 +515,7 @@ export async function stats(options: StatsOptions = {}): Promise<Stats> {
       bySource[String(item.source) as Source] = Number(item.count);
     }
     return {
-      scope: sessionScope(result.scope),
+      scope: validateNativeScope(result.scope),
       total: Number(result.total), bySource,
       byProject: ((result.byProject as UnknownRecord[] | undefined) ?? []).map((item) => ({ project: String(item.project), count: Number(item.count) })),
       firstTimestampMs: typeof result.firstTimestampMs === 'number' ? result.firstTimestampMs : null,
@@ -517,14 +529,15 @@ export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
     const result = await native.sync({ ...options, scope: options.scope ?? 'local' });
     return {
       databasePath: String(result.databasePath),
-      scope: sessionScope(result.scope),
+      scope: validateNativeScope(result.scope),
       completed: result.completed === true,
     };
   });
 }
 
-export function resumeCommand(entry: Pick<HistoryEntry, 'source' | 'sessionId' | 'project'>): string | null {
+export function resumeCommand(entry: Pick<HistoryEntry, 'source' | 'sessionId' | 'project' | 'locations'>): string | null {
   if (!entry.sessionId) return null;
+  if (entry.locations.length > 0 && !entry.locations.includes('local')) return null;
   const resume = (() => {
     if (entry.source === 'claude') return `claude --resume ${shellQuote(entry.sessionId)}`;
     if (entry.source === 'codex') return `codex resume ${shellQuote(entry.sessionId)}`;

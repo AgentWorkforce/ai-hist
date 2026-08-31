@@ -58,6 +58,11 @@ work. `--all` runs all configured adapters, so today it performs local
 acquisition; it will include remote adapters once they ship. Cached remote/all
 queries are already part of the stable contract.
 
+Discovery results keep those two facts separate: the summary `scope` is the
+scope requested by the caller, while row `locations` are the presences actually
+observed. Thus a current `--all` discovery summary says `all` even though its
+connector-location work is local-only.
+
 ## SDK
 
 ```bash

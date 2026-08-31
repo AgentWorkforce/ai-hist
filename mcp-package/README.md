@@ -13,3 +13,9 @@ Tools: `search_history`, `recent_history`, `list_sessions`,
 `discover_sessions`, `get_session`, `get_session_events`, `history_stats`, and
 `sync`. Search, recent history, session listing, discovery, statistics, and sync accept a
 `scope` of `local`, `remote`, or `all`; scope defaults to `local`.
+
+Cached reads support all three scopes. Remote discovery and sync connectors are
+not available yet: explicit `remote` acquisition returns
+`UNSUPPORTED_OPERATION`, while `all` runs the configured local connectors.
+Consequently, the current discovery and sync tools are annotated as local,
+closed-world writes; their annotations will change when remote connectors ship.

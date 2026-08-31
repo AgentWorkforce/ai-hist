@@ -47,6 +47,10 @@ Explicit remote discovery/sync returns an unsupported operation until provider
 connectors ship; the engine must not silently fall back to local work. `all`
 acquisition runs all configured adapters, which currently means the local
 adapters and will include remote adapters when they become available.
+An acquisition result's `scope` records the request, not the set of connector
+locations that executed. Observed locations belong to each session row's
+`locations`; `all` therefore remains the result scope even while only local
+adapters are configured.
 
 ## Operation semantics
 

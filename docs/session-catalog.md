@@ -114,6 +114,11 @@ Keys are `snake_case`. `models`, `workspace_roots`, and `locations` are always
 arrays (possibly empty); every other absent value is `null`, never an invented
 placeholder or an empty string.
 
+For this cache-only operation, top-level `scope` is the filter applied to the
+ledger. `locations` contains observed presences only; legacy rows that predate
+presence tracking may therefore have an empty array while still appearing in
+the compatibility-preserving default local view.
+
 `next_cursor` is the continuation for the next page, or `null` once the catalog
 is exhausted (the page came back short of its limit). See
 [Pagination](#pagination).
@@ -162,15 +167,19 @@ types, in this order:
 `counters` is the run's bill of work, and it is the honest way to check that
 discovery stayed cheap — `bytes_read` and `files_opened` are what a bounded
 request bounds, and `shallow_reads` is `0` on a rescan where nothing changed.
+Summary `scope` echoes the requested acquisition scope. It does not enumerate
+connector locations that executed, and `providers` groups source adapters
+rather than local/remote locations. Today an `all` summary accompanies
+local-only connector work; row `locations` still report observed presences.
 
 Diagnostics are their own lines and never appear inside the `summary` object,
 so a consumer that only wants the tally can read the last line and stop. In
 human (non-`--json`) mode they go to stderr instead, leaving stdout clean:
 
 ```text
-  2026-06-21 11:00  codex    shallow  0198c2ad-codex   /Users/you/Projects/api  make the backoff configurable
-  2026-06-20 10:05  claude   shallow  3f6c1b7a-claude  /Users/you/Projects/api  add a retry to the http client
-  2 session(s): 0 discovered, 2 unchanged (0 file(s) opened, 0 shallow read(s))
+  2026-06-21 11:00  codex    local        shallow  0198c2ad-codex   /Users/you/Projects/api  make the backoff configurable
+  2026-06-20 10:05  claude   local        shallow  3f6c1b7a-claude  /Users/you/Projects/api  add a retry to the http client
+  2 session(s): 0 discovered, 2 unchanged (0 file(s) opened, 0 shallow read(s)); requested scope: local, connector locations run: local
 ```
 
 A provider that fails contributes a `diagnostic` and nothing else; the run
@@ -242,6 +251,13 @@ today. Explicit remote acquisition is reserved but unsupported until provider
 connectors ship, and returns an error rather than silently doing local work.
 `--all` means every configured adapter; today that is the local adapters, and
 remote adapters will join the same operation when implemented.
+
+The discovery summary preserves the requested scope, so `--all` reports
+`scope: "all"` even while connector-location execution is local-only. That is
+different from each row's observed `locations`. A remote-only session can be
+selected by resume search, but it cannot yield a usable local resume command;
+materialize it locally first. Sessions with both presences remain locally
+resumable.
 
 Direct `session` and `events` lookups already name a `(source, session_id)` and
 therefore remain scope-independent.
@@ -364,7 +380,8 @@ read with no sort.
 
 ## Rescans and source stamps
 
-Each row stores a `source_stamp` — `v{scanner version}:{provider change marker}`:
+Each connector presence stores a `source_stamp` —
+`v{scanner version}:{provider change marker}`:
 
 | Source | Change marker |
 |---|---|
@@ -373,10 +390,13 @@ Each row stores a `source_stamp` — `v{scanner version}:{provider change marker
 | opencode | `{time_created}:{time_updated}` |
 | relay | `{newest synced timestamp}:{synced row count}` |
 
-On a rescan, a candidate whose stamp matches the stored one is served straight
-from the catalog: no read, no parse, `skipped_unchanged` incremented,
-`from_cache: true` on the emitted row. In the benchmark below, a rescan of 450
-unchanged sessions performs **zero** shallow reads.
+On a rescan, a candidate whose stamp matches the stamp for that same location
+in `session_presences` is served straight from the catalog: no read, no parse,
+`skipped_unchanged` incremented, `from_cache: true` on the emitted row. The
+top-level catalog row retains a canonical `source_stamp` summary for backward
+compatibility, but connector change detection never relies on that merged
+copy. In the benchmark below, a rescan of 450 unchanged sessions performs
+**zero** shallow reads.
 
 The `v{N}` prefix is the *scanner* version (`SHALLOW_SCANNER_VERSION`), separate
 from `parser_version` (the full-ingest parser generation). Bumping it
@@ -419,8 +439,8 @@ plus the `idx_sessions_source_last`, `idx_sessions_raw_path`,
 sessions (a codex subagent thread, a Claude subagent sidecar), keyed by
 `(source, locator)` with the stamp, so a rescan costs a primary-key lookup
 instead of re-reading them every run.
-Databases created by an older release are migrated in place by ignore-error
-`ALTER TABLE`s in `init_db`, and `schema_is_current` knows about the new
+Databases created by an older release are migrated in place by a serialized
+missing-column check in `init_db`, and `schema_is_current` knows about the new
 columns, so a read-only handle over an old database is upgraded instead of
 failing with `no such column`.
 

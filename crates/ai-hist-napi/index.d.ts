@@ -41,6 +41,7 @@ export interface NativeHistoryEntry {
   project?: string
   prompt: string
   timestampMs: number
+  locations: Array<string>
 }
 export interface NativeSessionEvent {
   id: number

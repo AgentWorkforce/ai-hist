@@ -28,10 +28,10 @@ test('CLI and MCP import only the public SDK for history operations', async () =
   assert.doesNotMatch(cli + mcp, /ai-hist-native|node:sqlite|sql\.js|child_process/);
 });
 
-test('MCP session operations expose scope and remote-capable writes are open-world', async () => {
+test('MCP session operations expose scope and current local writes are closed-world', async () => {
   const mcp = await readFile(join(sourceDir, 'mcp-server.ts'), 'utf8');
   assert.match(mcp, /const SESSION_SCOPE = z\.enum\(\['local', 'remote', 'all'\]\)/);
-  assert.match(mcp, /const OPEN_WORLD_WRITE = \{ readOnlyHint: false, idempotentHint: true, openWorldHint: true \}/);
+  assert.match(mcp, /const LOCAL_WRITE = \{ readOnlyHint: false, idempotentHint: true, openWorldHint: false \}/);
   for (const tool of ['search_history', 'recent_history', 'list_sessions', 'discover_sessions', 'history_stats', 'sync']) {
     const start = mcp.indexOf(`server.tool('${tool}'`);
     assert.notEqual(start, -1, `${tool} is registered`);
@@ -42,6 +42,6 @@ test('MCP session operations expose scope and remote-capable writes are open-wor
   for (const tool of ['discover_sessions', 'sync']) {
     const start = mcp.indexOf(`server.tool('${tool}'`);
     const end = mcp.indexOf("server.tool('", start + 13);
-    assert.match(mcp.slice(start, end === -1 ? undefined : end), /OPEN_WORLD_WRITE/, `${tool} is open-world`);
+    assert.match(mcp.slice(start, end === -1 ? undefined : end), /LOCAL_WRITE/, `${tool} is currently local-only`);
   }
 });
