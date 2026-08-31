@@ -27,6 +27,11 @@ produces `0.6.1` and `minor` produces `0.7.0`. `custom_version` is available for
 an explicit version and overrides the selected bump type. Leave `dry_run`
 enabled to build and validate without publishing packages or creating a tag.
 
+After every successful non-dry release, the workflow pushes a version-only
+commit containing the updated package manifests and lockfiles, then creates the
+GitHub tag and Release from that commit. Failed releases and dry runs never
+change the checked-in version baseline.
+
 ## Supported matrix
 
 - Node.js: minimum 20; tested 20 and 22.
