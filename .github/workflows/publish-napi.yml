@@ -147,7 +147,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # A real release persists its version commit before publishing.
+          # A real release persists its version commit once publishing and
+          # the registry smoke tests succeed.
           persist-credentials: true
       - uses: actions/setup-node@v6
         with:
@@ -298,25 +299,6 @@ jobs:
           else
             git commit -m "chore: release $VERSION"
           fi
-      - name: Persist release version
-        id: persist-version
-        if: ${{ !inputs.dry_run }}
-        working-directory: .
-        run: |
-          set -euo pipefail
-          if [[ "$GITHUB_REF" != refs/heads/* ]]; then
-            echo "Release versions can only be persisted from a branch checkout" >&2
-            exit 1
-          fi
-          BRANCH="${GITHUB_REF#refs/heads/}"
-          git fetch origin "$BRANCH"
-          REMOTE_SHA=$(git rev-parse "origin/$BRANCH")
-          if [[ "$REMOTE_SHA" != "$GITHUB_SHA" ]]; then
-            echo "The release branch advanced from $GITHUB_SHA to $REMOTE_SHA; rerun from the new tip" >&2
-            exit 1
-          fi
-          git push origin "HEAD:$GITHUB_REF"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
           path: crates/ai-hist-napi/artifacts
@@ -420,6 +402,29 @@ jobs:
             );
           '
 
+      # The branch only advances once every package is published and the
+      # registry smoke tests pass, so a failed release never persists its
+      # version bump. The commit itself was prepared before the publish-only
+      # sdk-ts/package.json rewrite, so it stays version-only.
+      - name: Persist release version
+        id: persist-version
+        if: ${{ !inputs.dry_run }}
+        working-directory: .
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != refs/heads/* ]]; then
+            echo "Release versions can only be persisted from a branch checkout" >&2
+            exit 1
+          fi
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          git fetch origin "$BRANCH"
+          REMOTE_SHA=$(git rev-parse "origin/$BRANCH")
+          if [[ "$REMOTE_SHA" != "$GITHUB_SHA" ]]; then
+            echo "The release branch advanced from $GITHUB_SHA to $REMOTE_SHA; rerun from the new tip" >&2
+            exit 1
+          fi
+          git push origin "HEAD:$GITHUB_REF"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Create GitHub Release and tag
         if: ${{ !inputs.dry_run }}
         env:
