@@ -381,14 +381,16 @@ jobs:
           SMOKE=$(mktemp -d)
           cd "$SMOKE"
           npm init -y
-          npm install "ai-hist@$VERSION" "ai-hist-mcp@$VERSION"
+          node "$GITHUB_WORKSPACE/scripts/npm-install-with-registry-retry.mjs" \
+            "ai-hist@$VERSION" "ai-hist-mcp@$VERSION"
           ./node_modules/.bin/ai-hist sessions list --db "$SMOKE/empty.db" --json
           timeout 2 ./node_modules/.bin/ai-hist-mcp </dev/null || test $? -eq 124
 
           NO_OPTIONAL=$(mktemp -d)
           cd "$NO_OPTIONAL"
           npm init -y
-          npm install --omit=optional "ai-hist@$VERSION"
+          node "$GITHUB_WORKSPACE/scripts/npm-install-with-registry-retry.mjs" \
+            --omit=optional "ai-hist@$VERSION"
           node --input-type=module -e '
             import("ai-hist").then((sdk) => sdk.recent()).then(
               () => process.exit(1),

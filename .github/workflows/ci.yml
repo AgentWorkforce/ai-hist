@@ -27,6 +27,9 @@ jobs:
       - name: Rust formatting
         run: cargo fmt --all -- --check
 
+      - name: Release workflow tests
+        run: node --test scripts/*.test.mjs
+
       - name: Rust lint
         run: cargo clippy --workspace --all-targets -- -A clippy::too_many_arguments -D warnings
 
