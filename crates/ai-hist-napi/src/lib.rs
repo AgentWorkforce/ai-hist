@@ -10,13 +10,14 @@ use ai_hist_core::{
     default_db_path, open_db, open_db_readonly, recent as core_recent,
     schema_is_catalog_read_current, schema_is_event_read_current, schema_is_read_current,
     search as core_search, session as core_session,
-    session_events_page as core_session_events_page, stats as core_stats, HistoryEntry,
-    QueryFilter, SessionEvent as CoreSessionEvent, SessionEventCursor as CoreEventCursor,
+    session_events_page as core_session_events_page, stats_scoped as core_stats_scoped,
+    HistoryEntry, QueryFilter, SessionEvent as CoreSessionEvent,
+    SessionEventCursor as CoreEventCursor, SessionScope,
 };
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 2;
+pub const NATIVE_CONTRACT_VERSION: u32 = 3;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -50,6 +51,27 @@ fn validate_limit(limit: Option<i64>, default: i64, max: i64) -> napi::Result<i6
     Ok(limit)
 }
 
+fn parse_scope(scope: Option<String>) -> napi::Result<SessionScope> {
+    match scope.as_deref().unwrap_or("local") {
+        "local" => Ok(SessionScope::Local),
+        "remote" => Ok(SessionScope::Remote),
+        "all" => Ok(SessionScope::All),
+        value => Err(native_error(
+            "INVALID_ARGUMENT",
+            format!("scope must be local, remote, or all (got '{value}')"),
+        )),
+    }
+}
+
+fn scope_name(scope: SessionScope) -> String {
+    match scope {
+        SessionScope::Local => "local",
+        SessionScope::Remote => "remote",
+        SessionScope::All => "all",
+    }
+    .to_string()
+}
+
 /// Contract version implemented by this native addon.
 #[napi]
 pub fn native_contract_version() -> u32 {
@@ -69,6 +91,7 @@ pub fn native_build_profile() -> String {
 
 #[napi(object)]
 pub struct HistoryQueryOptions {
+    pub scope: Option<String>,
     pub db_path: Option<String>,
     pub source: Option<String>,
     pub project: Option<String>,
@@ -78,19 +101,21 @@ pub struct HistoryQueryOptions {
 }
 
 impl HistoryQueryOptions {
-    fn filter(&self, limit: i64) -> QueryFilter {
-        QueryFilter {
+    fn filter(&self, limit: i64) -> napi::Result<QueryFilter> {
+        Ok(QueryFilter {
+            scope: parse_scope(self.scope.clone())?,
             source: self.source.clone(),
             project: self.project.clone(),
             tag: self.tag.clone(),
             before_ms: self.before_ms,
             limit,
-        }
+        })
     }
 }
 
 #[napi(object)]
 pub struct SearchOptions {
+    pub scope: Option<String>,
     pub db_path: Option<String>,
     pub source: Option<String>,
     pub project: Option<String>,
@@ -205,6 +230,7 @@ pub struct ProjectCount {
 
 #[napi(object)]
 pub struct NativeStats {
+    pub scope: String,
     pub total: i64,
     pub by_source: Vec<SourceCount>,
     pub by_project: Vec<ProjectCount>,
@@ -214,6 +240,7 @@ pub struct NativeStats {
 
 #[napi(object)]
 pub struct StatsOptions {
+    pub scope: Option<String>,
     pub db_path: Option<String>,
     pub tag: Option<String>,
 }
@@ -258,6 +285,7 @@ pub async fn search(
     options: Option<SearchOptions>,
 ) -> napi::Result<Vec<NativeHistoryEntry>> {
     let options = options.unwrap_or(SearchOptions {
+        scope: None,
         db_path: None,
         source: None,
         project: None,
@@ -269,6 +297,7 @@ pub async fn search(
     let limit = validate_limit(options.limit, 20, 1_000)?;
     let path = db_path(options.db_path.clone());
     let filter = QueryFilter {
+        scope: parse_scope(options.scope)?,
         source: options.source,
         project: options.project,
         tag: options.tag,
@@ -293,6 +322,7 @@ pub async fn search(
 #[napi]
 pub async fn recent(options: Option<HistoryQueryOptions>) -> napi::Result<Vec<NativeHistoryEntry>> {
     let options = options.unwrap_or(HistoryQueryOptions {
+        scope: None,
         db_path: None,
         source: None,
         project: None,
@@ -302,7 +332,7 @@ pub async fn recent(options: Option<HistoryQueryOptions>) -> napi::Result<Vec<Na
     });
     let limit = validate_limit(options.limit, 20, 1_000)?;
     let path = db_path(options.db_path.clone());
-    let filter = options.filter(limit);
+    let filter = options.filter(limit)?;
     read_database(path, Vec::new(), move |conn| {
         Ok(core_recent(conn, &filter)?
             .into_iter()
@@ -391,13 +421,16 @@ pub async fn get_session_events_page(
 #[napi]
 pub async fn stats(options: Option<StatsOptions>) -> napi::Result<NativeStats> {
     let options = options.unwrap_or(StatsOptions {
+        scope: None,
         db_path: None,
         tag: None,
     });
+    let scope = parse_scope(options.scope)?;
     let path = db_path(options.db_path);
     read_database(
         path,
         NativeStats {
+            scope: scope_name(scope),
             total: 0,
             by_source: Vec::new(),
             by_project: Vec::new(),
@@ -405,8 +438,9 @@ pub async fn stats(options: Option<StatsOptions>) -> napi::Result<NativeStats> {
             last_timestamp_ms: None,
         },
         move |conn| {
-            let result = core_stats(conn, options.tag.as_deref())?;
+            let result = core_stats_scoped(conn, options.tag.as_deref(), scope)?;
             Ok(NativeStats {
+                scope: scope_name(scope),
                 total: result.total,
                 by_source: result
                     .by_source
@@ -445,6 +479,7 @@ pub struct CatalogSession {
     pub raw_path: Option<String>,
     pub source_stamp: Option<String>,
     pub discovery_state: String,
+    pub locations: Vec<String>,
     pub from_cache: bool,
 }
 
@@ -468,6 +503,7 @@ impl From<ai_hist_engine::ShallowSession> for CatalogSession {
             raw_path: session.raw_path,
             source_stamp: session.source_stamp,
             discovery_state: session.discovery_state,
+            locations: session.locations,
             from_cache: session.from_cache,
         }
     }
@@ -482,6 +518,7 @@ pub struct CatalogCursor {
 
 #[napi(object)]
 pub struct ListCatalogOptions {
+    pub scope: Option<String>,
     pub db_path: Option<String>,
     pub sources: Option<Vec<String>>,
     pub limit: Option<i64>,
@@ -492,6 +529,7 @@ pub struct ListCatalogOptions {
 #[napi(object)]
 pub struct SessionCatalogPage {
     pub contract_version: u32,
+    pub scope: String,
     pub sessions: Vec<CatalogSession>,
     pub next_cursor: Option<CatalogCursor>,
 }
@@ -502,6 +540,7 @@ pub async fn list_session_catalog_page(
     options: Option<ListCatalogOptions>,
 ) -> napi::Result<SessionCatalogPage> {
     let options = options.unwrap_or(ListCatalogOptions {
+        scope: None,
         db_path: None,
         sources: None,
         limit: None,
@@ -509,8 +548,10 @@ pub async fn list_session_catalog_page(
         after: None,
     });
     validate_limit(options.limit, DEFAULT_LIMIT, 1_000)?;
+    let scope = parse_scope(options.scope)?;
     let path = db_path(options.db_path);
     let request = ai_hist_engine::CatalogListOptions {
+        scope,
         sources: options.sources.unwrap_or_default(),
         limit: options.limit,
         before_ms: options.before_ms,
@@ -522,13 +563,17 @@ pub async fn list_session_catalog_page(
     };
     read_database_with_schema(
         path,
-        ai_hist_engine::SessionCatalogPage::default(),
+        ai_hist_engine::SessionCatalogPage {
+            scope,
+            ..Default::default()
+        },
         schema_is_catalog_read_current,
         move |conn| ai_hist_engine::list_session_catalog_page(conn, &request),
     )
     .await
     .map(|page| SessionCatalogPage {
         contract_version: ai_hist_engine::SESSION_CATALOG_CONTRACT_VERSION,
+        scope: scope_name(page.scope),
         sessions: page
             .sessions
             .into_iter()
@@ -552,6 +597,7 @@ pub async fn list_session_catalog(
 
 #[napi(object)]
 pub struct DiscoverOptions {
+    pub scope: Option<String>,
     pub db_path: Option<String>,
     pub sources: Option<Vec<String>>,
     pub limit: Option<u32>,
@@ -591,6 +637,7 @@ pub struct SourceExemption {
 #[napi(object)]
 pub struct DiscoverResult {
     pub contract_version: u32,
+    pub scope: String,
     pub sessions: Vec<CatalogSession>,
     pub discovered: u32,
     pub skipped_unchanged: u32,
@@ -604,23 +651,27 @@ pub struct DiscoverResult {
 #[napi]
 pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result<DiscoverResult> {
     let options = options.unwrap_or(DiscoverOptions {
+        scope: None,
         db_path: None,
         sources: None,
         limit: None,
     });
+    let scope = parse_scope(options.scope)?;
     let path = db_path(options.db_path);
     let request = ai_hist_engine::DiscoverOptions {
+        scope,
         sources: options.sources.unwrap_or_default(),
         limit: options.limit.map(|limit| limit as usize),
     };
     let (sessions, summary) = napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::discover_sessions_local_at(&path, &request)
+        ai_hist_engine::discover_sessions_scoped_at(&path, &request)
     })
     .await
     .map_err(worker_error)?
     .map_err(|error| native_error("DISCOVERY_FAILED", format!("{error:#}")))?;
     Ok(DiscoverResult {
         contract_version: summary.contract_version,
+        scope: scope_name(scope),
         sessions: sessions.into_iter().map(CatalogSession::from).collect(),
         discovered: summary.discovered as u32,
         skipped_unchanged: summary.skipped_unchanged as u32,
@@ -665,26 +716,35 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
 #[napi(object)]
 pub struct SyncOptions {
     pub db_path: Option<String>,
+    pub scope: Option<String>,
 }
 
 #[napi(object)]
 pub struct SyncResult {
     pub database_path: String,
     pub completed: bool,
+    pub scope: String,
 }
 
 /// Explicit full ingestion. A read operation never calls this implicitly.
 #[napi]
 pub async fn sync(options: Option<SyncOptions>) -> napi::Result<SyncResult> {
-    let path = db_path(options.and_then(|options| options.db_path));
+    let options = options.unwrap_or(SyncOptions {
+        db_path: None,
+        scope: None,
+    });
+    let scope = parse_scope(options.scope)?;
+    let path = db_path(options.db_path);
     let result_path = path.display().to_string();
-    let completed = napi::tokio::task::spawn_blocking(move || ai_hist_engine::sync_local_at(&path))
-        .await
-        .map_err(worker_error)?
-        .map_err(|error| native_error("SYNC_FAILED", format!("{error:#}")))?;
+    let completed =
+        napi::tokio::task::spawn_blocking(move || ai_hist_engine::sync_scoped_at(&path, scope))
+            .await
+            .map_err(worker_error)?
+            .map_err(|error| native_error("SYNC_FAILED", format!("{error:#}")))?;
     Ok(SyncResult {
         database_path: result_path,
         completed,
+        scope: scope_name(scope),
     })
 }
 

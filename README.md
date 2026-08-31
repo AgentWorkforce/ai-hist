@@ -30,6 +30,21 @@ ai-hist sessions discover --limit 100
 ai-hist sessions list --limit 100
 ```
 
+Session-set commands share one mutually exclusive location scope:
+
+```bash
+ai-hist sessions list --local   # default; identical to omitting a scope flag
+ai-hist sessions list --remote  # cached sessions with a remote presence
+ai-hist sessions list --all     # union of both, with each session returned once
+```
+
+The same `--local` / `--remote` / `--all` contract applies to discovery,
+search, recent history, statistics, and sync. Local and remote are presences of a session,
+not separate catalogs: every result comes from the same session ledger. Reads
+only filter that cached ledger. Remote discovery and remote sync are reserved
+for provider connectors and currently return an unsupported-operation error;
+they never silently fall back to local work.
+
 No Rust toolchain, C/C++ compiler, standalone CLI, curl installer, or runtime
 binary download is used.
 
@@ -56,21 +71,22 @@ import {
   sync,
 } from 'ai-hist';
 
-await discoverSessions({ limit: 100 });
-const sessions = await listSessionCatalog({ limit: 100 });
+await discoverSessions({ limit: 100, scope: 'local' });
+const sessions = await listSessionCatalog({ limit: 100, scope: 'all' });
 const firstEvents = sessions[0]
   ? await getSessionEventsPage(sessions[0].sessionId, {
       source: sessions[0].source,
       limit: 200,
     })
   : null;
-const matches = await search('migration', { limit: 20 });
-await sync(); // explicit full ingestion
+const matches = await search('migration', { limit: 20, scope: 'all' });
+await sync({ scope: 'local' }); // explicit full ingestion; local is the default
 ```
 
 `listSessionCatalog` is cache-only. `discoverSessions` performs bounded shallow
-provider discovery and updates the catalog. `sync` performs full ingestion.
-Reads never silently turn into either discovery or sync.
+provider discovery and updates the shared ledger. `sync` performs full
+ingestion. Reads never silently turn into either discovery or sync. Direct
+session and event lookup is identity-based and therefore has no location scope.
 
 ## MCP
 

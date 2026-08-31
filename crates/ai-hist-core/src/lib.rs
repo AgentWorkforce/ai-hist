@@ -63,6 +63,38 @@ pub struct QueryFilter {
     pub tag: Option<String>,
     pub before_ms: Option<i64>,
     pub limit: i64,
+    pub scope: SessionScope,
+}
+
+/// Which acquisition surface a query should include.
+///
+/// Local remains the default so upgrading does not turn an offline read into a
+/// network-backed workflow or expose remotely discovered catalog entries in
+/// existing commands. `All` is the union of both locations, not a third place.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionScope {
+    #[default]
+    Local,
+    Remote,
+    All,
+}
+
+/// A place where one logical provider session has been observed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionLocation {
+    Local,
+    Remote,
+}
+
+impl SessionLocation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -350,6 +382,8 @@ const REQUIRED_TABLES: &[&str] = &[
     "tags",
     "session_tags",
     "sessions",
+    "session_presences",
+    "schema_migrations",
     "discovery_skips",
 ];
 const REQUIRED_HISTORY_COLUMNS: &[&str] = &["prompt_hash", "git_branch"];
@@ -368,6 +402,8 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
     "source_stamp",
     "discovery_state",
 ];
+const REQUIRED_SESSION_PRESENCE_COLUMNS: &[&str] =
+    &["raw_locator", "source_stamp", "discovery_state"];
 
 /// Indexes the session catalog's fast paths depend on.
 ///
@@ -389,12 +425,19 @@ const REQUIRED_SESSIONS_INDEXES: &[&str] = &[
     "idx_sessions_raw_path",
     "idx_session_events_source_page",
     "idx_session_events_page",
+    "idx_session_presences_location",
+    "idx_session_presences_locator",
 ];
 
-const REQUIRED_CATALOG_READ_INDEXES: &[&str] =
-    &["idx_sessions_recency", "idx_sessions_source_recency"];
+const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
+    "idx_sessions_recency",
+    "idx_sessions_source_recency",
+    "idx_session_presences_location",
+];
 const REQUIRED_EVENT_READ_INDEXES: &[&str] =
     &["idx_session_events_source_page", "idx_session_events_page"];
+const REQUIRED_SCOPE_READ_INDEXES: &[&str] = &["idx_session_presences_location"];
+const REQUIRED_TRIGGERS: &[&str] = &["delete_session_presences"];
 
 /// Whether this database already has everything [`init_db`] would add.
 ///
@@ -409,7 +452,7 @@ pub fn schema_is_current(conn: &Connection) -> Result<bool> {
 
 /// Whether read-only APIs can safely and efficiently query this database.
 pub fn schema_is_read_current(conn: &Connection) -> Result<bool> {
-    schema_has_required_indexes(conn, &[])
+    schema_has_required_indexes(conn, REQUIRED_SCOPE_READ_INDEXES)
 }
 
 /// Whether the cache-only catalog can use its sort-free query plans.
@@ -425,6 +468,11 @@ pub fn schema_is_event_read_current(conn: &Connection) -> Result<bool> {
 fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> Result<bool> {
     let mut table = conn.prepare("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1")?;
     for name in REQUIRED_TABLES {
+        if !table.exists([name])? {
+            return Ok(false);
+        }
+    }
+    for name in REQUIRED_TRIGGERS {
         if !table.exists([name])? {
             return Ok(false);
         }
@@ -446,6 +494,16 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     if !REQUIRED_SESSIONS_COLUMNS
         .iter()
         .all(|needed| session_columns.contains(*needed))
+    {
+        return Ok(false);
+    }
+    let presence_columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('session_presences')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !REQUIRED_SESSION_PRESENCE_COLUMNS
+        .iter()
+        .all(|needed| presence_columns.contains(*needed))
     {
         return Ok(false);
     }
@@ -488,6 +546,9 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE history ADD COLUMN git_branch TEXT", []);
     conn.execute_batch(
         r#"
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    name TEXT PRIMARY KEY
+);
 CREATE TABLE IF NOT EXISTS discovery_skips (
     source TEXT NOT NULL,
     locator TEXT NOT NULL,
@@ -517,6 +578,21 @@ CREATE TABLE IF NOT EXISTS sessions (
     discovery_state TEXT,
     PRIMARY KEY (session_id, source)
 );
+CREATE TABLE IF NOT EXISTS session_presences (
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    location TEXT NOT NULL CHECK(location IN ('local', 'remote')),
+    raw_locator TEXT,
+    source_stamp TEXT,
+    discovery_state TEXT,
+    PRIMARY KEY (source, session_id, location)
+);
+CREATE TRIGGER IF NOT EXISTS delete_session_presences
+AFTER DELETE ON sessions
+BEGIN
+    DELETE FROM session_presences
+    WHERE source = OLD.source AND session_id = OLD.session_id;
+END;
 "#,
     )?;
     // `sessions` predates the shallow catalog. Databases created by an older
@@ -541,6 +617,59 @@ CREATE TABLE IF NOT EXISTS sessions (
                 return Err(error).with_context(|| format!("adding column sessions.{column}"));
             }
         }
+    }
+    for column in REQUIRED_SESSION_PRESENCE_COLUMNS {
+        if let Err(error) = conn.execute(
+            &format!("ALTER TABLE session_presences ADD COLUMN {column} TEXT"),
+            [],
+        ) {
+            if !error.to_string().contains("duplicate column name") {
+                return Err(error)
+                    .with_context(|| format!("adding column session_presences.{column}"));
+            }
+        }
+    }
+    // Before the presence model every identity in the local evidence ledger
+    // was local. Check the marker before attempting a write so an
+    // already-current database remains readable while another process writes.
+    // The transaction rechecks after acquiring the write lock, making two
+    // concurrent first opens both safe and crash-atomic.
+    let presence_backfilled = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = 'session_presences_local_backfill_v1')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !presence_backfilled {
+        conn.execute_batch(
+            r#"
+BEGIN IMMEDIATE;
+INSERT OR IGNORE INTO session_presences
+    (source, session_id, location, raw_locator, source_stamp, discovery_state)
+SELECT source, session_id, 'local', raw_path, source_stamp, discovery_state
+FROM sessions
+WHERE session_id <> ''
+  AND NOT EXISTS (
+      SELECT 1 FROM schema_migrations
+      WHERE name = 'session_presences_local_backfill_v1'
+  );
+INSERT OR IGNORE INTO session_presences (source, session_id, location)
+SELECT source, session_id, 'local'
+FROM (
+    SELECT source, session_id FROM history WHERE session_id IS NOT NULL AND session_id <> ''
+    UNION SELECT source, session_id FROM session_events WHERE session_id <> ''
+    UNION SELECT source, session_id FROM tool_calls WHERE session_id <> ''
+    UNION SELECT source, session_id FROM file_edits WHERE session_id <> ''
+    UNION SELECT source, session_id FROM session_commit_links WHERE session_id <> ''
+)
+WHERE NOT EXISTS (
+    SELECT 1 FROM schema_migrations
+    WHERE name = 'session_presences_local_backfill_v1'
+);
+INSERT OR IGNORE INTO schema_migrations (name)
+VALUES ('session_presences_local_backfill_v1');
+COMMIT;
+"#,
+        )?;
     }
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_history_hash ON history(prompt_hash)",
@@ -599,6 +728,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     // path, because a transcript's session id is not known until it is read.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sessions_raw_path ON sessions(source, raw_path)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_presences_location ON session_presences(location, source, session_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_presences_locator ON session_presences(location, source, raw_locator)",
         [],
     )?;
     conn.execute(
@@ -852,11 +989,118 @@ fn append_filters(sql: &mut String, params: &mut Vec<String>, filter: &QueryFilt
     }
 }
 
+fn append_scope_filter(sql: &mut String, scope: SessionScope, alias: &str) {
+    match scope {
+        SessionScope::Local => {
+            // Rows written before presences existed are local by construction.
+            // Keep that compatibility fallback only while a session has no
+            // explicit presence: a remote-only session must not leak into the
+            // default local view.
+            sql.push_str(&format!(
+                " AND (EXISTS (SELECT 1 FROM session_presences sp_local WHERE sp_local.source = {alias}.source AND sp_local.session_id = {alias}.session_id AND sp_local.location = 'local') OR NOT EXISTS (SELECT 1 FROM session_presences sp_any WHERE sp_any.source = {alias}.source AND sp_any.session_id = {alias}.session_id))"
+            ));
+        }
+        SessionScope::Remote => {
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM session_presences sp_remote WHERE sp_remote.source = {alias}.source AND sp_remote.session_id = {alias}.session_id AND sp_remote.location = 'remote')"
+            ));
+        }
+        SessionScope::All => {}
+    }
+}
+
+/// Record that a provider session exists at one acquisition location.
+///
+/// The operation is idempotent and intentionally does not infer the opposite
+/// location. A teleported session can therefore have both rows, while a cloud
+/// catalog entry stays remote-only until local materialization is observed.
+pub fn mark_session_presence(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    location: SessionLocation,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO session_presences (source, session_id, location) VALUES (?, ?, ?)",
+        params![source, session_id, location.as_str()],
+    )?;
+    Ok(())
+}
+
+/// Record a presence together with connector-specific cache metadata.
+///
+/// Locator and stamp live on the presence so a dual local/remote session can
+/// retain independent change detection state. Canonical merged metadata stays
+/// on `sessions` for the unified user-facing row.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_session_presence(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    location: SessionLocation,
+    raw_locator: Option<&str>,
+    source_stamp: Option<&str>,
+    discovery_state: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO session_presences \
+         (source, session_id, location, raw_locator, source_stamp, discovery_state) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(source, session_id, location) DO UPDATE SET \
+         raw_locator = COALESCE(excluded.raw_locator, session_presences.raw_locator), \
+         source_stamp = COALESCE(excluded.source_stamp, session_presences.source_stamp), \
+         discovery_state = CASE \
+             WHEN session_presences.discovery_state = 'full' THEN 'full' \
+             ELSE COALESCE(excluded.discovery_state, session_presences.discovery_state) \
+         END",
+        params![
+            source,
+            session_id,
+            location.as_str(),
+            raw_locator,
+            source_stamp,
+            discovery_state
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn insert_history(conn: &Connection, entry: &HistoryEntry) -> Result<usize> {
-    Ok(conn.execute(
+    insert_history_at_location(conn, entry, SessionLocation::Local)
+}
+
+/// Insert one history row and record the acquisition location of its session.
+/// Existing callers use [`insert_history`] for the local default; remote
+/// connectors use this entry point so ingestion never manufactures a local
+/// presence.
+pub fn insert_history_at_location(
+    conn: &Connection,
+    entry: &HistoryEntry,
+    location: SessionLocation,
+) -> Result<usize> {
+    if conn.is_autocommit() {
+        let transaction = conn.unchecked_transaction()?;
+        let inserted = insert_history_with_presence(&transaction, entry, location)?;
+        transaction.commit()?;
+        return Ok(inserted);
+    }
+    // An existing caller transaction makes the evidence and presence atomic.
+    insert_history_with_presence(conn, entry, location)
+}
+
+fn insert_history_with_presence(
+    conn: &Connection,
+    entry: &HistoryEntry,
+    location: SessionLocation,
+) -> Result<usize> {
+    if let Some(session_id) = entry.session_id.as_deref().filter(|id| !id.is_empty()) {
+        mark_session_presence(conn, &entry.source, session_id, location)?;
+    }
+    let inserted = conn.execute(
         "INSERT OR IGNORE INTO history (source, session_id, project, prompt, prompt_hash, timestamp_ms) VALUES (?, ?, ?, ?, ?, ?)",
         params![entry.source, entry.session_id, entry.project, entry.prompt, entry.prompt_hash, entry.timestamp_ms],
-    )?)
+    )?;
+    Ok(inserted)
 }
 
 pub fn search(
@@ -872,6 +1116,7 @@ pub fn search(
     let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history_fts f JOIN history h ON f.rowid = h.id WHERE history_fts MATCH ?".to_string();
     let mut params_vec = vec![query];
     append_filters(&mut sql, &mut params_vec, filter, "h");
+    append_scope_filter(&mut sql, filter.scope, "h");
     sql.push_str(" ORDER BY h.timestamp_ms DESC LIMIT ?");
     params_vec.push(filter.limit.max(1).to_string());
     let mut stmt = conn.prepare(&sql)?;
@@ -886,6 +1131,7 @@ pub fn recent(conn: &Connection, filter: &QueryFilter) -> Result<Vec<HistoryEntr
     let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history h WHERE 1=1".to_string();
     let mut params_vec = Vec::new();
     append_filters(&mut sql, &mut params_vec, filter, "h");
+    append_scope_filter(&mut sql, filter.scope, "h");
     sql.push_str(" ORDER BY h.timestamp_ms DESC LIMIT ?");
     params_vec.push(filter.limit.max(1).to_string());
     let mut stmt = conn.prepare(&sql)?;
@@ -1147,10 +1393,15 @@ pub fn session_file_edits(
 }
 
 pub fn stats(conn: &Connection, tag: Option<&str>) -> Result<Stats> {
-    let mut where_sql = String::new();
+    stats_scoped(conn, tag, SessionScope::Local)
+}
+
+pub fn stats_scoped(conn: &Connection, tag: Option<&str>, scope: SessionScope) -> Result<Stats> {
+    let mut where_sql = " WHERE 1=1".to_string();
     let mut params_vec = Vec::new();
+    append_scope_filter(&mut where_sql, scope, "h");
     if let Some(tag) = tag {
-        where_sql = " WHERE EXISTS (SELECT 1 FROM session_tags st JOIN tags t ON t.id = st.tag_id WHERE st.source = h.source AND st.session_id = h.session_id AND t.name = ?)".into();
+        where_sql.push_str(" AND EXISTS (SELECT 1 FROM session_tags st JOIN tags t ON t.id = st.tag_id WHERE st.source = h.source AND st.session_id = h.session_id AND t.name = ?)");
         params_vec.push(normalize_tag_name(tag));
     }
     let total = conn.query_row(
@@ -1170,11 +1421,7 @@ pub fn stats(conn: &Connection, tag: Option<&str>) -> Result<Stats> {
         rows
     };
     let by_project = {
-        let extra = if where_sql.is_empty() {
-            "WHERE project IS NOT NULL".to_string()
-        } else {
-            format!("{where_sql} AND project IS NOT NULL")
-        };
+        let extra = format!("{where_sql} AND project IS NOT NULL");
         let mut stmt = conn.prepare(&format!("SELECT project, COUNT(*) FROM history h {extra} GROUP BY project ORDER BY COUNT(*) DESC LIMIT 10"))?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params_vec.clone()), |r| {
@@ -1563,6 +1810,140 @@ mod tests {
             "\"parity-check\""
         );
         assert_eq!(build_fts_query(&["foo*".into()], false), "foo*");
+    }
+
+    #[test]
+    fn session_scope_defaults_to_local_and_uses_lowercase_wire_names() {
+        assert_eq!(SessionScope::default(), SessionScope::Local);
+        assert_eq!(
+            serde_json::to_string(&SessionScope::Remote).unwrap(),
+            "\"remote\""
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionScope>("\"all\"").unwrap(),
+            SessionScope::All
+        );
+    }
+
+    #[test]
+    fn search_and_recent_apply_presence_scope_with_a_local_legacy_fallback() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (session_id, timestamp_ms) in [("legacy", 1), ("local", 2), ("remote", 3), ("both", 4)]
+        {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some(session_id.into()),
+                    project: None,
+                    prompt: "scopeprobe".into(),
+                    prompt_hash: None,
+                    timestamp_ms,
+                },
+            )
+            .unwrap();
+        }
+        mark_session_presence(&conn, "claude", "local", SessionLocation::Local).unwrap();
+        conn.execute(
+            "DELETE FROM session_presences WHERE source = 'claude' AND session_id = 'remote'",
+            [],
+        )
+        .unwrap();
+        mark_session_presence(&conn, "claude", "remote", SessionLocation::Remote).unwrap();
+        mark_session_presence(&conn, "claude", "both", SessionLocation::Local).unwrap();
+        mark_session_presence(&conn, "claude", "both", SessionLocation::Remote).unwrap();
+        // Presence writes are idempotent.
+        mark_session_presence(&conn, "claude", "both", SessionLocation::Remote).unwrap();
+
+        let ids = |rows: Vec<HistoryEntry>| {
+            rows.into_iter()
+                .map(|row| row.session_id.unwrap())
+                .collect::<Vec<_>>()
+        };
+        for query in [false, true] {
+            let run = |scope| {
+                let filter = QueryFilter {
+                    limit: 20,
+                    scope,
+                    ..Default::default()
+                };
+                if query {
+                    search(&conn, &["scopeprobe".into()], false, &filter).unwrap()
+                } else {
+                    recent(&conn, &filter).unwrap()
+                }
+            };
+            assert_eq!(ids(run(SessionScope::Local)), ["both", "local", "legacy"]);
+            assert_eq!(ids(run(SessionScope::Remote)), ["both", "remote"]);
+            assert_eq!(
+                ids(run(SessionScope::All)),
+                ["both", "remote", "local", "legacy"]
+            );
+        }
+        assert_eq!(
+            stats_scoped(&conn, None, SessionScope::Local)
+                .unwrap()
+                .total,
+            3
+        );
+        assert_eq!(
+            stats_scoped(&conn, None, SessionScope::Remote)
+                .unwrap()
+                .total,
+            2
+        );
+        assert_eq!(
+            stats_scoped(&conn, None, SessionScope::All).unwrap().total,
+            4
+        );
+        // Direct lookup is identity-based rather than acquisition-scoped.
+        assert_eq!(
+            session(&conn, "remote", Some("claude"), None)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let presence_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_presences WHERE source = 'claude' AND session_id = 'both' AND location = 'remote'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(presence_count, 1);
+    }
+
+    #[test]
+    fn history_and_presence_insert_roll_back_together() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_history_insert BEFORE INSERT ON history
+             WHEN NEW.session_id = 'reject-me'
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+        let entry = HistoryEntry {
+            id: 0,
+            source: "codex".into(),
+            session_id: Some("reject-me".into()),
+            project: None,
+            prompt: "must roll back".into(),
+            prompt_hash: None,
+            timestamp_ms: 1,
+        };
+        assert!(insert_history_at_location(&conn, &entry, SessionLocation::Remote).is_err());
+        let presence_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_presences WHERE source = 'codex' AND session_id = 'reject-me'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(presence_count, 0);
     }
 
     #[test]
@@ -1991,7 +2372,9 @@ mod tests {
                          PRIMARY KEY (session_id, source)
                      );
                      INSERT INTO sessions (session_id, source, last_activity_ms)
-                     VALUES ('legacy-1', 'claude', 42);",
+                     VALUES ('legacy-1', 'claude', 42);
+                     INSERT INTO history (source, session_id, prompt, timestamp_ms)
+                     VALUES ('codex', 'history-only', 'legacy prompt', 41);",
                 )
                 .unwrap();
             assert!(
@@ -2022,6 +2405,118 @@ mod tests {
             .unwrap();
         assert_eq!(id, "legacy-1");
         assert_eq!(state, None);
+        let location: String = conn
+            .query_row(
+                "SELECT location FROM session_presences WHERE source = 'claude' AND session_id = 'legacy-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(location, "local");
+        let history_location: String = conn
+            .query_row(
+                "SELECT location FROM session_presences WHERE source = 'codex' AND session_id = 'history-only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history_location, "local");
+
+        // The legacy backfill is permanently guarded. A session discovered
+        // remotely after migration remains remote-only on every later init.
+        conn.execute(
+            "INSERT INTO sessions (session_id, source) VALUES ('cloud-1', 'codex')",
+            [],
+        )
+        .unwrap();
+        mark_session_presence(&conn, "codex", "cloud-1", SessionLocation::Remote).unwrap();
+        init_db(&conn).unwrap();
+        let locations = conn
+            .prepare(
+                "SELECT location FROM session_presences WHERE source = 'codex' AND session_id = 'cloud-1' ORDER BY location",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(locations, ["remote"]);
+
+        conn.execute(
+            "DELETE FROM sessions WHERE source = 'codex' AND session_id = 'cloud-1'",
+            [],
+        )
+        .unwrap();
+        let stale: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_presences WHERE source = 'codex' AND session_id = 'cloud-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "canonical deletion cleans presence state");
+    }
+
+    #[test]
+    fn concurrent_first_presence_migrations_are_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("concurrent-legacy.db");
+        {
+            let legacy = Connection::open(&db_path).unwrap();
+            legacy.execute_batch(SCHEMA).unwrap();
+            legacy
+                .execute_batch(
+                    "ALTER TABLE history ADD COLUMN git_branch TEXT;
+                     CREATE TABLE sessions (
+                         session_id TEXT NOT NULL,
+                         source TEXT NOT NULL,
+                         cwd TEXT,
+                         git_branch TEXT,
+                         first_activity_ms INTEGER,
+                         last_activity_ms INTEGER,
+                         last_assistant_text TEXT,
+                         raw_path TEXT,
+                         parser_version INTEGER NOT NULL DEFAULT 1,
+                         PRIMARY KEY (session_id, source)
+                     );
+                     INSERT INTO sessions (session_id, source)
+                     VALUES ('legacy-race', 'claude');",
+                )
+                .unwrap();
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let handles = (0..4)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let path = db_path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    open_db(&path).map(drop)
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name = 'session_presences_local_backfill_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker_count, 1);
+        let presence_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_presences WHERE source = 'claude' AND session_id = 'legacy-race' AND location = 'local'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(presence_count, 1);
     }
 
     /// The catalog listing's promise is an indexed, sort-free read. A database
@@ -2075,6 +2570,15 @@ mod tests {
             .unwrap();
         assert!(schema_is_read_current(&conn).unwrap());
         assert!(!schema_is_event_read_current(&conn).unwrap());
+
+        init_db(&conn).unwrap();
+        conn.execute_batch("DROP INDEX idx_session_presences_location")
+            .unwrap();
+        assert!(!schema_is_current(&conn).unwrap());
+        assert!(!schema_is_read_current(&conn).unwrap());
+        assert!(!schema_is_catalog_read_current(&conn).unwrap());
+        // Direct event pagination does not use session location.
+        assert!(schema_is_event_read_current(&conn).unwrap());
     }
 
     /// A fresh database and a migrated one must end up with the same `sessions`

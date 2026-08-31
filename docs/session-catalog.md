@@ -1,6 +1,7 @@
 # Session Catalog — shallow coding-agent session discovery
 
-**Answer "which coding-agent sessions exist on this machine, newest first?" in milliseconds, without indexing a single transcript.**
+**Answer "which coding-agent sessions have been found, newest first?" in
+milliseconds, without indexing a single transcript.**
 
 `ai-hist sync` builds the deep index: every message, tool call, file edit and
 full-text row. That is the right thing for search, and the wrong thing for a
@@ -12,13 +13,22 @@ table so the next listing touches no provider file at all.
 The two layers coexist. Discovery never blocks or downgrades a full sync, and a
 fully indexed session keeps its richer state when discovery re-reads it.
 
+The catalog is one ledger, not separate local and remote catalogs. A session
+may have a `local` presence, a `remote` presence, or both. Its presences are
+stored in `session_presences`, while callers still receive one session row.
+Collection commands select a location with exactly one of `--local`,
+`--remote`, or `--all`; omitting a scope flag means `--local`. `--all` is the
+deduplicated union, so the same `(source, session_id)` is never returned twice
+just because it has both presences. Combining scope flags is an invalid
+argument; provider `--source` filters remain orthogonal to location scope.
+
 ---
 
 ## The two operations
 
 | | `ai-hist sessions list` | `ai-hist sessions discover` |
 |---|---|---|
-| Reads | the `sessions` table only | provider locations, with bounded reads |
+| Reads | the cached ledger only | configured provider locations, with bounded reads |
 | Provider I/O | none | head/tail of the newest candidates |
 | Writes | nothing (read-only handle when the schema is current) | upserts `sessions` rows |
 | Output | one JSON object | JSONL session, diagnostic, and summary records |
@@ -32,15 +42,17 @@ Use **`discover`** when the catalog may be stale — on app launch, on a manual
 refresh, or on a timer. It is safe to run beside `ai-hist sync`.
 
 ```bash
-# Refresh the catalog from every provider, newest first.
+# Refresh from local provider locations (the default).
 ai-hist sessions discover
+ai-hist sessions discover --local
 
-# Just the 20 most recent sessions across all providers (bounded work).
-ai-hist sessions discover --limit 20
+# Run every configured discovery adapter (currently local adapters).
+ai-hist sessions discover --all --limit 20
 
 # Read back what the catalog holds — no provider file is opened.
 ai-hist sessions list
-ai-hist sessions list --limit 100 --source codex --source claude
+ai-hist sessions list --remote --limit 100 --source codex --source claude
+ai-hist sessions list --all --limit 100
 
 # Page backwards by recency (keyset, not OFFSET).
 ai-hist sessions list --limit 50 --before-ms 1781949900000
@@ -54,7 +66,7 @@ ai-hist sessions discover --json      # JSONL: sessions, diagnostics, summary
 
 ## The output contract
 
-Both operations carry `contract_version` — currently **1**
+Both operations carry `contract_version` — currently **2**
 (`SESSION_CATALOG_CONTRACT_VERSION`). It is bumped whenever the shape or the
 meaning of a row changes in a way a consumer must notice, so parse it and fail
 loudly on a version you do not know rather than guessing.
@@ -65,7 +77,8 @@ One object, never a bare array, so the version travels with the payload:
 
 ```jsonc
 {
-  "contract_version": 1,
+  "contract_version": 2,
+  "scope": "local",
   "sessions": [
     {
       "source": "codex",
@@ -85,6 +98,7 @@ One object, never a bare array, so the version travels with the payload:
       "raw_path": "/Users/you/.codex/sessions/2026/06/21/rollout-codex.jsonl",
       "source_stamp": "v1:1788042670103317900:569",
       "discovery_state": "shallow",
+      "locations": ["local"],
       "from_cache": true
     }
   ],
@@ -96,8 +110,8 @@ One object, never a bare array, so the version travels with the payload:
 }
 ```
 
-Keys are `snake_case`. `models` and `workspace_roots` are always arrays
-(possibly empty); every other absent value is `null`, never an invented
+Keys are `snake_case`. `models`, `workspace_roots`, and `locations` are always
+arrays (possibly empty); every other absent value is `null`, never an invented
 placeholder or an empty string.
 
 `next_cursor` is the continuation for the next page, or `null` once the catalog
@@ -120,7 +134,8 @@ types, in this order:
 // so a consumer always sees the reason before the non-zero exit
 {
   "type": "summary",
-  "contract_version": 1,
+  "contract_version": 2,
+  "scope": "local",
   "discovered": 2,
   "skipped_unchanged": 0,
   "providers": {
@@ -188,13 +203,14 @@ contract:
 | `raw_path` | observed | provider file this row came from; `null` for database- and network-backed sources |
 | `source_stamp` | internal | change marker; see [rescan behaviour](#rescans-and-source-stamps) |
 | `discovery_state` | internal | `"shallow"` or `"full"` |
+| `locations` | derived | sorted presences from `session_presences`: `"local"`, `"remote"`, or both |
 | `from_cache` | per-response | `true` when the row was served without re-reading the source |
 
 Absent metadata stays `null`. Nothing is ever invented to fill a column.
 
 ### What the catalog deliberately does not have
 
-These require `ai-hist sync`, for every provider, without exception:
+These require a full `ai-hist sync` through an available provider connector:
 
 - per-message events (`session_events`), tool calls, file edits
 - token usage and cost
@@ -205,13 +221,30 @@ These require `ai-hist sync`, for every provider, without exception:
 `discovery_state` tells you which you have: `"full"` means a full ingest has
 run for that session, `"shallow"` means catalog metadata only. Full ingest
 always wins — a shallow rescan refreshes a `full` row's metadata and stamp but
-never downgrades its state.
+never downgrades its state. Local connectors provide full sync today; remote
+rows remain shallow until remote connectors ship.
 
 ### Product boundary
 
 Discovery reports *which sessions exist* and identifying metadata. It does not
 infer project membership, work status, health, risk or success, and it does not
 summarize outcomes.
+
+### Scope and connector availability
+
+Scope filtering is consistent across catalog listing, search, recent history,
+statistics, packs, and resume selection: `local` selects sessions with a local presence, `remote` selects those
+with a remote presence, and `all` returns their deduplicated union. These are
+cache-only queries over the same ledger.
+
+Discovery and sync are acquisition operations. Local adapters are available
+today. Explicit remote acquisition is reserved but unsupported until provider
+connectors ship, and returns an error rather than silently doing local work.
+`--all` means every configured adapter; today that is the local adapters, and
+remote adapters will join the same operation when implemented.
+
+Direct `session` and `events` lookups already name a `(source, session_id)` and
+therefore remain scope-independent.
 
 ---
 
@@ -274,8 +307,9 @@ How each adapter works:
 
 The ordering and the limit are **global**, not per provider:
 
-1. Every selected provider enumerates its candidates **cheaply** — a directory
-   walk plus `stat`, or one indexed query. No file content is read.
+1. Every selected provider adapter in the requested scope enumerates its
+   candidates **cheaply** — a directory walk plus `stat`, or one indexed query.
+   No file content is read.
 2. Candidates from all providers are merged and sorted by recency hint,
    descending. Candidates with no recency signal sort last; ties break on
    `(source, locator)` so a run is reproducible.
@@ -390,6 +424,16 @@ Databases created by an older release are migrated in place by ignore-error
 columns, so a read-only handle over an old database is upgraded instead of
 failing with `no such column`.
 
+`session_presences` is the location child table. It is keyed by
+`(source, session_id, location)`, where `location` is `local` or `remote`, and
+is joined to the corresponding `sessions` row by `(source, session_id)`.
+Each presence also keeps its connector-specific `raw_locator`, `source_stamp`,
+and `discovery_state`, so local and cloud change detection cannot overwrite
+one another. Existing identities found in local catalog and evidence tables
+are backfilled with a local presence during migration. Scope queries use this
+table to select sessions and aggregate their `locations`; they do not duplicate
+the session or its events.
+
 ---
 
 ## Adding a provider
@@ -417,11 +461,12 @@ discoverable".
 
 ## Programmatic access
 
-- **Native (napi)** — `listSessions(options?)` returns
-  `{contractVersion, sessions, nextCursor}`; `discoverSessions(options?)` runs a shallow
-  scan and returns the rows plus the summary. The CLI renders the same collected
+- **Native (napi)** — `listSessionCatalogPage(options?)` returns
+  `{contractVersion, scope, sessions, nextCursor}`;
+  `discoverSessions(options?)` runs a shallow scan and returns the rows plus
+  the summary. The CLI renders the same collected
   result as JSONL when line-oriented records are more convenient. Both run on
-  a blocking worker thread and accept `sources` / `limit`, with `beforeMs` and
+  a blocking worker thread and accept `scope` / `sources` / `limit`, with `beforeMs` and
   `after` (the previous page's `nextCursor`) on the listing.
 - **TypeScript SDK** — `listSessionCatalog()` / `discoverSessions()` wrap the
   same contract for Node consumers; see the SDK's own documentation for the

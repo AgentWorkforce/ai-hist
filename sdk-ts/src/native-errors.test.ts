@@ -13,11 +13,11 @@ test('missing database reads are explicit empty cache operations', async () => {
   const dbPath = join(root, 'missing', 'history.db');
   try {
     assert.deepEqual(await listSessionCatalogPage({ dbPath, limit: 20 }), {
-      contractVersion: 1, sessions: [], nextCursor: null,
+      contractVersion: 2, scope: 'local', sessions: [], nextCursor: null,
     });
     assert.deepEqual(await recent({ dbPath, limit: 20 }), []);
     assert.deepEqual(await stats({ dbPath }), {
-      total: 0, bySource: {}, byProject: [], firstTimestampMs: null, lastTimestampMs: null,
+      scope: 'local', total: 0, bySource: {}, byProject: [], firstTimestampMs: null, lastTimestampMs: null,
     });
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -29,7 +29,7 @@ test('SDK/native contract mismatch is actionable', () => {
     () => validateNativeContract(999),
     (error: unknown) => error instanceof NativeContractMismatchError
       && error.code === 'NATIVE_CONTRACT_MISMATCH'
-      && /requires native contract 2/.test(error.message),
+      && /requires native contract 3/.test(error.message),
   );
 });
 

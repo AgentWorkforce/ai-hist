@@ -123,12 +123,12 @@ jobs:
       - name: Execute native contract smoke test
         if: matrix.test_native
         shell: bash
-        run: node -e "const n=require('./index.js'); if(n.nativeContractVersion()!==2) process.exit(1)"
+        run: node -e "const n=require('./index.js'); if(n.nativeContractVersion()!==3) process.exit(1)"
 
       - name: Execute musl native contract smoke test
         if: matrix.test_musl
         shell: bash
-        run: docker run --rm -v "$PWD:/work" -w /work node:22-alpine node -e "const n=require('./index.js'); if(n.nativeContractVersion()!==2) process.exit(1)"
+        run: docker run --rm -v "$PWD:/work" -w /work node:22-alpine node -e "const n=require('./index.js'); if(n.nativeContractVersion()!==3) process.exit(1)"
 
       - uses: actions/upload-artifact@v4
         with:

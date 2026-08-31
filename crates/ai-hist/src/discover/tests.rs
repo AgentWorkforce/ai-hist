@@ -11,7 +11,7 @@
 //! listing performs no file I/O at all.
 
 use super::*;
-use ai_hist_core::init_db;
+use ai_hist_core::{init_db, mark_session_presence, upsert_session_presence};
 use std::fs;
 use std::time::{Duration, SystemTime};
 
@@ -150,6 +150,7 @@ fn only(sources: &[&str]) -> DiscoverOptions {
     DiscoverOptions {
         sources: sources.iter().map(|s| s.to_string()).collect(),
         limit: None,
+        ..Default::default()
     }
 }
 
@@ -896,6 +897,7 @@ fn the_limit_is_global_not_per_provider() {
         &DiscoverOptions {
             sources: Vec::new(),
             limit: Some(3),
+            ..Default::default()
         },
     );
     assert_eq!(
@@ -983,6 +985,7 @@ fn bounded_reads_do_not_grow_with_the_size_of_the_archive() {
     let limited = DiscoverOptions {
         sources: Vec::new(),
         limit: Some(2),
+        ..Default::default()
     };
     let baseline = discover(&conn, small.path(), &limited);
 
@@ -1086,6 +1089,82 @@ fn the_cache_only_listing_survives_the_provider_files_disappearing() {
     let mut sorted = recency.clone();
     sorted.sort_by(|a, b| b.cmp(a));
     assert_eq!(recency, sorted, "the catalog lists newest first");
+}
+
+#[test]
+fn catalog_scope_filters_presences_without_duplicating_dual_sessions() {
+    let conn = catalog();
+    for (id, recency) in [
+        ("legacy-local", 400),
+        ("local-only", 300),
+        ("remote-only", 200),
+        ("dual", 100),
+    ] {
+        seed_row(&conn, "codex", id, Some(recency));
+    }
+    mark_session_presence(&conn, "codex", "local-only", SessionLocation::Local).unwrap();
+    mark_session_presence(&conn, "codex", "remote-only", SessionLocation::Remote).unwrap();
+    upsert_session_presence(
+        &conn,
+        "codex",
+        "remote-only",
+        SessionLocation::Remote,
+        Some("cloud://remote-only"),
+        Some("v1:remote-stamp"),
+        Some("shallow"),
+    )
+    .unwrap();
+    mark_session_presence(&conn, "codex", "dual", SessionLocation::Local).unwrap();
+    mark_session_presence(&conn, "codex", "dual", SessionLocation::Remote).unwrap();
+
+    let ids = |scope| {
+        list_session_catalog(
+            &conn,
+            &CatalogListOptions {
+                scope,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.session_id, row.locations))
+        .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        ids(SessionScope::Local),
+        vec![
+            ("legacy-local".into(), vec!["local".into()]),
+            ("local-only".into(), vec!["local".into()]),
+            ("dual".into(), vec!["local".into(), "remote".into()]),
+        ]
+    );
+    assert_eq!(
+        ids(SessionScope::Remote),
+        vec![
+            ("remote-only".into(), vec!["remote".into()]),
+            ("dual".into(), vec!["local".into(), "remote".into()]),
+        ]
+    );
+    assert_eq!(ids(SessionScope::All).len(), 4);
+
+    assert!(
+        fetch_catalog_row_at_location(&conn, "codex", "remote-only", SessionLocation::Local,)
+            .unwrap()
+            .is_none()
+    );
+    let remote_cache =
+        fetch_catalog_row_at_location(&conn, "codex", "remote-only", SessionLocation::Remote)
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        remote_cache.raw_path.as_deref(),
+        Some("cloud://remote-only")
+    );
+    assert_eq!(
+        remote_cache.source_stamp.as_deref(),
+        Some("v1:remote-stamp")
+    );
 }
 
 #[test]
@@ -1387,6 +1466,7 @@ fn the_catalog_listing_is_served_by_an_index_not_a_table_scan() {
         limit: Some(10),
         before_ms: Some(1),
         after: None,
+        ..Default::default()
     });
     assert!(
         filtered.contains("idx_sessions_source_recency") && !filtered.contains("TEMP B-TREE"),
@@ -1530,6 +1610,7 @@ fn non_session_candidates_do_not_consume_limit_slots() {
         &DiscoverOptions {
             sources: vec!["codex".into()],
             limit: Some(2),
+            ..Default::default()
         },
     );
     assert_eq!(
@@ -1550,7 +1631,8 @@ fn bumping_the_scanner_version_invalidates_stored_stamps() {
     discover(&conn, home.path(), &only(&["claude"]));
     // Simulate a database stamped by an older scanner generation.
     conn.execute(
-        "UPDATE sessions SET source_stamp = 'v0:stale' WHERE session_id = 'claude-1'",
+        "UPDATE session_presences SET source_stamp = 'v0:stale' \
+         WHERE location = 'local' AND session_id = 'claude-1'",
         [],
     )
     .unwrap();

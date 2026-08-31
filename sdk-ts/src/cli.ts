@@ -4,12 +4,14 @@ import { readFile } from 'node:fs/promises';
 
 import {
   discoverSessions, getSession, getSessionEventsPage, listSessionCatalogPage,
-  recent, search, stats, sync, type CatalogCursor,
+  recent, search, stats, sync, type CatalogCursor, type SessionScope,
 } from './index.js';
 
 type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
 
 type PackageMetadata = { version?: string };
+
+const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-warning', 'remote', 'version']);
 
 function versionTriple(value: string): [number, number, number] | null {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(value);
@@ -60,6 +62,7 @@ function parse(argv: string[]): Parsed {
     if (!arg.startsWith('--')) { positional.push(arg); continue; }
     const [name, inline] = arg.slice(2).split('=', 2);
     if (inline !== undefined) { flags.set(name, [...(flags.get(name) ?? []), inline]); continue; }
+    if (BOOLEAN_FLAGS.has(name)) { flags.set(name, [...(flags.get(name) ?? []), true]); continue; }
     const next = argv[i + 1];
     if (next && !next.startsWith('-')) { flags.set(name, [...(flags.get(name) ?? []), next]); i++; }
     else flags.set(name, [...(flags.get(name) ?? []), true]);
@@ -84,9 +87,27 @@ function numberFlag(args: Parsed, name: string): number | undefined {
   return parsed;
 }
 
+function scopeFlag(args: Parsed): SessionScope {
+  const selected = (['local', 'remote', 'all'] as const).filter((scope) => args.flags.has(scope));
+  for (const scope of selected) {
+    if (args.flags.get(scope)?.some((value) => value !== true)) {
+      throw new Error(`--${scope} does not take a value`);
+    }
+  }
+  if (selected.length > 1) throw new Error('--local, --remote, and --all are mutually exclusive');
+  return selected[0] ?? 'local';
+}
+
+function rejectScopeFlag(args: Parsed, command: string): void {
+  if (['local', 'remote', 'all'].some((scope) => args.flags.has(scope))) {
+    throw new Error(`${command} addresses a session by identity and does not accept --local, --remote, or --all`);
+  }
+}
+
 function common(args: Parsed) {
   return {
     dbPath: textFlag(args, 'db'),
+    scope: scopeFlag(args),
     source: textFlag(args, 'source') as never,
     project: textFlag(args, 'project'),
     tag: textFlag(args, 'tag'),
@@ -108,7 +129,8 @@ function wireValue(value: unknown): unknown {
 function humanLine(value: unknown): string {
   if (!value || typeof value !== 'object') return String(value);
   const row = value as Record<string, unknown>;
-  return [row.timestampMs ?? row.lastActivityMs ?? '', row.source ?? '', row.sessionId ?? '', row.project ?? row.cwd ?? '', row.prompt ?? row.firstPrompt ?? '']
+  const locations = Array.isArray(row.locations) ? `[${row.locations.join(',')}]` : '';
+  return [row.timestampMs ?? row.lastActivityMs ?? '', row.source ?? '', locations, row.sessionId ?? '', row.project ?? row.cwd ?? '', row.prompt ?? row.firstPrompt ?? '']
     .filter((item) => item !== '' && item != null)
     .join('  ');
 }
@@ -133,14 +155,14 @@ function output(value: unknown, json: boolean): void {
 
 function usage(): never {
   process.stderr.write(`Usage:
-  ai-hist sessions list [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
-  ai-hist sessions discover [--source SOURCE] [--limit N] [--json]
-  ai-hist search QUERY... [--source SOURCE] [--project PATH] [--limit N] [--json]
-  ai-hist recent [N] [--source SOURCE] [--project PATH] [--json]
+  ai-hist sessions list [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
+  ai-hist sessions discover [--local | --remote | --all] [--source SOURCE] [--limit N] [--json]
+  ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--limit N] [--json]
+  ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--json]
   ai-hist session SESSION_ID [--source SOURCE] [--json]
   ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
-  ai-hist stats [--json]
-  ai-hist sync [--db PATH] [--json]
+  ai-hist stats [--local | --remote | --all] [--json]
+  ai-hist sync [--local | --remote | --all] [--db PATH] [--json]
 `);
   process.exit(2);
 }
@@ -188,7 +210,7 @@ async function main(): Promise<void> {
   if (command === 'sessions' && subcommand === 'list') {
     const sources = textFlags(args, 'source');
     output(await listSessionCatalogPage({
-      dbPath: textFlag(args, 'db'), sources: sources.length ? sources as never : undefined,
+      dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sources: sources.length ? sources as never : undefined,
       limit: numberFlag(args, 'limit'), beforeMs: numberFlag(args, 'before-ms'),
       after: catalogCursorFlag(args),
     }), json);
@@ -197,7 +219,7 @@ async function main(): Promise<void> {
   if (command === 'sessions' && subcommand === 'discover') {
     const sources = textFlags(args, 'source');
     outputDiscovery(await discoverSessions({
-      dbPath: textFlag(args, 'db'), sources: sources.length ? sources as never : undefined,
+      dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sources: sources.length ? sources as never : undefined,
       limit: numberFlag(args, 'limit'),
     }), json);
     return;
@@ -214,19 +236,21 @@ async function main(): Promise<void> {
   }
   if (command === 'session') {
     if (!subcommand) usage();
+    rejectScopeFlag(args, 'session');
     output(await getSession(subcommand, { dbPath: textFlag(args, 'db'), source: textFlag(args, 'source') as never, tag: textFlag(args, 'tag') }), json);
     return;
   }
   if (command === 'events') {
     if (!subcommand) usage();
+    rejectScopeFlag(args, 'events');
     output(await getSessionEventsPage(subcommand, {
       dbPath: textFlag(args, 'db'), source: textFlag(args, 'source') as never,
       limit: numberFlag(args, 'limit'), after: cursorFlag(args),
     }), json);
     return;
   }
-  if (command === 'stats') { output(await stats({ dbPath: textFlag(args, 'db'), tag: textFlag(args, 'tag') }), json); return; }
-  if (command === 'sync') { output(await sync({ dbPath: textFlag(args, 'db') }), json); return; }
+  if (command === 'stats') { output(await stats({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args), tag: textFlag(args, 'tag') }), json); return; }
+  if (command === 'sync') { output(await sync({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args) }), json); return; }
   usage();
 }
 

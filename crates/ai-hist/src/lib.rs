@@ -6,9 +6,10 @@ use ai_hist_core::{
     session_file_edits, session_tool_calls, sync_opencode_db, untag_session, HistoryEntry,
     QueryFilter, SourceDatabaseError, SOURCE_CHOICES,
 };
+pub use ai_hist_core::{SessionLocation, SessionScope};
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -30,11 +31,12 @@ mod learn;
 
 pub use discover::{
     discover_sessions, discover_sessions_collect, discover_sessions_with_env, list_session_catalog,
-    list_session_catalog_page, shallow_providers, AllProvidersFailed, Candidate, CatalogCursor,
-    CatalogListOptions, DiscoverOptions, DiscoveryCounters, DiscoveryDiagnostic, DiscoveryEnv,
-    DiscoverySummary, ProviderSummary, ScanEnv, SessionCatalogPage, ShallowReadAccess,
-    ShallowSession, ShallowSessionProvider, SourceExemption, DEFAULT_CATALOG_LIMIT,
-    DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION, SHALLOW_SCANNER_VERSION,
+    list_session_catalog_page, shallow_providers, validate_discovery_scope, AllProvidersFailed,
+    Candidate, CatalogCursor, CatalogListOptions, DiscoverOptions, DiscoveryCounters,
+    DiscoveryDiagnostic, DiscoveryEnv, DiscoverySummary, ProviderSummary, ScanEnv,
+    SessionCatalogPage, ShallowReadAccess, ShallowSession, ShallowSessionProvider, SourceExemption,
+    DEFAULT_CATALOG_LIMIT, DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION,
+    SHALLOW_SCANNER_VERSION,
 };
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -79,6 +81,29 @@ pub fn sync_local() -> Result<()> {
 pub fn sync_local_at(db_path: &Path) -> Result<bool> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
     sync_exclusive(db_path)
+}
+
+/// Full ingestion for a selected session-presence scope.
+///
+/// Remote provider connectors are intentionally a capability boundary. Until
+/// one is configured, remote-only ingestion fails loudly; `all` runs every
+/// available connector, which currently means the local registry.
+pub fn sync_scoped_at(db_path: &Path, scope: SessionScope) -> Result<bool> {
+    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    sync_scope_exclusive(db_path, scope)
+}
+
+fn sync_scope_exclusive(db_path: &Path, scope: SessionScope) -> Result<bool> {
+    validate_sync_scope(scope)?;
+    sync_exclusive(db_path)
+}
+
+fn validate_sync_scope(scope: SessionScope) -> Result<()> {
+    anyhow::ensure!(
+        scope != SessionScope::Remote,
+        "remote session sync is not available: no remote provider connectors are configured"
+    );
+    Ok(())
 }
 
 /// Sync local agent history into the DB, then push new records to
@@ -145,8 +170,26 @@ pub fn list_sessions_local_at(
     db_path: &Path,
     options: &CatalogListOptions,
 ) -> Result<SessionCatalogPage> {
+    let mut options = options.clone();
+    options.scope = SessionScope::Local;
+    list_sessions_scoped_at(db_path, &options)
+}
+
+/// Cache-only catalog listing for an explicit session-presence scope.
+pub fn list_sessions_scoped(options: &CatalogListOptions) -> Result<SessionCatalogPage> {
+    list_sessions_scoped_at(&default_db_path(), options)
+}
+
+/// Scoped cache-only catalog listing against an explicitly selected database.
+pub fn list_sessions_scoped_at(
+    db_path: &Path,
+    options: &CatalogListOptions,
+) -> Result<SessionCatalogPage> {
     if !db_path.exists() {
-        return Ok(SessionCatalogPage::default());
+        return Ok(SessionCatalogPage {
+            scope: options.scope,
+            ..Default::default()
+        });
     }
     let conn = match open_db_readonly(db_path) {
         Ok(conn) if schema_is_catalog_read_current(&conn).unwrap_or(false) => conn,
@@ -174,7 +217,54 @@ pub fn discover_sessions_local_at(
     options: &DiscoverOptions,
 ) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
     let conn = open_db(db_path)?;
+    let mut local = options.clone();
+    local.scope = SessionScope::Local;
+    discover_sessions_collect(&conn, &local)
+}
+
+/// Scoped discovery into an explicitly selected database.
+pub fn discover_sessions_scoped_at(
+    db_path: &Path,
+    options: &DiscoverOptions,
+) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
+    validate_discovery_scope(options.scope)?;
+    let conn = open_db(db_path)?;
     discover_sessions_collect(&conn, options)
+}
+
+#[derive(Args, Debug, Clone, Copy, Default)]
+#[group(id = "session_scope", multiple = false)]
+struct SessionScopeArgs {
+    /// Select sessions with a local presence (default).
+    #[arg(long, group = "session_scope")]
+    local: bool,
+    /// Select sessions with a provider-cloud presence.
+    #[arg(long, group = "session_scope")]
+    remote: bool,
+    /// Select the union of local and remote presences.
+    #[arg(long, group = "session_scope")]
+    all: bool,
+}
+
+impl SessionScopeArgs {
+    fn resolve(self) -> SessionScope {
+        if self.remote {
+            SessionScope::Remote
+        } else if self.all {
+            SessionScope::All
+        } else {
+            SessionScope::Local
+        }
+    }
+
+    fn service_args(self) -> Vec<String> {
+        match self.resolve() {
+            SessionScope::Local if self.local => vec!["--local".to_string()],
+            SessionScope::Local => Vec::new(),
+            SessionScope::Remote => vec!["--remote".to_string()],
+            SessionScope::All => vec!["--all".to_string()],
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -195,6 +285,8 @@ struct Cli {
 enum Command {
     /// Search prompts and sessions.
     Search {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         query: Vec<String>,
         #[arg(long)]
         source: Option<String>,
@@ -219,6 +311,8 @@ enum Command {
     },
     /// Show recent history entries.
     Recent {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         #[arg(default_value_t = 20)]
         n: i64,
         #[arg(long)]
@@ -266,8 +360,10 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         window: i64,
     },
-    /// Show local history statistics.
+    /// Show history statistics.
     Stats {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         #[arg(long)]
         tag: Option<String>,
         #[arg(long)]
@@ -304,6 +400,8 @@ enum Command {
     },
     /// Print a resume command for the best matching session.
     Resume {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         #[arg(required = true)]
         query: Vec<String>,
         /// Pass the query through as a raw FTS5 MATCH expression. Operators such as
@@ -320,6 +418,8 @@ enum Command {
     },
     /// Sync local agent history into the relayhistory database.
     Sync {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         /// Install a background service (launchd on macOS, cron on Linux) that
         /// runs `sync` on an interval so the database stays fresh automatically.
         #[arg(long)]
@@ -334,6 +434,8 @@ enum Command {
     },
     /// Repeatedly sync local agent history.
     Watch {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         #[arg(long, default_value_t = 60)]
         interval: u64,
     },
@@ -344,6 +446,8 @@ enum Command {
     },
     /// Build a compact context pack from matching history.
     Pack {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         #[arg(required = true)]
         query: Vec<String>,
         #[arg(long)]
@@ -514,6 +618,8 @@ enum SessionsAction {
     /// tool calls: one indexed query over `sessions`. Run `sessions discover`
     /// first to populate a fresh database.
     List {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         /// Restrict to a source (repeatable). Defaults to every discoverable source.
         #[arg(long)]
         source: Vec<String>,
@@ -553,6 +659,8 @@ enum SessionsAction {
     /// only what the catalog needs, and upserts rows as it goes. Sources whose
     /// bytes have not changed since the last run are served from the catalog.
     Discover {
+        #[command(flatten)]
+        scope: SessionScopeArgs,
         /// Restrict to a source (repeatable). Defaults to every discoverable source.
         #[arg(long)]
         source: Vec<String>,
@@ -731,19 +839,27 @@ pub fn run() -> Result<()> {
     // wait on SQLite before contention is detected.
     match &cli.command {
         Command::Sync {
+            scope,
             install_service,
             uninstall_service,
             interval,
         } => {
             if *install_service {
-                return install_managed_service(&SYNC_SERVICE, *interval, &[]);
+                validate_sync_scope(scope.resolve())?;
+                return install_managed_service(&SYNC_SERVICE, *interval, &scope.service_args());
             }
             if *uninstall_service {
                 return uninstall_managed_service(&SYNC_SERVICE);
             }
-            return sync_exclusive(&db_path).map(|_| ());
+            return sync_scope_exclusive(&db_path, scope.resolve()).map(|_| ());
         }
-        Command::Watch { interval } => return watch_loop(&db_path, *interval),
+        Command::Watch { scope, interval } => {
+            validate_sync_scope(scope.resolve())?;
+            return watch_loop(&db_path, *interval, scope.resolve());
+        }
+        Command::Sessions {
+            action: SessionsAction::Discover { scope, .. },
+        } => validate_discovery_scope(scope.resolve())?,
         Command::SyncOpencode { opencode_db } => {
             let source = opencode_db.clone().unwrap_or_else(default_opencode_db_path);
             return sync_opencode_exclusive(&db_path, &source).map(|_| ());
@@ -762,6 +878,7 @@ pub fn run() -> Result<()> {
 
     match cli.command {
         Command::Search {
+            scope,
             query,
             source,
             project,
@@ -780,6 +897,7 @@ pub fn run() -> Result<()> {
                 &query,
                 fts,
                 &QueryFilter {
+                    scope: scope.resolve(),
                     source,
                     project,
                     tag,
@@ -799,6 +917,7 @@ pub fn run() -> Result<()> {
             print_search_rows(rows, json)
         }
         Command::Recent {
+            scope,
             n,
             source,
             project,
@@ -809,6 +928,7 @@ pub fn run() -> Result<()> {
             let rows = recent(
                 &conn,
                 &QueryFilter {
+                    scope: scope.resolve(),
                     source,
                     project,
                     tag,
@@ -861,6 +981,7 @@ pub fn run() -> Result<()> {
         Command::Context { id, window } => show_context(&conn, id, window),
         Command::Doctor { json } => doctor(&db_path, json),
         Command::Pack {
+            scope,
             query,
             source,
             project,
@@ -875,6 +996,7 @@ pub fn run() -> Result<()> {
                 &conn,
                 query,
                 QueryFilter {
+                    scope: scope.resolve(),
                     source,
                     project,
                     tag,
@@ -886,7 +1008,9 @@ pub fn run() -> Result<()> {
                 json,
             )
         }
-        Command::Stats { tag, json } => print_stats(&conn, tag.as_deref(), json),
+        Command::Stats { scope, tag, json } => {
+            print_stats(&conn, scope.resolve(), tag.as_deref(), json)
+        }
         Command::Tag {
             session_id,
             tag_name,
@@ -949,12 +1073,18 @@ pub fn run() -> Result<()> {
             sessions,
             json,
         } => print_tags(&conn, tag.as_deref(), sessions, json),
-        Command::Resume { query, fts, json } => {
+        Command::Resume {
+            scope,
+            query,
+            fts,
+            json,
+        } => {
             let rows = search(
                 &conn,
                 &query,
                 fts,
                 &QueryFilter {
+                    scope: scope.resolve(),
                     limit: 1,
                     ..Default::default()
                 },
@@ -1025,7 +1155,7 @@ pub fn run() -> Result<()> {
                     !dry_run,
                     "`ai-hist import --watch` cannot be combined with --dry-run"
                 );
-                watch_loop(&db_path, interval)
+                watch_loop(&db_path, interval, SessionScope::Local)
             } else {
                 let file = file.context("`ai-hist import` requires FILE unless --watch is set")?;
                 import_history(&conn, &file, dry_run)
@@ -1315,6 +1445,7 @@ pub fn run() -> Result<()> {
         },
         Command::Sessions { action } => match action {
             SessionsAction::List {
+                scope,
                 source,
                 limit,
                 before_ms,
@@ -1345,6 +1476,7 @@ pub fn run() -> Result<()> {
                 let page = list_session_catalog_page(
                     &conn,
                     &CatalogListOptions {
+                        scope: scope.resolve(),
                         sources: source,
                         limit,
                         before_ms,
@@ -1354,10 +1486,11 @@ pub fn run() -> Result<()> {
                 print_session_catalog(&page, json)
             }
             SessionsAction::Discover {
+                scope,
                 source,
                 limit,
                 json,
-            } => run_session_discovery(&conn, source, limit, json),
+            } => run_session_discovery(&conn, scope.resolve(), source, limit, json),
         },
     }
 }
@@ -1366,7 +1499,7 @@ pub fn run() -> Result<()> {
 ///
 /// The JSON form is one object, not a bare array, so the contract version and
 /// the pagination cursor travel with the payload:
-/// `{"contract_version":1,"sessions":[…],"next_cursor":{…}|null}`. Feed
+/// `{"contract_version":2,"scope":"local","sessions":[…],"next_cursor":{…}|null}`. Feed
 /// `next_cursor` back as `--after-ms/--after-source/--after-session-id` to get
 /// the next page; it is null once the catalog is exhausted.
 fn print_session_catalog(page: &SessionCatalogPage, as_json: bool) -> Result<()> {
@@ -1376,6 +1509,7 @@ fn print_session_catalog(page: &SessionCatalogPage, as_json: bool) -> Result<()>
             "{}",
             json!({
                 "contract_version": SESSION_CATALOG_CONTRACT_VERSION,
+                "scope": page.scope,
                 "sessions": rows,
                 "next_cursor": page.next_cursor,
             })
@@ -1423,9 +1557,10 @@ fn fmt_session_row(row: &ShallowSession) -> String {
             }
         })
         .unwrap_or_default();
+    let locations = row.locations.join(",");
     format!(
-        "  {when}  {:<8} {:<8} {:<38} {cwd}  {prompt}",
-        row.source, row.discovery_state, row.session_id
+        "  {when}  {:<8} {:<12} {:<8} {:<38} {cwd}  {prompt}",
+        row.source, locations, row.discovery_state, row.session_id
     )
 }
 
@@ -1437,11 +1572,16 @@ fn fmt_session_row(row: &ShallowSession) -> String {
 /// not change the exit code; only an every-provider failure does.
 fn run_session_discovery(
     conn: &Connection,
+    scope: SessionScope,
     sources: Vec<String>,
     limit: Option<usize>,
     as_json: bool,
 ) -> Result<()> {
-    let options = DiscoverOptions { sources, limit };
+    let options = DiscoverOptions {
+        scope,
+        sources,
+        limit,
+    };
     let mut count = 0usize;
     let outcome = discover_sessions(conn, &options, |session| {
         count += 1;
@@ -1926,13 +2066,18 @@ fn show_context(conn: &Connection, id: i64, window_minutes: i64) -> Result<()> {
     Ok(())
 }
 
-fn print_stats(conn: &Connection, tag: Option<&str>, as_json: bool) -> Result<()> {
+fn print_stats(
+    conn: &Connection,
+    scope: SessionScope,
+    tag: Option<&str>,
+    as_json: bool,
+) -> Result<()> {
     let tag_norm = tag.map(normalize_tag_name);
-    let where_sql = if tag_norm.is_some() {
-        format!(" WHERE {}", tag_filter_clause("h"))
-    } else {
-        String::new()
-    };
+    let mut where_sql = " WHERE 1=1".to_string();
+    append_session_scope_filter(&mut where_sql, scope, "h");
+    if tag_norm.is_some() {
+        where_sql.push_str(&format!(" AND {}", tag_filter_clause("h")));
+    }
     let params_vec = tag_norm.iter().map(String::as_str).collect::<Vec<_>>();
     let total: i64 = conn.query_row(
         &format!("SELECT COUNT(*) FROM history h{where_sql}"),
@@ -1950,11 +2095,7 @@ fn print_stats(conn: &Connection, tag: Option<&str>, as_json: bool) -> Result<()
         .iter()
         .cloned()
         .collect::<serde_json::Map<_, _>>();
-    let project_where = if tag_norm.is_some() {
-        format!("WHERE project IS NOT NULL AND {}", tag_filter_clause("h"))
-    } else {
-        "WHERE project IS NOT NULL".to_string()
-    };
+    let project_where = format!("{where_sql} AND project IS NOT NULL");
     let top_projects = query_pairs(
         conn,
         &format!("SELECT project, COUNT(*) FROM history h {project_where} GROUP BY project ORDER BY COUNT(*) DESC LIMIT 10"),
@@ -1978,11 +2119,20 @@ fn print_stats(conn: &Connection, tag: Option<&str>, as_json: bool) -> Result<()
                 "first_timestamp_ms": first,
                 "last_timestamp_ms": last,
                 "tag": tag_norm,
+                "scope": scope,
             })
         );
         return Ok(());
     }
     println!("\nTotal entries: {total}");
+    println!(
+        "Scope: {}",
+        match scope {
+            SessionScope::Local => "local",
+            SessionScope::Remote => "remote",
+            SessionScope::All => "all",
+        }
+    );
     if let Some(tag) = tag_norm {
         println!("Tag filter: {tag}");
     }
@@ -2953,10 +3103,10 @@ fn prepare_sync_and_push_db(db_path: &Path) -> Result<(Connection, bool)> {
     Ok((conn, false))
 }
 
-fn watch_loop(db_path: &Path, interval: u64) -> Result<()> {
+fn watch_loop(db_path: &Path, interval: u64, scope: SessionScope) -> Result<()> {
     println!("Watching every {interval}s (Ctrl-C to stop)...");
     loop {
-        match sync_exclusive(db_path) {
+        match sync_scope_exclusive(db_path, scope) {
             Ok(_) => {}
             Err(err) => eprintln!("Error: {err:#}"),
         }
@@ -3911,6 +4061,7 @@ fn append_history_search_filters(
     filter: &QueryFilter,
     alias: &str,
 ) {
+    append_session_scope_filter(sql, filter.scope, alias);
     if let Some(source) = &filter.source {
         sql.push_str(&format!(" AND {alias}.source = ?"));
         params.push(source.clone());
@@ -3932,6 +4083,7 @@ fn append_event_search_filters(
     alias: &str,
     role: SearchRole,
 ) {
+    append_session_scope_filter(sql, filter.scope, alias);
     if let Some(source) = &filter.source {
         sql.push_str(&format!(" AND {alias}.source = ?"));
         params.push(source.clone());
@@ -3948,6 +4100,26 @@ fn append_event_search_filters(
         SearchRole::All => {}
         SearchRole::User => sql.push_str(&format!(" AND {alias}.role = 'user'")),
         SearchRole::Assistant => sql.push_str(&format!(" AND {alias}.role = 'assistant'")),
+    }
+}
+
+/// Restrict a history/event query by where its canonical session is present.
+///
+/// Legacy rows with no session id or no classification are local so upgrading
+/// cannot make existing history disappear. Remote requires an explicit remote
+/// presence. `all` adds no predicate and therefore cannot multiply rows.
+fn append_session_scope_filter(sql: &mut String, scope: SessionScope, alias: &str) {
+    match scope {
+        SessionScope::Local => sql.push_str(&format!(
+            " AND ({alias}.session_id IS NULL \
+               OR EXISTS (SELECT 1 FROM session_presences p WHERE p.source = {alias}.source AND p.session_id = {alias}.session_id AND p.location = 'local') \
+               OR NOT EXISTS (SELECT 1 FROM session_presences p WHERE p.source = {alias}.source AND p.session_id = {alias}.session_id))"
+        )),
+        SessionScope::Remote => sql.push_str(&format!(
+            " AND {alias}.session_id IS NOT NULL \
+               AND EXISTS (SELECT 1 FROM session_presences p WHERE p.source = {alias}.source AND p.session_id = {alias}.session_id AND p.location = 'remote')"
+        )),
+        SessionScope::All => {}
     }
 }
 
@@ -4996,6 +5168,10 @@ fn sync_codex_rollouts(
                 branches.remove(&meta.session_id);
                 conn.execute(
                     "DELETE FROM history WHERE source = 'codex' AND session_id = ?",
+                    [meta.session_id.as_str()],
+                )?;
+                conn.execute(
+                    "DELETE FROM session_presences WHERE source = 'codex' AND session_id = ?",
                     [meta.session_id.as_str()],
                 )?;
                 conn.execute(
@@ -6523,6 +6699,15 @@ fn upsert_session(
             raw_path,
         ],
     )?;
+    ai_hist_core::upsert_session_presence(
+        conn,
+        source,
+        session_id,
+        SessionLocation::Local,
+        raw_path,
+        None,
+        Some("full"),
+    )?;
     Ok(())
 }
 
@@ -8036,6 +8221,7 @@ mod tests {
     fn only_non_mutating_commands_get_a_read_only_handle() {
         // Reads must not take the write lock...
         assert!(super::is_read_only(&super::Command::Stats {
+            scope: super::SessionScopeArgs::default(),
             tag: None,
             json: false
         }));
@@ -8058,6 +8244,7 @@ mod tests {
         // ...and anything that writes must not get a read-only handle, or it
         // fails at runtime with "attempt to write a readonly database".
         assert!(!super::is_read_only(&super::Command::Sync {
+            scope: super::SessionScopeArgs::default(),
             install_service: false,
             uninstall_service: false,
             interval: 60,

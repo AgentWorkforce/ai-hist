@@ -104,7 +104,8 @@ fn discover_streams_jsonl_rows_then_a_summary() {
 
     let summary = lines.last().expect("a summary line");
     assert_eq!(summary["type"], "summary");
-    assert_eq!(summary["contract_version"], 1);
+    assert_eq!(summary["contract_version"], 2);
+    assert_eq!(summary["scope"], "local");
     assert_eq!(summary["discovered"], 2);
     assert_eq!(summary["skipped_unchanged"], 0);
     assert_eq!(summary["providers"]["claude"]["discovered"], 1);
@@ -159,11 +160,15 @@ fn list_serves_the_catalog_after_the_provider_files_are_gone() {
         String::from_utf8_lossy(&output.stderr)
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["contract_version"], 1);
+    assert_eq!(payload["contract_version"], 2);
+    assert_eq!(payload["scope"], "local");
     let sessions = payload["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 2);
     assert_eq!(sessions[0]["session_id"], "codex-cli");
     assert_eq!(sessions[1]["session_id"], "claude-cli");
+    assert!(sessions
+        .iter()
+        .all(|row| row["locations"] == serde_json::json!(["local"])));
     assert!(sessions.iter().all(|row| row["from_cache"] == true));
 
     // A page that did not fill its limit ends the walk.
@@ -179,6 +184,75 @@ fn list_serves_the_catalog_after_the_provider_files_are_gone() {
     let payload: Value = serde_json::from_slice(&filtered.stdout).unwrap();
     assert_eq!(payload["sessions"].as_array().unwrap().len(), 1);
     assert_eq!(payload["sessions"][0]["source"], "claude");
+}
+
+#[test]
+fn scope_flags_default_to_local_and_all_is_a_deduplicated_union() {
+    let temp = fake_home();
+    let db_path = temp.path().join("history.db");
+    assert!(isolated(&temp, &db_path, &["sessions", "discover"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let list = |scope: Option<&str>| {
+        let mut args = vec!["sessions", "list", "--json"];
+        if let Some(scope) = scope {
+            args.push(scope);
+        }
+        let output = isolated(&temp, &db_path, &args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+
+    let implicit = list(None);
+    let explicit = list(Some("--local"));
+    assert_eq!(implicit, explicit);
+    assert_eq!(implicit["scope"], "local");
+    assert_eq!(implicit["sessions"].as_array().unwrap().len(), 2);
+
+    let remote = list(Some("--remote"));
+    assert_eq!(remote["scope"], "remote");
+    assert!(remote["sessions"].as_array().unwrap().is_empty());
+
+    let all = list(Some("--all"));
+    assert_eq!(all["scope"], "all");
+    assert_eq!(all["sessions"].as_array().unwrap().len(), 2);
+
+    let conflict = isolated(
+        &temp,
+        &db_path,
+        &["sessions", "list", "--local", "--remote"],
+    )
+    .output()
+    .unwrap();
+    assert!(!conflict.status.success());
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("cannot be used with"));
+}
+
+#[test]
+fn explicit_remote_discovery_fails_instead_of_falling_back_to_local() {
+    let temp = fake_home();
+    let db_path = temp.path().join("history.db");
+    let output = isolated(
+        &temp,
+        &db_path,
+        &["sessions", "discover", "--remote", "--json"],
+    )
+    .output()
+    .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no remote provider connectors are configured"));
+    assert!(
+        !db_path.exists(),
+        "unsupported discovery must not create a ledger"
+    );
 }
 
 #[test]

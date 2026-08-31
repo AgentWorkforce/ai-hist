@@ -21,8 +21,8 @@ import {
   sync,
 } from 'ai-hist';
 
-await discoverSessions({ limit: 100 });
-const page = await listSessionCatalogPage({ limit: 20 });
+await discoverSessions({ scope: 'all', limit: 100 });
+const page = await listSessionCatalogPage({ scope: 'all', limit: 20 });
 const first = page.sessions[0];
 if (first) {
   const prompts = await getSession(first.sessionId);
@@ -34,6 +34,17 @@ if (first) {
 All APIs are async. `listSessionCatalog` and `listSessionCatalogPage` are
 cache-only. `discoverSessions` is shallow discovery. `sync` is full ingestion.
 Missing databases return empty read results; they do not trigger provider I/O.
+
+Session discovery, listing, search, recent history, statistics, and sync accept
+`scope: 'local' | 'remote' | 'all'`. Scope defaults to `local`, preserving
+offline behavior and making provider-cloud access explicit. The CLI exposes the
+same mutually exclusive `--local`, `--remote`, and `--all` flags; omitting them
+is equivalent to `--local`.
+
+Catalog pages, discovery results, statistics, and sync results echo the applied `scope`. Each catalog
+session also has `locations`, containing `local`, `remote`, or both, so an
+`all` query still returns one logical session while preserving where it was
+found.
 
 The event primitive is page-based and uses `{ tsMs, id }` as a deterministic
 cursor. The `sessionEvents` async iterator walks pages without accumulating a

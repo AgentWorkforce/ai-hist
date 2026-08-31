@@ -21,27 +21,54 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 2 and catalog contract version 1, normalizes nullable fields, maps
+version 3 and catalog contract version 2, normalizes nullable fields, maps
 native errors, and supplies pagination helpers.
 
 The CLI and MCP server import only the SDK's public functions. They do not
 open SQLite, import `ai-hist-native`, scan providers, or invoke another CLI.
 
+## Session ledger and location scope
+
+There is one session ledger. `local` and `remote` are presences recording where
+a logical session was observed, not independent session stores. Collection
+operations accept one scope: `local` (the default), `remote`, or `all`. The
+`all` view is the union of both presences, deduplicated by canonical session
+identity, so materializing a remote session locally does not create a second
+user-visible session. Connector-specific locator, change stamp, and discovery
+state live on each presence, preventing a local scan and a cloud scan from
+overwriting one another's acquisition state.
+
+Scope changes selection, not I/O. Cached collection reads (`sessions list`,
+`search`, and `recent`) stay database-only for every scope. Direct session and
+event lookup already names one session and remains scope-independent.
+
+Acquisition is still explicit. Local discovery and sync are implemented.
+Explicit remote discovery/sync returns an unsupported operation until provider
+connectors ship; the engine must not silently fall back to local work. `all`
+acquisition runs all configured adapters, which currently means the local
+adapters and will include remote adapters when they become available.
+
 ## Operation semantics
 
 | Operation | Provider I/O | Database work | Missing database |
 |---|---:|---|---|
-| `listSessionCatalog*` | none | one indexed cache query | empty page |
-| `discoverSessions` | bounded shallow reads | catalog upserts | creates catalog DB |
-| `search`, `recent`, `getSession`, `stats` | none | indexed reads | empty result |
+| `listSessionCatalog*` (`local` / `remote` / `all`) | none | one indexed cache query | empty page |
+| `discoverSessions` (`local`, default) | bounded shallow reads | catalog upserts | creates catalog DB |
+| `discoverSessions` (`remote`) | unsupported until connectors ship | none | unsupported operation |
+| `discoverSessions` (`all`) | all configured adapters (currently local) | catalog upserts | creates catalog DB |
+| `search`, `recent` (`local` / `remote` / `all`) | none | indexed reads | empty result |
+| `stats` (`local` / `remote` / `all`) | none | indexed aggregate reads | empty result |
+| `getSession` | none | indexed identity read | empty result |
 | `getSessionEventsPage` | none | bounded keyset page | empty page |
-| `sync` | full explicit scan | migrations + ingestion | creates DB |
+| `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
+| `sync` (`remote`) | unsupported until connectors ship | none | unsupported operation |
+| `sync` (`all`) | all configured adapters (currently local) | migrations + ingestion | creates DB |
 
 No read operation invokes discovery or sync. A common cold start is:
 
 ```ts
-await discoverSessions({ limit: 100 });
-const sessions = await listSessionCatalog({ limit: 100 });
+await discoverSessions({ limit: 100, scope: 'local' });
+const sessions = await listSessionCatalog({ limit: 100, scope: 'all' });
 ```
 
 Events use `(ts_ms, id)` keyset pagination. Catalog ordering is

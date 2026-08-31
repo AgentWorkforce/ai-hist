@@ -11,4 +11,5 @@ loads the native addon directly, scans provider files, or invokes a CLI.
 
 Tools: `search_history`, `recent_history`, `list_sessions`,
 `discover_sessions`, `get_session`, `get_session_events`, `history_stats`, and
-`sync`.
+`sync`. Search, recent history, session listing, discovery, statistics, and sync accept a
+`scope` of `local`, `remote`, or `all`; scope defaults to `local`.

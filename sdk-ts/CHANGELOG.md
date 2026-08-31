@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add the shared `SessionScope` (`local`, `remote`, or `all`) to session
+  discovery, listing, search, recent history, statistics, and sync. The SDK and CLI default
+  to local scope; the CLI exposes mutually exclusive `--local`, `--remote`, and
+  `--all` flags, and MCP tools expose the equivalent `scope` argument.
+- Catalog pages, discovery results, statistics, and sync results echo their applied scope, while each
+  `CatalogSession` reports its `local` and/or `remote` locations. This advances
+  the session-catalog contract to 2 and the native-addon contract to 3.
 - Mandatory `ai-hist-native` contract validation and stable errors for
   unsupported/missing platforms, load/version failures, and database errors.
 - Native-backed discovery, catalog pages, session history, event pages,

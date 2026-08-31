@@ -11,6 +11,7 @@ export declare function nativeContractVersion(): number
  */
 export declare function nativeBuildProfile(): string
 export interface HistoryQueryOptions {
+  scope?: string
   dbPath?: string
   source?: string
   project?: string
@@ -19,6 +20,7 @@ export interface HistoryQueryOptions {
   limit?: number
 }
 export interface SearchOptions {
+  scope?: string
   dbPath?: string
   source?: string
   project?: string
@@ -80,6 +82,7 @@ export interface ProjectCount {
   count: number
 }
 export interface NativeStats {
+  scope: string
   total: number
   bySource: Array<SourceCount>
   byProject: Array<ProjectCount>
@@ -87,6 +90,7 @@ export interface NativeStats {
   lastTimestampMs?: number
 }
 export interface StatsOptions {
+  scope?: string
   dbPath?: string
   tag?: string
 }
@@ -118,6 +122,7 @@ export interface CatalogSession {
   rawPath?: string
   sourceStamp?: string
   discoveryState: string
+  locations: Array<string>
   fromCache: boolean
 }
 export interface CatalogCursor {
@@ -126,6 +131,7 @@ export interface CatalogCursor {
   sessionId: string
 }
 export interface ListCatalogOptions {
+  scope?: string
   dbPath?: string
   sources?: Array<string>
   limit?: number
@@ -134,6 +140,7 @@ export interface ListCatalogOptions {
 }
 export interface SessionCatalogPage {
   contractVersion: number
+  scope: string
   sessions: Array<CatalogSession>
   nextCursor?: CatalogCursor
 }
@@ -142,6 +149,7 @@ export declare function listSessionCatalogPage(options?: ListCatalogOptions | un
 /** Convenience first-page catalog listing with identical cache-only semantics. */
 export declare function listSessionCatalog(options?: ListCatalogOptions | undefined | null): Promise<Array<CatalogSession>>
 export interface DiscoverOptions {
+  scope?: string
   dbPath?: string
   sources?: Array<string>
   limit?: number
@@ -171,6 +179,7 @@ export interface SourceExemption {
 }
 export interface DiscoverResult {
   contractVersion: number
+  scope: string
   sessions: Array<CatalogSession>
   discovered: number
   skippedUnchanged: number
@@ -183,10 +192,12 @@ export interface DiscoverResult {
 export declare function discoverSessions(options?: DiscoverOptions | undefined | null): Promise<DiscoverResult>
 export interface SyncOptions {
   dbPath?: string
+  scope?: string
 }
 export interface SyncResult {
   databasePath: string
   completed: boolean
+  scope: string
 }
 /** Explicit full ingestion. A read operation never calls this implicitly. */
 export declare function sync(options?: SyncOptions | undefined | null): Promise<SyncResult>
