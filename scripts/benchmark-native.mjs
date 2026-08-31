@@ -1,5 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
-import { appendFile, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { appendFile, copyFile, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { arch, cpus, platform, release, tmpdir } from 'node:os';
 import { dirname, extname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -217,40 +217,21 @@ async function createOpencodeFixture(home, count) {
 
 // A changed opencode session is a bumped `time_updated` stamp plus a new
 // assistant message, mirroring the appended record in the Claude fixture.
+// Restoration is a byte copy of the pristine store, not reversed rows: a
+// DELETE leaves the inserted pages on the freelist, so later cases would
+// snapshot a larger store than the one the first cold case measured.
 function changeOpencodeSessions(databasePath, sessions) {
   const timestampMs = Date.now();
   const db = new DatabaseSync(databasePath);
   try {
-    const readStamp = db.prepare('SELECT time_updated FROM session WHERE id = ?');
     const bumpStamp = db.prepare('UPDATE session SET time_updated = ? WHERE id = ?');
     const insertMessage = db.prepare('INSERT INTO message VALUES (?, ?, ?, ?)');
     const insertPart = db.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)');
-    const originals = [];
     db.exec('BEGIN');
     for (const session of sessions) {
-      originals.push({ sessionId: session.sessionId, timeUpdated: readStamp.get(session.sessionId).time_updated });
       bumpStamp.run(timestampMs, session.sessionId);
       insertMessage.run(`changed-m-${session.sessionId}`, session.sessionId, timestampMs, '{"role":"assistant","modelID":"benchmark-model"}');
       insertPart.run(`changed-p-${session.sessionId}`, `changed-m-${session.sessionId}`, session.sessionId, timestampMs, '{"type":"text","text":"changed benchmark response"}');
-    }
-    db.exec('COMMIT');
-    return originals;
-  } finally {
-    db.close();
-  }
-}
-
-function restoreOpencodeSessions(databasePath, originals) {
-  const db = new DatabaseSync(databasePath);
-  try {
-    const restoreStamp = db.prepare('UPDATE session SET time_updated = ? WHERE id = ?');
-    const deleteMessage = db.prepare('DELETE FROM message WHERE id = ?');
-    const deletePart = db.prepare('DELETE FROM part WHERE id = ?');
-    db.exec('BEGIN');
-    for (const original of originals) {
-      restoreStamp.run(original.timeUpdated, original.sessionId);
-      deleteMessage.run(`changed-m-${original.sessionId}`);
-      deletePart.run(`changed-p-${original.sessionId}`);
     }
     db.exec('COMMIT');
   } finally {
@@ -307,6 +288,8 @@ try {
   const fixtureHome = join(temporary, 'home');
   await createDiscoveryFixture(fixtureHome, Math.max(...discoveryLimits));
   const opencodeDb = await createOpencodeFixture(fixtureHome, Math.max(...discoveryLimits));
+  const opencodePristine = join(temporary, 'opencode-pristine.db');
+  await copyFile(opencodeDb, opencodePristine);
 
   results.push(...await measureDiscoveryScaling({
     prefix: '', source: 'claude', home: fixtureHome, temporary,
@@ -316,7 +299,7 @@ try {
   results.push(...await measureDiscoveryScaling({
     prefix: 'opencode ', source: 'opencode', home: fixtureHome, temporary,
     change: (sessions) => changeOpencodeSessions(opencodeDb, sessions),
-    restore: (originals) => restoreOpencodeSessions(opencodeDb, originals),
+    restore: () => copyFile(opencodePristine, opencodeDb),
   }));
 
   const firstPage = await listSessionCatalogPage({ dbPath, limit: 20 });
