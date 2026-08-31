@@ -483,6 +483,28 @@ pub fn open_db_readonly(path: &Path) -> Result<Connection> {
 
 pub fn init_db(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // A database that already has everything runs the idempotent DDL as pure
+    // no-ops without claiming the write lock, so opening beside a concurrent
+    // writer stays lock-free. A fresh or outdated database — which needs the
+    // lock regardless — does the whole schema pass in one transaction: each
+    // DDL statement is otherwise its own WAL commit, which made opening a
+    // fresh database cost dozens of commits before the first query could run.
+    if schema_is_current(conn)? {
+        return init_db_schema(conn);
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match init_db_schema(conn) {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(Into::into),
+        Err(error) => {
+            // Best effort: some failures already rolled the transaction back,
+            // and a rollback error must not mask the schema error.
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn init_db_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     let _ = conn.execute("ALTER TABLE history ADD COLUMN prompt_hash TEXT", []);
     let _ = conn.execute("ALTER TABLE history ADD COLUMN git_branch TEXT", []);
@@ -563,24 +585,16 @@ CREATE TABLE IF NOT EXISTS sessions (
         "CREATE INDEX IF NOT EXISTS idx_session_tags_tag ON session_tags(tag_id)",
         [],
     )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_sessions_branch ON sessions(git_branch)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_activity_ms DESC)",
-        [],
-    )?;
-    // Recency inside one source. Superseded for the source-filtered catalog
-    // listing (`sessions list --source codex`) by `idx_sessions_source_recency`
-    // below, which carries that listing's whole ORDER BY.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_sessions_source_last ON sessions(source, last_activity_ms DESC)",
-        [],
+    // No query reads by bare cwd/branch/recency any more, and every extra
+    // index on `sessions` is one more btree a discovery upsert must update —
+    // the write cost showed up directly in cold-discovery profiles. Dropped
+    // (not just no longer created) so existing databases shed the write
+    // amplification too.
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_sessions_cwd;
+         DROP INDEX IF EXISTS idx_sessions_branch;
+         DROP INDEX IF EXISTS idx_sessions_last;
+         DROP INDEX IF EXISTS idx_sessions_source_last;",
     )?;
     // The catalog's total order is (last_activity_ms DESC, source, session_id):
     // recency alone ties constantly, because every mtime-derived session in one

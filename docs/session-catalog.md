@@ -379,8 +379,10 @@ the schema is current: it cannot block the writer and cannot be blocked by it.
 The catalog lives in the existing `sessions` table, extended with
 `first_prompt`, `models_json`, `originator`, `agent_version`, `repo_url`,
 `initial_commit`, `workspace_roots_json`, `source_stamp` and `discovery_state`,
-plus the `idx_sessions_source_last`, `idx_sessions_raw_path`,
-`idx_sessions_recency` and `idx_sessions_source_recency` indexes. A companion
+plus the `idx_sessions_raw_path`, `idx_sessions_recency` and
+`idx_sessions_source_recency` indexes — exactly the three the catalog's fast
+paths use, because every additional index on `sessions` is one more btree a
+discovery upsert must update. A companion
 `discovery_skips` table remembers sources already examined and found not to be
 sessions (a codex subagent thread, a Claude subagent sidecar), keyed by
 `(source, locator)` with the stamp, so a rescan costs a primary-key lookup

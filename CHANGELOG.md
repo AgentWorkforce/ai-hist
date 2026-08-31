@@ -4,6 +4,21 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- Cold shallow discovery of a large archive into a fresh database is ~3x
+  faster: hot-path catalog statements run through the prepared-statement
+  cache, the discovery upsert returns the merged row via `RETURNING` instead
+  of a second lookup, filesystem reads run one window ahead of catalog writes
+  on a persistent worker pool, and a fresh database's schema lands in a single
+  transaction. The unused `idx_sessions_cwd`, `idx_sessions_branch`,
+  `idx_sessions_last`, and `idx_sessions_source_last` indexes are dropped —
+  nothing queries them, and each was one more btree per catalog write.
+  Discovery runs commit at WAL's NORMAL durability, scoped to the run itself:
+  discovery writes only catalog rows a provider rescan reproduces, while
+  user-created records (tags, commit links) keep the database's default FULL
+  durability.
+
 ### Breaking
 
 - Retire standalone Rust CLI release assets and the curl/source installer.
@@ -27,8 +42,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - Extend the `sessions` catalog table with `first_prompt`, `models_json`,
   `originator`, `agent_version`, `repo_url`, `initial_commit`,
   `workspace_roots_json`, `source_stamp`, and `discovery_state`, plus the
-  `idx_sessions_source_last` and `idx_sessions_raw_path` indexes. Existing
-  databases migrate in place on the next open.
+  `idx_sessions_raw_path`, `idx_sessions_recency`, and
+  `idx_sessions_source_recency` indexes. Existing databases migrate in place
+  on the next open.
 - Expose `listSessions` and `discoverSessions` from the napi binding, so a Node
   host can drive the catalog in-process instead of shelling out.
 - The npm-installed `ai-hist --version` reports the SDK package version and can

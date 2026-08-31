@@ -47,17 +47,18 @@
 //! busy-retry connection, batched into one short transaction per read window
 //! so a run of fresh rows costs one commit, not hundreds.
 //!
-//! Within a run, shallow reads of file-backed providers fan out across worker
-//! threads (see [`ScanEnv`]). The candidate walk, the emission order, and the
-//! set of sources read are identical to a serial run — parallelism changes
-//! wall-clock time, never observable behaviour.
+//! Within a run, shallow reads of file-backed providers fan out across a
+//! persistent pool of worker threads (see [`ScanEnv`]), and the pool reads one
+//! window ahead of the catalog writes. The candidate walk, the emission order,
+//! and the set of sources read are identical to a serial run — parallelism
+//! changes wall-clock time, never observable behaviour.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use ai_hist_core::SOURCE_CHOICES;
@@ -1602,14 +1603,24 @@ pub fn list_session_catalog_page(
     })
 }
 
+/// Hot-path statements are built once and executed through the connection's
+/// prepared-statement cache: discovery runs each of them per candidate, and
+/// re-preparing them dominated a cold run's profile.
+static CATALOG_ROW_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE source = ? AND session_id = ?")
+});
+static CATALOG_ROW_BY_PATH_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE source = ? AND raw_path = ? LIMIT 1")
+});
+
 fn fetch_catalog_row(
     conn: &Connection,
     source: &str,
     session_id: &str,
 ) -> Result<Option<ShallowSession>> {
-    let sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE source = ? AND session_id = ?");
     Ok(conn
-        .query_row(&sql, params![source, session_id], row_to_session)
+        .prepare_cached(&CATALOG_ROW_SQL)?
+        .query_row(params![source, session_id], row_to_session)
         .ok())
 }
 
@@ -1618,10 +1629,9 @@ fn fetch_catalog_row_by_path(
     source: &str,
     raw_path: &str,
 ) -> Result<Option<ShallowSession>> {
-    let sql =
-        format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE source = ? AND raw_path = ? LIMIT 1");
     Ok(conn
-        .query_row(&sql, params![source, raw_path], row_to_session)
+        .prepare_cached(&CATALOG_ROW_BY_PATH_SQL)?
+        .query_row(params![source, raw_path], row_to_session)
         .ok())
 }
 
@@ -1638,33 +1648,28 @@ fn is_known_non_session(
     stamp: &str,
 ) -> Result<bool> {
     let known: Option<String> = conn
-        .query_row(
-            "SELECT stamp FROM discovery_skips WHERE source = ? AND locator = ?",
-            params![source, locator],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT stamp FROM discovery_skips WHERE source = ? AND locator = ?")?
+        .query_row(params![source, locator], |row| row.get(0))
         .ok();
     Ok(known.as_deref() == Some(stamp))
 }
 
 /// Remember that this source, at this stamp, is not a session.
 fn record_non_session(conn: &Connection, source: &str, locator: &str, stamp: &str) -> Result<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO discovery_skips (source, locator, stamp, reason, updated_ms) \
          VALUES (?, ?, ?, 'not-a-session', ?) \
          ON CONFLICT(source, locator) DO UPDATE SET \
          stamp = excluded.stamp, reason = excluded.reason, updated_ms = excluded.updated_ms",
-        params![source, locator, stamp, now_ms()],
-    )?;
+    )?
+    .execute(params![source, locator, stamp, now_ms()])?;
     Ok(())
 }
 
 /// Drop a stale non-session marker once a source does resolve to a session.
 fn clear_non_session(conn: &Connection, source: &str, locator: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM discovery_skips WHERE source = ? AND locator = ?",
-        params![source, locator],
-    )?;
+    conn.prepare_cached("DELETE FROM discovery_skips WHERE source = ? AND locator = ?")?
+        .execute(params![source, locator])?;
     Ok(())
 }
 
@@ -1675,16 +1680,8 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-/// Write a shallow row into the catalog.
-///
-/// Never nulls out a value the catalog already holds, never lowers
-/// `first_activity_ms` past what a fuller pass observed, and never downgrades
-/// a fully indexed row to `'shallow'` — including a row from a database that
-/// predates `discovery_state`, whose NULL readers deliberately interpret as
-/// `'full'`. A shallow rescan of such a row still refreshes its metadata and
-/// stamp.
-pub fn upsert_shallow_session(conn: &Connection, session: &ShallowSession) -> Result<()> {
-    conn.execute(
+static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
         "INSERT INTO sessions \
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, \
           last_assistant_text, raw_path, parser_version, first_prompt, models_json, originator, \
@@ -1714,7 +1711,28 @@ pub fn upsert_shallow_session(conn: &Connection, session: &ShallowSession) -> Re
          source_stamp = COALESCE(excluded.source_stamp, sessions.source_stamp), \
          discovery_state = CASE \
              WHEN sessions.discovery_state IS NULL OR sessions.discovery_state = 'full' \
-             THEN 'full' ELSE 'shallow' END",
+             THEN 'full' ELSE 'shallow' END \
+         RETURNING {SESSION_COLUMNS}"
+    )
+});
+
+/// Write a shallow row into the catalog, returning the merged row as stored.
+///
+/// Never nulls out a value the catalog already holds, never lowers
+/// `first_activity_ms` past what a fuller pass observed, and never downgrades
+/// a fully indexed row to `'shallow'` — including a row from a database that
+/// predates `discovery_state`, whose NULL readers deliberately interpret as
+/// `'full'`. A shallow rescan of such a row still refreshes its metadata and
+/// stamp.
+///
+/// The returned row is what the catalog now holds (including a preserved
+/// `full` state), read back through the write's own `RETURNING` clause so the
+/// merge costs no second lookup.
+pub fn upsert_shallow_session(
+    conn: &Connection,
+    session: &ShallowSession,
+) -> Result<ShallowSession> {
+    let mut row = conn.prepare_cached(&UPSERT_SESSION_SQL)?.query_row(
         params![
             session.session_id,
             session.source,
@@ -1733,8 +1751,10 @@ pub fn upsert_shallow_session(conn: &Connection, session: &ShallowSession) -> Re
             json_array_or_none(&session.workspace_roots),
             session.source_stamp,
         ],
+        row_to_session,
     )?;
-    Ok(())
+    row.from_cache = false;
+    Ok(row)
 }
 
 // ---------------------------------------------------------------------------
@@ -1877,6 +1897,14 @@ pub fn discover_sessions_with_env(
     mut on_row: impl FnMut(&ShallowSession),
 ) -> Result<DiscoverySummary> {
     let conn = env.conn();
+    // Discovery writes only stamp-guarded `sessions` rows and
+    // `discovery_skips` markers — data a rescan of the provider sources
+    // reproduces — so its commits run at WAL's NORMAL durability instead of
+    // paying FULL's fsync per window. The relaxation is scoped to this run:
+    // the guard restores the connection's previous level on every exit, and
+    // records a rescan cannot restore (user tags, commit links) are written
+    // elsewhere at the database's default durability.
+    let _synchronous = RelaxedSynchronous::new(conn)?;
     let providers = select_providers(options)?;
     let mut summary = DiscoverySummary {
         contract_version: SESSION_CATALOG_CONTRACT_VERSION,
@@ -1949,78 +1977,118 @@ pub fn discover_sessions_with_env(
     let scan = env.scan();
     let mut position = 0usize;
 
-    while emitted < limit && position < candidates.len() {
-        let window_cap = (limit - emitted).min(MAX_READ_WINDOW);
-        let mut entries: Vec<WindowEntry<'_>> = Vec::new();
-        let mut potential = 0usize;
-        while position < candidates.len() && potential < window_cap {
-            let candidate = &candidates[position];
-            position += 1;
-            let Some(provider) = by_source.get(candidate.source) else {
-                continue;
-            };
-            let expected = stored_stamp(&candidate.stamp);
-            let cached = match candidate.session_id.as_deref() {
-                Some(session_id) => fetch_catalog_row(conn, candidate.source, session_id)?,
-                None => fetch_catalog_row_by_path(conn, candidate.source, &candidate.locator)?,
-            };
-            if let Some(cached) =
-                cached.filter(|row| row.source_stamp.as_deref() == Some(&expected))
-            {
-                env.note_skipped();
-                summary.skipped_unchanged += 1;
-                if let Some(entry) = summary.providers.get_mut(candidate.source) {
-                    entry.skipped_unchanged += 1;
-                }
-                potential += 1;
-                entries.push(WindowEntry::Cached(cached));
-                continue;
-            }
-            // A source already examined and found not to be a session (a codex
-            // subagent thread, a claude sidecar) is remembered by its stamp, so a
-            // rescan costs a PK lookup instead of a fresh read every single run.
-            if is_known_non_session(conn, candidate.source, &candidate.locator, &expected)? {
-                env.note_skipped();
-                summary.skipped_unchanged += 1;
-                if let Some(entry) = summary.providers.get_mut(candidate.source) {
-                    entry.skipped_unchanged += 1;
-                }
-                continue;
-            }
-            env.note_shallow_read();
-            potential += 1;
-            entries.push(WindowEntry::Read {
-                candidate,
-                provider: *provider,
-                expected,
-                result: None,
-            });
-        }
+    // One pool of read workers serves every window. Workers are spawned
+    // lazily — the first window that fans out pays for exactly the threads it
+    // can use, and later windows reuse them — because spawning a fresh set per
+    // window cost more wall clock than the reads themselves on small files.
+    let pool_cap = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(MAX_READ_WORKERS);
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<ReadJob<'_>>();
+    let job_rx = Mutex::new(job_rx);
 
-        let fs_reads: Vec<usize> = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                matches!(entry, WindowEntry::Read { provider, .. }
+    std::thread::scope(|scope| -> Result<()> {
+        let job_tx = job_tx;
+        let mut pool_size = 0usize;
+        // The engine runs one window ahead of the catalog: while the pool reads
+        // window N's files, the engine classifies window N+1 and queues its reads,
+        // then collects N's results and applies them. The window in flight
+        // reserves its potential emitters against the limit, so the set of
+        // sources read never exceeds what a strictly serial walk reads, and rows
+        // are still emitted in candidate order.
+        let mut pending: Option<InFlightWindow<'_>> = None;
+        loop {
+            let reserved = pending.as_ref().map_or(0, |window| window.potential);
+            let mut next: Option<InFlightWindow<'_>> = None;
+            if emitted + reserved < limit && position < candidates.len() {
+                let window_cap = (limit - emitted - reserved).min(MAX_READ_WINDOW);
+                let mut entries: Vec<WindowEntry<'_>> = Vec::new();
+                let mut potential = 0usize;
+                while position < candidates.len() && potential < window_cap {
+                    let candidate = &candidates[position];
+                    position += 1;
+                    let Some(provider) = by_source.get(candidate.source) else {
+                        continue;
+                    };
+                    let expected = stored_stamp(&candidate.stamp);
+                    let cached = match candidate.session_id.as_deref() {
+                        Some(session_id) => fetch_catalog_row(conn, candidate.source, session_id)?,
+                        None => {
+                            fetch_catalog_row_by_path(conn, candidate.source, &candidate.locator)?
+                        }
+                    };
+                    if let Some(cached) =
+                        cached.filter(|row| row.source_stamp.as_deref() == Some(&expected))
+                    {
+                        env.note_skipped();
+                        summary.skipped_unchanged += 1;
+                        if let Some(entry) = summary.providers.get_mut(candidate.source) {
+                            entry.skipped_unchanged += 1;
+                        }
+                        potential += 1;
+                        entries.push(WindowEntry::Cached(cached));
+                        continue;
+                    }
+                    // A source already examined and found not to be a session (a codex
+                    // subagent thread, a claude sidecar) is remembered by its stamp, so a
+                    // rescan costs a PK lookup instead of a fresh read every single run.
+                    if is_known_non_session(conn, candidate.source, &candidate.locator, &expected)?
+                    {
+                        env.note_skipped();
+                        summary.skipped_unchanged += 1;
+                        if let Some(entry) = summary.providers.get_mut(candidate.source) {
+                            entry.skipped_unchanged += 1;
+                        }
+                        continue;
+                    }
+                    env.note_shallow_read();
+                    potential += 1;
+                    entries.push(WindowEntry::Read {
+                        candidate,
+                        provider: *provider,
+                        expected,
+                        result: None,
+                    });
+                }
+
+                let fs_reads: Vec<usize> = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| {
+                        matches!(entry, WindowEntry::Read { provider, .. }
                     if provider.read_access() == ShallowReadAccess::Filesystem)
-            })
-            .map(|(index, _)| index)
-            .collect();
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(fs_reads.len())
-            .min(MAX_READ_WORKERS);
-        if workers > 1 {
-            let next = AtomicUsize::new(0);
-            let results = Mutex::new(Vec::with_capacity(fs_reads.len()));
-            std::thread::scope(|scope| {
-                for _ in 0..workers {
-                    scope.spawn(|| loop {
-                        let slot = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&entry_index) = fs_reads.get(slot) else {
-                            break;
-                        };
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                let want = fs_reads.len().min(pool_cap);
+                let mut results = None;
+                if want > 1 {
+                    // Grow the shared pool to what this window can use. Workers are
+                    // spawned once for the whole run — spawning a fresh set per
+                    // window cost more wall clock than the reads themselves on small
+                    // files — and outlive the window, pulling whatever is queued.
+                    while pool_size < want {
+                        let job_rx = &job_rx;
+                        scope.spawn(move || loop {
+                            // Take the receiver lock only to pull one job; the read
+                            // itself runs unlocked.
+                            let job = job_rx.lock().expect("read job queue").recv();
+                            let Ok((entry_index, candidate, provider, result_tx)) = job else {
+                                break;
+                            };
+                            let provider: &dyn ShallowSessionProvider = provider;
+                            let outcome = provider.read_shallow(&scan, None, candidate);
+                            // A send fails only when the engine abandoned the window
+                            // on an error path; the job queue hanging up is what ends
+                            // the worker.
+                            let _ = result_tx.send((entry_index, outcome));
+                        });
+                        pool_size += 1;
+                    }
+                    let (result_tx, result_rx) = std::sync::mpsc::channel();
+                    let mut dispatched = 0usize;
+                    for &entry_index in &fs_reads {
                         let WindowEntry::Read {
                             candidate,
                             provider,
@@ -2029,148 +2097,172 @@ pub fn discover_sessions_with_env(
                         else {
                             continue;
                         };
-                        let outcome = provider.read_shallow(&scan, None, candidate);
-                        results
-                            .lock()
-                            .expect("window read results")
-                            .push((entry_index, outcome));
-                    });
+                        job_tx
+                            .send((entry_index, *candidate, *provider, result_tx.clone()))
+                            .expect("read workers alive");
+                        dispatched += 1;
+                    }
+                    results = Some((result_rx, dispatched));
                 }
-            });
-            for (entry_index, outcome) in results.into_inner().expect("window read results") {
-                if let WindowEntry::Read { result, .. } = &mut entries[entry_index] {
-                    *result = Some(outcome);
+                next = Some(InFlightWindow {
+                    entries,
+                    potential,
+                    results,
+                });
+            }
+
+            // Apply the window dispatched on the previous pass; its reads have had
+            // this whole classification to complete in the background.
+            let Some(window) = pending.take() else {
+                match next {
+                    Some(window) => {
+                        pending = Some(window);
+                        continue;
+                    }
+                    None => break,
+                }
+            };
+            pending = next;
+            let InFlightWindow {
+                mut entries,
+                results,
+                ..
+            } = window;
+            if let Some((result_rx, dispatched)) = results {
+                for _ in 0..dispatched {
+                    let (entry_index, outcome) = result_rx.recv().expect("window read results");
+                    if let WindowEntry::Read { result, .. } = &mut entries[entry_index] {
+                        *result = Some(outcome);
+                    }
                 }
             }
-        }
 
-        // Writes for the whole window share one transaction; a fresh archive
-        // costs one commit per window instead of one per row. Cached-only
-        // windows stay read-only, and rows are not exposed to callers until
-        // every write they describe has committed successfully.
-        let has_writes = entries
-            .iter()
-            .any(|entry| matches!(entry, WindowEntry::Read { .. }));
-        if has_writes {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-        }
-        let mut window_error: Option<anyhow::Error> = None;
-        let mut window_rows = Vec::new();
-        let mut window_sessions = BTreeSet::new();
-        let mut window_discovered = 0usize;
-        let mut window_discovered_by_source: BTreeMap<String, usize> = BTreeMap::new();
-        'apply: for entry in entries {
-            let (candidate, provider, expected, result) = match entry {
-                WindowEntry::Cached(row) => {
-                    let key = (row.source.clone(), row.session_id.clone());
-                    if !emitted_sessions.contains(&key) && window_sessions.insert(key) {
-                        window_rows.push(row);
+            // Writes for the whole window share one transaction; a fresh archive
+            // costs one commit per window instead of one per row. Cached-only
+            // windows stay read-only, and rows are not exposed to callers until
+            // every write they describe has committed successfully.
+            let has_writes = entries
+                .iter()
+                .any(|entry| matches!(entry, WindowEntry::Read { .. }));
+            if has_writes {
+                conn.execute_batch("BEGIN IMMEDIATE")?;
+            }
+            let mut window_error: Option<anyhow::Error> = None;
+            let mut window_rows = Vec::new();
+            let mut window_sessions = BTreeSet::new();
+            let mut window_discovered = 0usize;
+            let mut window_discovered_by_source: BTreeMap<String, usize> = BTreeMap::new();
+            'apply: for entry in entries {
+                let (candidate, provider, expected, result) = match entry {
+                    WindowEntry::Cached(row) => {
+                        let key = (row.source.clone(), row.session_id.clone());
+                        if !emitted_sessions.contains(&key) && window_sessions.insert(key) {
+                            window_rows.push(row);
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                WindowEntry::Read {
-                    candidate,
-                    provider,
-                    expected,
-                    result,
-                } => (candidate, provider, expected, result),
-            };
-            let read = match result {
-                Some(read) => read,
-                // Catalog-backed providers (and a window with nothing worth
-                // fanning out) read here, serially, with the connection.
-                None => provider.read_shallow(&scan, Some(conn), candidate),
-            };
-            let session = match read {
-                Ok(Some(session)) => session,
-                Ok(None) => {
-                    if let Err(error) =
-                        record_non_session(conn, candidate.source, &candidate.locator, &expected)
-                    {
-                        window_error = Some(error);
-                        break 'apply;
+                    WindowEntry::Read {
+                        candidate,
+                        provider,
+                        expected,
+                        result,
+                    } => (candidate, provider, expected, result),
+                };
+                let read = match result {
+                    Some(read) => read,
+                    // Catalog-backed providers (and a window with nothing worth
+                    // fanning out) read here, serially, with the connection.
+                    None => provider.read_shallow(&scan, Some(conn), candidate),
+                };
+                let session = match read {
+                    Ok(Some(session)) => session,
+                    Ok(None) => {
+                        if let Err(error) = record_non_session(
+                            conn,
+                            candidate.source,
+                            &candidate.locator,
+                            &expected,
+                        ) {
+                            window_error = Some(error);
+                            break 'apply;
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                Err(error) => {
+                    Err(error) => {
+                        summary.diagnostics.push(DiscoveryDiagnostic {
+                            source: candidate.source.to_string(),
+                            locator: Some(candidate.locator.clone()),
+                            error: format!("{error:#}"),
+                        });
+                        continue;
+                    }
+                };
+                if session.session_id.is_empty() {
                     summary.diagnostics.push(DiscoveryDiagnostic {
                         source: candidate.source.to_string(),
                         locator: Some(candidate.locator.clone()),
-                        error: format!("{error:#}"),
+                        error: "no session id in source".to_string(),
                     });
                     continue;
                 }
-            };
-            if session.session_id.is_empty() {
-                summary.diagnostics.push(DiscoveryDiagnostic {
-                    source: candidate.source.to_string(),
-                    locator: Some(candidate.locator.clone()),
-                    error: "no session id in source".to_string(),
-                });
-                continue;
-            }
-            let mut session = session;
-            session.source_stamp = Some(expected);
-            session.discovery_state = "shallow".to_string();
-            if let Err(error) = upsert_shallow_session(conn, &session) {
-                summary.diagnostics.push(DiscoveryDiagnostic {
-                    source: candidate.source.to_string(),
-                    locator: Some(candidate.locator.clone()),
-                    error: format!("{error:#}"),
-                });
-                continue;
-            }
-            // A file that used to be skipped as a non-session (or was never one)
-            // must not keep a stale marker once it resolves to a session.
-            if let Err(error) = clear_non_session(conn, candidate.source, &candidate.locator) {
-                window_error = Some(error);
-                break 'apply;
-            }
-            // Emit the merged catalog row, so what a caller sees is exactly what
-            // the catalog now holds (including a preserved `full` state).
-            let row = match fetch_catalog_row(conn, &session.source, &session.session_id) {
-                Ok(row) => row
-                    .map(|mut row| {
-                        row.from_cache = false;
-                        row
-                    })
-                    .unwrap_or(session),
-                Err(error) => {
+                let mut session = session;
+                session.source_stamp = Some(expected);
+                session.discovery_state = "shallow".to_string();
+                // The upsert's RETURNING clause hands back the merged catalog row,
+                // so what a caller sees is exactly what the catalog now holds
+                // (including a preserved `full` state).
+                let row = match upsert_shallow_session(conn, &session) {
+                    Ok(row) => row,
+                    Err(error) => {
+                        summary.diagnostics.push(DiscoveryDiagnostic {
+                            source: candidate.source.to_string(),
+                            locator: Some(candidate.locator.clone()),
+                            error: format!("{error:#}"),
+                        });
+                        continue;
+                    }
+                };
+                // A file that used to be skipped as a non-session (or was never one)
+                // must not keep a stale marker once it resolves to a session.
+                if let Err(error) = clear_non_session(conn, candidate.source, &candidate.locator) {
                     window_error = Some(error);
                     break 'apply;
                 }
-            };
-            window_discovered += 1;
-            *window_discovered_by_source
-                .entry(candidate.source.to_string())
-                .or_default() += 1;
-            let key = (row.source.clone(), row.session_id.clone());
-            if !emitted_sessions.contains(&key) && window_sessions.insert(key) {
-                window_rows.push(row);
+                window_discovered += 1;
+                *window_discovered_by_source
+                    .entry(candidate.source.to_string())
+                    .or_default() += 1;
+                let key = (row.source.clone(), row.session_id.clone());
+                if !emitted_sessions.contains(&key) && window_sessions.insert(key) {
+                    window_rows.push(row);
+                }
             }
-        }
-        if has_writes {
-            if let Err(error) = conn.execute_batch("COMMIT") {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(error.into());
+            if has_writes {
+                if let Err(error) = conn.execute_batch("COMMIT") {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
             }
-        }
 
-        summary.discovered += window_discovered;
-        for (source, discovered) in window_discovered_by_source {
-            if let Some(entry) = summary.providers.get_mut(&source) {
-                entry.discovered += discovered;
+            summary.discovered += window_discovered;
+            for (source, discovered) in window_discovered_by_source {
+                if let Some(entry) = summary.providers.get_mut(&source) {
+                    entry.discovered += discovered;
+                }
+            }
+            for row in window_rows {
+                emitted_sessions.insert((row.source.clone(), row.session_id.clone()));
+                emitted += 1;
+                on_row(&row);
+            }
+            if let Some(error) = window_error {
+                return Err(error);
             }
         }
-        for row in window_rows {
-            emitted_sessions.insert((row.source.clone(), row.session_id.clone()));
-            emitted += 1;
-            on_row(&row);
-        }
-        if let Some(error) = window_error {
-            return Err(error);
-        }
-    }
+        // Hang up the job queue so idle workers exit; the scope joins them.
+        drop(job_tx);
+        Ok(())
+    })?;
 
     summary.counters = env.counters();
     Ok(summary)
@@ -2178,8 +2270,62 @@ pub fn discover_sessions_with_env(
 
 /// Most potential emitters one read window may hold, whatever the limit.
 const MAX_READ_WINDOW: usize = 256;
-/// Most worker threads one window's filesystem reads fan out across.
+/// Most worker threads a run's filesystem reads fan out across.
 const MAX_READ_WORKERS: usize = 16;
+
+/// Scoped `PRAGMA synchronous = NORMAL` for one discovery run.
+///
+/// Constructed at the start of [`discover_sessions_with_env`] and restores the
+/// connection's previous synchronous level when dropped, so only discovery's
+/// own commits — reconstructible catalog rows and skip markers — run at the
+/// relaxed durability.
+struct RelaxedSynchronous<'a> {
+    conn: &'a Connection,
+    previous: i64,
+}
+
+impl<'a> RelaxedSynchronous<'a> {
+    fn new(conn: &'a Connection) -> Result<Self> {
+        let previous = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(Self { conn, previous })
+    }
+}
+
+impl Drop for RelaxedSynchronous<'_> {
+    fn drop(&mut self) {
+        // Best effort: a connection that cannot take the pragma any more is
+        // being torn down anyway.
+        let _ = self.conn.pragma_update(None, "synchronous", self.previous);
+    }
+}
+
+/// One shallow read's outcome, keyed by the entry's index in its window.
+type ReadOutcome = (usize, Result<Option<ShallowSession>>);
+
+/// One filesystem read handed to the worker pool: the entry's index in its
+/// window, the candidate and provider to read it with, and the sender for
+/// that window's results. The references point at run-scoped data
+/// (`candidates` and the provider list), never at the window itself, so a
+/// job stays valid while its window waits in the pipeline.
+type ReadJob<'c> = (
+    usize,
+    &'c Candidate,
+    &'c dyn ShallowSessionProvider,
+    std::sync::mpsc::Sender<ReadOutcome>,
+);
+
+/// A classified window whose filesystem reads are already queued on the pool.
+struct InFlightWindow<'c> {
+    /// The window's candidates, in emission order.
+    entries: Vec<WindowEntry<'c>>,
+    /// Potential emitters, reserved against the limit while the window is in
+    /// flight so the pipeline never reads past what a serial walk would.
+    potential: usize,
+    /// Receiver for the window's dispatched reads, with how many to expect.
+    /// `None` when nothing was worth fanning out.
+    results: Option<(std::sync::mpsc::Receiver<ReadOutcome>, usize)>,
+}
 
 /// One classified candidate in a read window.
 enum WindowEntry<'c> {
