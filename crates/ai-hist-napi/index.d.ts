@@ -108,8 +108,12 @@ export interface NativeSessionFileEdit {
   cwd?: string
 }
 /**
- * Continuation for tool call and file edit pages. `tsMs` is nullable because
+ * Continuation for tool call and file edit pages. `tsMs` is optional because
  * both tables order their undated rows last.
+ *
+ * Absent-or-`undefined` is how a caller says "inside the undated tail": an
+ * explicit JavaScript `null` cannot be converted to `i64` and fails at the
+ * boundary, so the SDK normalizes `null` to `undefined` before calling in.
  */
 export interface EvidenceCursor {
   tsMs?: number

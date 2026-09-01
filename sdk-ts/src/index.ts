@@ -276,10 +276,17 @@ export interface SessionFileEdit {
  */
 export interface EvidenceCursor { tsMs: number | null; id: number }
 
+/**
+ * A cursor on the way back in. An emitted cursor is always accepted, and so is
+ * one whose `tsMs` was dropped by a transport that omits nulls: absent and
+ * `null` both mean "already inside the undated tail".
+ */
+export interface EvidenceCursorInput { tsMs?: number | null; id: number }
+
 export interface EvidencePageOptions {
   dbPath?: string;
   limit?: number;
-  after?: EvidenceCursor;
+  after?: EvidenceCursorInput;
 }
 
 export interface SessionToolCallsPage {
@@ -598,6 +605,16 @@ function evidenceCursor(value: unknown): EvidenceCursor | null {
   return { tsMs: nullableNumber(row.tsMs), id: Number(row.id) };
 }
 
+/**
+ * The native boundary reads an absent `tsMs` as "inside the undated tail" but
+ * cannot convert an explicit `null` into its integer field, so the cursor this
+ * SDK hands back — `tsMs: null` for an undated row — has to be normalized
+ * before it goes back in. The catalog cursor is normalized the same way.
+ */
+function nativeEvidenceCursor(after: EvidenceCursorInput | undefined): object | undefined {
+  return after ? { ...after, tsMs: after.tsMs ?? undefined } : undefined;
+}
+
 function assertEvidenceContract(value: number): void {
   if (value !== SESSION_EVIDENCE_CONTRACT_VERSION) {
     throw new NativeContractMismatchError(
@@ -787,7 +804,9 @@ export async function getSessionToolCallsPage(
 ): Promise<SessionToolCallsPage> {
   evidenceIdentity(source, sessionId, 'getSessionToolCallsPage');
   return nativeCall(async (native) => {
-    const page = await native.getSessionToolCallsPage(source, sessionId, options);
+    const page = await native.getSessionToolCallsPage(source, sessionId, {
+      ...options, after: nativeEvidenceCursor(options.after),
+    });
     assertEvidenceContract(Number(page.contractVersion));
     return {
       contractVersion: Number(page.contractVersion),
@@ -823,7 +842,9 @@ export async function getSessionFileEditsPage(
 ): Promise<SessionFileEditsPage> {
   evidenceIdentity(source, sessionId, 'getSessionFileEditsPage');
   return nativeCall(async (native) => {
-    const page = await native.getSessionFileEditsPage(source, sessionId, options);
+    const page = await native.getSessionFileEditsPage(source, sessionId, {
+      ...options, after: nativeEvidenceCursor(options.after),
+    });
     assertEvidenceContract(Number(page.contractVersion));
     return {
       contractVersion: Number(page.contractVersion),

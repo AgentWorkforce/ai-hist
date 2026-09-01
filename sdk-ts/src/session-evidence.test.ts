@@ -11,6 +11,14 @@ import {
   type EvidenceCursor, type SessionFileEdit, type SessionToolCall,
 } from './index.js';
 
+// Undated tool calls and file edits are legal — both `ts_ms` columns are
+// nullable — but no provider adapter writes one, so the only way to build the
+// fixture that exercises a null cursor end to end is to add the rows directly.
+// Production code stays SQLite-free; this is test-only, and `node:sqlite`
+// arrived in Node 22 while the SDK still supports Node 20.
+const sqlite = await import('node:sqlite').catch(() => null);
+const needsNodeSqlite = sqlite ? false : 'node:sqlite requires Node >= 22';
+
 const SHARED_SESSION = 'shared-1';
 
 const CLAUDE_TRANSCRIPT = [
@@ -156,6 +164,72 @@ test('paged, iterated, and collected reads agree at every page size', async () =
     const second = await getSessionToolCallsPage('claude', SHARED_SESSION, { dbPath, limit: 2, after: roundTripped });
     assert.deepEqual(second.toolCalls, allCalls.slice(1));
     assert.equal(second.nextCursor, null);
+
+    // Both spellings of the undated tail cross the native boundary, which
+    // takes an absent `tsMs` and cannot convert an explicit null: the cursor
+    // a page hands back for an undated row is `tsMs: null`, and a transport
+    // that drops nulls delivers the same cursor without the field at all.
+    // On this fully dated database both name an empty tail rather than
+    // failing the call.
+    for (const after of [{ tsMs: null, id: allCalls[0].id }, { id: allCalls[0].id }]) {
+      const tail = await getSessionToolCallsPage('claude', SHARED_SESSION, { dbPath, after });
+      assert.deepEqual(tail.toolCalls, []);
+      assert.equal(tail.nextCursor, null);
+      const edits = await getSessionFileEditsPage('claude', SHARED_SESSION, { dbPath, after });
+      assert.deepEqual(edits.fileEdits, []);
+      assert.equal(edits.nextCursor, null);
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
+test('undated records page after the dated ones through a null cursor', { skip: needsNodeSqlite }, async () => {
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const database = new sqlite!.DatabaseSync(dbPath);
+    try {
+      database.exec(`
+        INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name, target, args_json, is_error, ts_ms)
+        VALUES ('claude', '${SHARED_SESSION}', 'a9', 'toolu_undated_1', 'Bash', 'ls', '{"command":"ls"}', 0, NULL),
+               ('claude', '${SHARED_SESSION}', 'a9', 'toolu_undated_2', 'Bash', 'pwd', '{"command":"pwd"}', NULL, NULL);
+        INSERT INTO file_edits (source, session_id, message_id, tool_use_id, file_path, tool_name, lines_added, lines_removed, ts_ms)
+        VALUES ('claude', '${SHARED_SESSION}', 'a9', 'toolu_undated_1', '/work/app/undated-a.ts', 'Edit', NULL, NULL, NULL),
+               ('claude', '${SHARED_SESSION}', 'a9', 'toolu_undated_2', '/work/app/undated-b.ts', 'Edit', 3, 1, NULL);
+      `);
+    } finally {
+      database.close();
+    }
+
+    const allCalls = await getSessionToolCalls('claude', SHARED_SESSION, { dbPath });
+    const allEdits = await getSessionFileEdits('claude', SHARED_SESSION, { dbPath });
+    assert.deepEqual(allCalls.map((call) => call.toolUseId), [
+      'toolu_1', 'toolu_2', 'toolu_3', 'toolu_undated_1', 'toolu_undated_2',
+    ]);
+    assert.deepEqual(allCalls.slice(3).map((call) => call.tsMs), [null, null]);
+    assert.deepEqual(allEdits.map((edit) => edit.filePath), [
+      '/work/app/auth.ts', '/work/app/notes.md', '/work/app/undated-a.ts', '/work/app/undated-b.ts',
+    ]);
+
+    // Every page size crosses from the dated head into the undated tail, so a
+    // cursor whose `tsMs` is null is walked rather than only constructed.
+    for (const limit of [1, 2, 3, 4, 5]) {
+      const calls: SessionToolCall[] = [];
+      for await (const call of sessionToolCalls('claude', SHARED_SESSION, { dbPath, limit })) calls.push(call);
+      assert.deepEqual(calls, allCalls, `tool calls at limit ${limit}`);
+      const edits: SessionFileEdit[] = [];
+      for await (const edit of sessionFileEdits('claude', SHARED_SESSION, { dbPath, limit })) edits.push(edit);
+      assert.deepEqual(edits, allEdits, `file edits at limit ${limit}`);
+    }
+
+    // The cursor that lands inside the tail is the null one, and it round
+    // trips through JSON exactly as the CLI and MCP server send it.
+    const inTail = await getSessionToolCallsPage('claude', SHARED_SESSION, { dbPath, limit: 4 });
+    assert.equal(inTail.nextCursor?.tsMs, null);
+    const resumed = await getSessionToolCallsPage('claude', SHARED_SESSION, {
+      dbPath, after: JSON.parse(JSON.stringify(inTail.nextCursor)) as EvidenceCursor,
+    });
+    assert.deepEqual(resumed.toolCalls.map((call) => call.toolUseId), ['toolu_undated_2']);
   } finally {
     await cleanup();
   }

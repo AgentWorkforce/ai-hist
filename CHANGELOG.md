@@ -40,9 +40,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
   indexed string and is parsed into `args` / `structuredPatch`; an absent or
   unparseable value becomes `null` while `argsJson` / `structuredPatchJson`
   keep the original, so one bad payload cannot fail a page. New
-  `idx_tool_calls_page` and `idx_file_edits_page` indexes back the access
-  path; existing databases add them on their next writable open. The
-  native-addon contract is now 5.
+  `idx_tool_calls_page_v2` and `idx_file_edits_page_v2` indexes back the access
+  path, ordering on `(source, session_id, (ts_ms IS NULL), ts_ms, id)` so a
+  page is read in order rather than sorted; existing databases add them, and
+  drop the superseded `idx_tool_calls_page` / `idx_file_edits_page` and the
+  now-redundant `idx_tool_calls_session` / `idx_file_edits_session`, on their
+  next writable open. The native-addon contract is now 5.
+- `ai-hist events --json` file-edit records additively carry `message_id`,
+  `structured_patch_json`, `git_branch`, and `cwd`.
 - Add remote provider connectors behind the existing `--remote` / `--all`
   acquisition scopes: `claude-web` lists claude.ai/code web sessions with the
   OAuth sign-in the Claude Code CLI stored (`~/.claude/.credentials.json`,

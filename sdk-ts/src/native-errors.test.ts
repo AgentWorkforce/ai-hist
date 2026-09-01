@@ -115,6 +115,28 @@ test('evidence pages reject out-of-range limits at the native boundary', async (
   }
 });
 
+test('evidence pages reject a padded identity instead of answering it empty', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-evidence-identity-'));
+  const dbPath = join(root, 'history.db');
+  try {
+    // The page matches an identity exactly, so a padded one would silently
+    // read as "no such session" rather than as the caller's mistake.
+    for (const operation of [
+      () => getSessionToolCallsPage('claude', ' sess-1 ', { dbPath }),
+      () => getSessionFileEditsPage(' claude ' as never, 'sess-1', { dbPath }),
+    ]) {
+      await assert.rejects(
+        operation(),
+        (error: unknown) => error instanceof InvalidArgumentError
+          && error.code === 'INVALID_ARGUMENT'
+          && /must not be padded with whitespace/.test(error.message),
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('database open failures use the stable SDK error', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'relayhistory-not-a-db-'));
   try {

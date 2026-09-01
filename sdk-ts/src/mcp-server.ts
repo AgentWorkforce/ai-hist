@@ -87,24 +87,22 @@ server.tool('get_session_events', 'Get one bounded page of normalized events.', 
 }, READ, ({ session_id, source, limit, after }) => call(() => getSessionEventsPage(session_id, { source, limit, after })));
 
 // Tool calls and file edits are keyed by (source, session_id): a session id
-// alone can name two sessions from two providers.
+// alone can name two sessions from two providers. A cursor's `tsMs` may be
+// null or absent -- both mean "already inside the undated tail" -- and reaches
+// the SDK exactly as the client sent it.
 const EVIDENCE_CURSOR = z.object({ tsMs: z.number().int().nullable().optional(), id: z.number().int() });
 
 server.tool('get_session_tool_calls', 'Get one bounded page of recorded tool calls for one session.', {
   source: SOURCE, session_id: z.string().min(1),
   limit: z.number().int().min(1).max(1000).optional().default(200),
   after: EVIDENCE_CURSOR.optional(),
-}, READ, ({ source, session_id, limit, after }) => call(() => getSessionToolCallsPage(source, session_id, {
-  limit, after: after ? { ...after, tsMs: after.tsMs ?? null } : undefined,
-})));
+}, READ, ({ source, session_id, limit, after }) => call(() => getSessionToolCallsPage(source, session_id, { limit, after })));
 
 server.tool('get_session_file_edits', 'Get one bounded page of recorded file edits for one session.', {
   source: SOURCE, session_id: z.string().min(1),
   limit: z.number().int().min(1).max(1000).optional().default(200),
   after: EVIDENCE_CURSOR.optional(),
-}, READ, ({ source, session_id, limit, after }) => call(() => getSessionFileEditsPage(source, session_id, {
-  limit, after: after ? { ...after, tsMs: after.tsMs ?? null } : undefined,
-})));
+}, READ, ({ source, session_id, limit, after }) => call(() => getSessionFileEditsPage(source, session_id, { limit, after })));
 
 server.tool('history_stats', 'Statistics for already-indexed RelayHistory data.', {
   scope: SESSION_SCOPE.optional().default('local'),

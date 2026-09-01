@@ -457,21 +457,34 @@ const REQUIRED_SESSIONS_INDEXES: &[&str] = &[
     "idx_sessions_raw_path",
     "idx_session_events_source_page",
     "idx_session_events_page",
-    "idx_tool_calls_page",
-    "idx_file_edits_page",
+    "idx_tool_calls_page_v2",
+    "idx_file_edits_page_v2",
     "idx_session_presences_location",
     "idx_session_presences_locator",
 ];
 
-/// Indexes retired from `sessions`: nothing queries them, and each was one
-/// more btree per catalog write. [`init_db`] drops them so existing databases
-/// shed the write amplification too; while one is still present the database
-/// has outstanding migration work, and the lock-free fast path must not run.
-const RETIRED_SESSIONS_INDEXES: &[&str] = &[
+/// Indexes no longer created: nothing queries them, or a replacement covers
+/// strictly more, and each was one more btree per write. [`init_db`] drops
+/// them so existing databases shed the write amplification too; while one is
+/// still present the database has outstanding migration work, and the
+/// lock-free fast path must not run.
+///
+/// The `sessions` four were never read by the catalog. The evidence four are
+/// prefixes of, or superseded by, the `_v2` page indexes: `(source,
+/// session_id)` is a strict prefix of the page index, and the original page
+/// indexes ordered on the bare `ts_ms` column, which cannot serve the
+/// canonical `ts_ms IS NULL, ts_ms, id` order. Because the schema guard
+/// compares index *names*, the corrected shape had to take a new name — a
+/// same-named old index would otherwise be read as current.
+const RETIRED_INDEXES: &[&str] = &[
     "idx_sessions_cwd",
     "idx_sessions_branch",
     "idx_sessions_last",
     "idx_sessions_source_last",
+    "idx_tool_calls_session",
+    "idx_file_edits_session",
+    "idx_tool_calls_page",
+    "idx_file_edits_page",
 ];
 
 const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
@@ -483,8 +496,9 @@ const REQUIRED_EVENT_READ_INDEXES: &[&str] =
     &["idx_session_events_source_page", "idx_session_events_page"];
 /// Indexes the session-scoped tool call and file edit pages depend on. Both
 /// pages always name one source and one session, so a single composite index
-/// per table carries the whole lookup.
-const REQUIRED_EVIDENCE_READ_INDEXES: &[&str] = &["idx_tool_calls_page", "idx_file_edits_page"];
+/// per table carries the whole lookup and its ordering.
+const REQUIRED_EVIDENCE_READ_INDEXES: &[&str] =
+    &["idx_tool_calls_page_v2", "idx_file_edits_page_v2"];
 const REQUIRED_SCOPE_READ_INDEXES: &[&str] = &["idx_session_presences_location"];
 const REQUIRED_TRIGGERS: &[&str] = &["delete_session_presences", "delete_session_hydration_state"];
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &["session_presences_local_backfill_v1"];
@@ -578,11 +592,11 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     Ok(true)
 }
 
-/// Whether any [`RETIRED_SESSIONS_INDEXES`] entry still exists.
+/// Whether any [`RETIRED_INDEXES`] entry still exists.
 fn retired_indexes_present(conn: &Connection) -> Result<bool> {
     let mut index =
         conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1")?;
-    for name in RETIRED_SESSIONS_INDEXES {
+    for name in RETIRED_INDEXES {
         if index.exists([name])? {
             return Ok(true);
         }
@@ -795,8 +809,8 @@ VALUES ('session_presences_local_backfill_v1');
         [],
     )?;
     // The write cost of the retired indexes showed up directly in
-    // cold-discovery profiles; see RETIRED_SESSIONS_INDEXES.
-    for name in RETIRED_SESSIONS_INDEXES {
+    // cold-discovery profiles; see RETIRED_INDEXES.
+    for name in RETIRED_INDEXES {
         conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])?;
     }
     // The catalog's total order is (last_activity_ms DESC, source, session_id):
@@ -850,24 +864,19 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_events_role ON session_events(role)",
         [],
     )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(source, session_id)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_file_edits_session ON file_edits(source, session_id)",
-        [],
-    )?;
     // Evidence pages always name one source and one session and continue on
-    // `(ts_ms, id)`. Both timestamps are nullable, so the index cannot also
-    // carry the "nulls last" half of the order; it still turns each page into
-    // a search over one session's rows instead of a scan of the table.
+    // `(ts_ms, id)` within the canonical `ts_ms IS NULL, ts_ms, id` order.
+    // Both timestamps are nullable, so the "nulls last" half of that order is
+    // carried by indexing the `ts_ms IS NULL` expression itself: an index over
+    // the bare column still leaves SQLite sorting every page in a temp b-tree.
+    // These also subsume the retired `(source, session_id)` indexes, which
+    // were strict prefixes of them.
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tool_calls_page ON tool_calls(source, session_id, ts_ms, id)",
+        "CREATE INDEX IF NOT EXISTS idx_tool_calls_page_v2 ON tool_calls(source, session_id, (ts_ms IS NULL), ts_ms, id)",
         [],
     )?;
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_file_edits_page ON file_edits(source, session_id, ts_ms, id)",
+        "CREATE INDEX IF NOT EXISTS idx_file_edits_page_v2 ON file_edits(source, session_id, (ts_ms IS NULL), ts_ms, id)",
         [],
     )?;
     conn.execute(
@@ -1586,33 +1595,42 @@ fn row_to_file_edit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionFileEdit
     })
 }
 
-/// Keyset continuation for the canonical
+/// One page's SQL and bound parameters, in the canonical
 /// `ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC` order.
 ///
 /// A dated cursor must still admit the whole undated tail, and an undated one
-/// must never walk back into the dated head, so the two cases are different
-/// predicates rather than one comparison over a coalesced timestamp.
-fn push_evidence_cursor(
-    sql: &mut String,
-    params: &mut Vec<rusqlite::types::Value>,
-    cursor: &SessionEvidenceCursor,
-) {
-    match cursor.ts_ms {
-        Some(ts_ms) => {
+/// must never walk back into the dated head, so the two continuation cases are
+/// different predicates rather than one comparison over a coalesced timestamp.
+///
+/// Both page readers and the query-plan test build their SQL here, so a plan
+/// assertion cannot pass against a restated copy while the real query drifts.
+fn evidence_page_query(
+    columns: &str,
+    table: &str,
+    source: &str,
+    session_id: &str,
+    limit: i64,
+    after: Option<&SessionEvidenceCursor>,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let mut sql = format!("SELECT {columns} FROM {table} WHERE source = ? AND session_id = ?");
+    let mut params: Vec<rusqlite::types::Value> =
+        vec![source.to_string().into(), session_id.to_string().into()];
+    match after.map(|cursor| (cursor.ts_ms, cursor.id)) {
+        Some((Some(ts_ms), id)) => {
             sql.push_str(" AND (ts_ms IS NULL OR ts_ms > ? OR (ts_ms = ? AND id > ?))");
             params.push(ts_ms.into());
             params.push(ts_ms.into());
-            params.push(cursor.id.into());
+            params.push(id.into());
         }
-        None => {
+        Some((None, id)) => {
             sql.push_str(" AND (ts_ms IS NULL AND id > ?)");
-            params.push(cursor.id.into());
+            params.push(id.into());
         }
+        None => {}
     }
-}
-
-fn evidence_next_cursor(ts_ms: Option<i64>, id: i64) -> SessionEvidenceCursor {
-    SessionEvidenceCursor { ts_ms, id }
+    sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC LIMIT ?");
+    params.push((limit + 1).into());
+    (sql, params)
 }
 
 /// One bounded page of recorded tool calls for one session, oldest first.
@@ -1628,26 +1646,28 @@ pub fn session_tool_calls_page(
     after: Option<&SessionEvidenceCursor>,
 ) -> Result<SessionToolCallPage> {
     let limit = limit.clamp(1, 1_000);
-    let mut sql =
-        format!("SELECT {TOOL_CALL_COLUMNS} FROM tool_calls WHERE source = ? AND session_id = ?");
-    let mut params_vec: Vec<rusqlite::types::Value> =
-        vec![source.to_string().into(), session_id.to_string().into()];
-    if let Some(cursor) = after {
-        push_evidence_cursor(&mut sql, &mut params_vec, cursor);
-    }
-    sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC LIMIT ?");
-    params_vec.push((limit + 1).into());
-
+    let (sql, params_vec) = evidence_page_query(
+        TOOL_CALL_COLUMNS,
+        "tool_calls",
+        source,
+        session_id,
+        limit,
+        after,
+    );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_tool_call)?;
     let mut tool_calls = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    // One extra row was requested, so `has_more` already implies a full page.
     let has_more = tool_calls.len() > limit as usize;
     if has_more {
         tool_calls.truncate(limit as usize);
     }
-    let next_cursor = (has_more && !tool_calls.is_empty()).then(|| {
+    let next_cursor = has_more.then(|| {
         let last = tool_calls.last().expect("non-empty page");
-        evidence_next_cursor(last.ts_ms, last.id)
+        SessionEvidenceCursor {
+            ts_ms: last.ts_ms,
+            id: last.id,
+        }
     });
     Ok(SessionToolCallPage {
         tool_calls,
@@ -1667,26 +1687,28 @@ pub fn session_file_edits_page(
     after: Option<&SessionEvidenceCursor>,
 ) -> Result<SessionFileEditPage> {
     let limit = limit.clamp(1, 1_000);
-    let mut sql =
-        format!("SELECT {FILE_EDIT_COLUMNS} FROM file_edits WHERE source = ? AND session_id = ?");
-    let mut params_vec: Vec<rusqlite::types::Value> =
-        vec![source.to_string().into(), session_id.to_string().into()];
-    if let Some(cursor) = after {
-        push_evidence_cursor(&mut sql, &mut params_vec, cursor);
-    }
-    sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC LIMIT ?");
-    params_vec.push((limit + 1).into());
-
+    let (sql, params_vec) = evidence_page_query(
+        FILE_EDIT_COLUMNS,
+        "file_edits",
+        source,
+        session_id,
+        limit,
+        after,
+    );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_file_edit)?;
     let mut file_edits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    // One extra row was requested, so `has_more` already implies a full page.
     let has_more = file_edits.len() > limit as usize;
     if has_more {
         file_edits.truncate(limit as usize);
     }
-    let next_cursor = (has_more && !file_edits.is_empty()).then(|| {
+    let next_cursor = has_more.then(|| {
         let last = file_edits.last().expect("non-empty page");
-        evidence_next_cursor(last.ts_ms, last.id)
+        SessionEvidenceCursor {
+            ts_ms: last.ts_ms,
+            id: last.id,
+        }
     });
     Ok(SessionFileEditPage {
         file_edits,
@@ -3006,7 +3028,7 @@ mod tests {
         init_db(&conn).unwrap();
         assert!(schema_is_evidence_read_current(&conn).unwrap());
 
-        conn.execute_batch("DROP INDEX idx_tool_calls_page; DROP INDEX idx_file_edits_page;")
+        conn.execute_batch("DROP INDEX idx_tool_calls_page_v2; DROP INDEX idx_file_edits_page_v2;")
             .unwrap();
         assert!(!schema_is_evidence_read_current(&conn).unwrap());
         assert!(!schema_is_current(&conn).unwrap());
@@ -3016,6 +3038,109 @@ mod tests {
         init_db(&conn).unwrap();
         assert!(schema_is_evidence_read_current(&conn).unwrap());
         assert!(schema_is_current(&conn).unwrap());
+    }
+
+    /// A database carrying the first shape of the page indexes -- the same
+    /// names over the bare `ts_ms` column -- must be upgraded, not mistaken
+    /// for current. The guard compares names, so the corrected shape took new
+    /// names and the originals joined the retirement list.
+    #[test]
+    fn the_superseded_evidence_indexes_are_dropped_and_replaced() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_tool_calls_page_v2;
+             DROP INDEX idx_file_edits_page_v2;
+             CREATE INDEX idx_tool_calls_page ON tool_calls(source, session_id, ts_ms, id);
+             CREATE INDEX idx_file_edits_page ON file_edits(source, session_id, ts_ms, id);
+             CREATE INDEX idx_tool_calls_session ON tool_calls(source, session_id);
+             CREATE INDEX idx_file_edits_session ON file_edits(source, session_id);",
+        )
+        .unwrap();
+        assert!(!schema_is_evidence_read_current(&conn).unwrap());
+        assert!(!schema_is_current(&conn).unwrap());
+
+        init_db(&conn).unwrap();
+        assert!(schema_is_evidence_read_current(&conn).unwrap());
+        assert!(schema_is_current(&conn).unwrap());
+        for retired in [
+            "idx_tool_calls_page",
+            "idx_file_edits_page",
+            "idx_tool_calls_session",
+            "idx_file_edits_session",
+        ] {
+            assert!(
+                RETIRED_INDEXES.contains(&retired),
+                "{retired} must be dropped from existing databases"
+            );
+            let present: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?)",
+                    [retired],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!present, "{retired} is still present after migration");
+        }
+    }
+
+    /// The evidence page promises an indexed, sort-free read. The plan is
+    /// taken from the same builder the readers run, so it cannot pass against
+    /// a restated copy of the query.
+    #[test]
+    fn evidence_pages_are_served_by_an_index_without_sorting() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_evidence(&conn);
+
+        let plan = |table: &str, columns: &str, after: Option<&SessionEvidenceCursor>| -> String {
+            let (sql, params) = evidence_page_query(columns, table, "claude", "s1", 10, after);
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            stmt.query_map(rusqlite::params_from_iter(params), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ")
+        };
+
+        for (table, columns, index) in [
+            ("tool_calls", TOOL_CALL_COLUMNS, "idx_tool_calls_page_v2"),
+            ("file_edits", FILE_EDIT_COLUMNS, "idx_file_edits_page_v2"),
+        ] {
+            let first = plan(table, columns, None);
+            assert!(
+                first.contains(index) && !first.contains("TEMP B-TREE"),
+                "the first {table} page must be index-ordered: {first}"
+            );
+            // The dated continuation is the plan that runs on every page after
+            // the first; its extra predicate must not cost the ordering.
+            let dated = plan(
+                table,
+                columns,
+                Some(&SessionEvidenceCursor {
+                    ts_ms: Some(100),
+                    id: 1,
+                }),
+            );
+            assert!(
+                dated.contains(index) && !dated.contains("TEMP B-TREE"),
+                "a dated {table} continuation must stay index-ordered: {dated}"
+            );
+            // A cursor already inside the undated tail pins `ts_ms IS NULL`,
+            // so SQLite orders that one narrow slice by id itself; the lookup
+            // is still a search on the same index rather than a table scan.
+            let undated = plan(
+                table,
+                columns,
+                Some(&SessionEvidenceCursor { ts_ms: None, id: 1 }),
+            );
+            assert!(
+                undated.contains(index) && !undated.contains("SCAN"),
+                "an undated {table} continuation must still be a search: {undated}"
+            );
+        }
     }
 
     #[test]

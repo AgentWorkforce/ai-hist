@@ -170,6 +170,20 @@ test('sessions tools and edits page versioned JSON and continue from a cursor', 
       cli, 'sessions', 'edits', 'claude', 'claude-evidence', '--db', db, '--no-warning',
     ], { env });
     assert.match(human.stdout, /\/work\/app\/a\.ts/);
+    // Human rows are positional: every column is printed, so an absent value
+    // never shifts the ones after it, and an uncounted line delta reads as `?`
+    // rather than a fabricated zero.
+    for (const line of human.stdout.trim().split('\n')) {
+      const columns = line.split('  ');
+      assert.equal(columns.length, 6, `edit row keeps six columns: ${line}`);
+      assert.match(columns[5], /^\+(\d+|\?)\/-(\d+|\?)$/);
+    }
+    const humanTools = await run(process.execPath, [
+      cli, 'sessions', 'tools', 'claude', 'claude-evidence', '--db', db, '--no-warning',
+    ], { env });
+    for (const line of humanTools.stdout.trim().split('\n')) {
+      assert.equal(line.split('  ').length, 6, `tool call row keeps six columns: ${line}`);
+    }
     const empty = await run(process.execPath, [
       cli, 'sessions', 'tools', 'claude', 'missing-session', '--db', db, '--no-warning',
     ], { env });
@@ -188,6 +202,23 @@ test('sessions tools and edits page versioned JSON and continue from a cursor', 
       (JSON.parse(continued.stdout).tool_calls as Array<Record<string, unknown>>).map((call) => call.tool_use_id),
       ['toolu_2'],
     );
+
+    // An undated cursor is spelled either way — `"tsMs": null` as the human
+    // hint and the JSON page print it, or no `tsMs` at all — and both reach
+    // the native boundary, which only accepts an absent one. On this dated
+    // session both name an empty undated tail instead of failing the command.
+    for (const after of [`{"tsMs":null,"id":${cursor.id as number}}`, '{"id":1}', '{"ts_ms":null,"id":1}']) {
+      const tail = await run(process.execPath, [
+        cli, 'sessions', 'tools', 'claude', 'claude-evidence', '--after', after,
+        '--db', db, '--json', '--no-warning',
+      ], { env });
+      assert.deepEqual((JSON.parse(tail.stdout) as Record<string, unknown>).tool_calls, []);
+      const tailEdits = await run(process.execPath, [
+        cli, 'sessions', 'edits', 'claude', 'claude-evidence', '--after', after,
+        '--db', db, '--no-warning',
+      ], { env });
+      assert.match(tailEdits.stdout, /No file edits\./);
+    }
 
     for (const args of [
       ['sessions', 'tools', 'claude'],

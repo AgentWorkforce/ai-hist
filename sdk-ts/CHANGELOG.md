@@ -32,8 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record may be indexed without a timestamp and undated records are ordered
   last. `args` and `structuredPatch` are parsed JSON; an absent or unparseable
   value is `null` and the raw string stays in `argsJson` /
-  `structuredPatchJson`. Pages carry session evidence contract 1, and this
-  advances the native-addon contract to 5.
+  `structuredPatchJson`; the same parse is exported as `parseStoredJson(raw)`
+  for callers holding a raw string of their own. A cursor going back in may
+  spell its undated tail either way — `tsMs: null` (what a page hands back) or
+  no `tsMs` at all (what a transport that drops nulls delivers) — so a printed
+  or serialized cursor always feeds back unedited. Pages carry session
+  evidence contract 1, and this advances the native-addon contract to 5.
 - Support remote acquisition through the engine's provider connectors:
   `discoverSessions`/`sync` with `scope: 'remote'` (and the remote half of
   `'all'`) run the claude.ai/code and Codex cloud connectors when the provider

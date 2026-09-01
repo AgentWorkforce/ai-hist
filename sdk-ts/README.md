@@ -81,10 +81,16 @@ Tool calls and file edits follow the same page / iterator / collect trio
 `...FileEdit...` equivalents), and take both a source and a session ID because
 provider session IDs are not unique across providers. Their cursor is
 `{ tsMs: number | null, id: number }`: a record may be indexed without a
-timestamp, and undated records are ordered last. Stored provider JSON is parsed
+timestamp, and undated records are ordered last. Feeding a cursor back in
+accepts either spelling of that tail — `tsMs: null` as emitted, or no `tsMs` at
+all after a transport that drops nulls — so a printed or JSON-serialized cursor
+returns unedited. Stored provider JSON is parsed
 into `args` and `structuredPatch`; a value that is absent or unparseable
 becomes `null` while the raw string stays available as `argsJson` and
 `structuredPatchJson`, so an unreadable payload never fails a page.
+`parseStoredJson(raw)` is that same parse, exported for callers that hold a raw
+stored string of their own: it returns the parsed value, or `null` for anything
+that is not a parseable string.
 
 Native loading failures distinguish unsupported platforms, missing optional
 platform packages, addon load failures, SDK/native contract mismatches, and

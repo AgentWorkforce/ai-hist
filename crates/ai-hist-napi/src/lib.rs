@@ -57,11 +57,23 @@ fn validate_limit(limit: Option<i64>, default: i64, max: i64) -> napi::Result<i6
 
 /// Session identity is two required strings; an empty one would silently widen
 /// a page to every row a provider ever recorded.
+///
+/// A padded value is rejected rather than trimmed, because the query is an
+/// exact match: trimming for the emptiness check alone would answer
+/// `" sess-1 "` with an empty page, and silently trimming would echo an
+/// identity the caller did not ask for. This boundary rejects every other
+/// invalid argument outright too.
 fn validate_identity(value: String, field: &str) -> napi::Result<String> {
     if value.trim().is_empty() {
         return Err(native_error(
             "INVALID_ARGUMENT",
             format!("{field} must not be empty"),
+        ));
+    }
+    if value.trim() != value {
+        return Err(native_error(
+            "INVALID_ARGUMENT",
+            format!("{field} must not be padded with whitespace"),
         ));
     }
     Ok(value)
@@ -342,8 +354,12 @@ impl From<CoreSessionFileEdit> for NativeSessionFileEdit {
     }
 }
 
-/// Continuation for tool call and file edit pages. `tsMs` is nullable because
+/// Continuation for tool call and file edit pages. `tsMs` is optional because
 /// both tables order their undated rows last.
+///
+/// Absent-or-`undefined` is how a caller says "inside the undated tail": an
+/// explicit JavaScript `null` cannot be converted to `i64` and fails at the
+/// boundary, so the SDK normalizes `null` to `undefined` before calling in.
 #[napi(object)]
 pub struct EvidenceCursor {
     pub ts_ms: Option<i64>,

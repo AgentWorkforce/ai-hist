@@ -258,6 +258,9 @@ function continuationNotice(cursor: EvidenceCursor | null): void {
   if (cursor) process.stdout.write(`more available: --after '${JSON.stringify(cursor)}'\n`);
 }
 
+// Human rows are positional, so every column is always printed: an absent
+// value is `-` rather than a dropped field that would shift the columns after
+// it, and an uncounted line delta is `?` rather than a fabricated 0.
 function outputToolCalls(page: SessionToolCallsPage, json: boolean): void {
   if (json) {
     output(page, true);
@@ -270,8 +273,8 @@ function outputToolCalls(page: SessionToolCallsPage, json: boolean): void {
   for (const call of page.toolCalls) {
     process.stdout.write([
       call.tsMs ?? '-', call.source, call.toolUseId, call.name,
-      call.target ?? '', call.isError === true ? '(error)' : '',
-    ].filter((item) => item !== '').join('  ').concat('\n'));
+      call.target ?? '-', call.isError === true ? '(error)' : '-',
+    ].join('  ').concat('\n'));
   }
   continuationNotice(page.nextCursor);
 }
@@ -287,9 +290,9 @@ function outputFileEdits(page: SessionFileEditsPage, json: boolean): void {
   }
   for (const edit of page.fileEdits) {
     process.stdout.write([
-      edit.tsMs ?? '-', edit.source, edit.toolUseId, edit.toolName ?? '', edit.filePath,
-      `+${edit.linesAdded ?? 0}/-${edit.linesRemoved ?? 0}`,
-    ].filter((item) => item !== '').join('  ').concat('\n'));
+      edit.tsMs ?? '-', edit.source, edit.toolUseId, edit.toolName ?? '-', edit.filePath,
+      `+${edit.linesAdded ?? '?'}/-${edit.linesRemoved ?? '?'}`,
+    ].join('  ').concat('\n'));
   }
   continuationNotice(page.nextCursor);
 }
