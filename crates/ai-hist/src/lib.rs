@@ -30,15 +30,18 @@ mod codex;
 pub mod discover;
 mod hydrate;
 mod learn;
+/// Remote session connectors (claude.ai/code web sessions, Codex cloud tasks)
+/// and their availability reporting.
+pub mod remote;
 
 pub use discover::{
-    discover_sessions, discover_sessions_collect, discover_sessions_with_env, list_session_catalog,
-    list_session_catalog_page, shallow_providers, validate_discovery_scope, AllProvidersFailed,
-    Candidate, CatalogCursor, CatalogListOptions, DiscoverOptions, DiscoveryCounters,
-    DiscoveryDiagnostic, DiscoveryEnv, DiscoverySummary, ProviderSummary, ScanEnv,
-    SessionCatalogPage, ShallowReadAccess, ShallowSession, ShallowSessionProvider, SourceExemption,
-    DEFAULT_CATALOG_LIMIT, DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION,
-    SHALLOW_SCANNER_VERSION,
+    discover_sessions, discover_sessions_collect, discover_sessions_with_env,
+    discover_sessions_with_providers, list_session_catalog, list_session_catalog_page,
+    shallow_providers, validate_discovery_scope, AllProvidersFailed, Candidate, CatalogCursor,
+    CatalogListOptions, DiscoverOptions, DiscoveryCounters, DiscoveryDiagnostic, DiscoveryEnv,
+    DiscoverySummary, ProviderSummary, ScanEnv, SessionCatalogPage, ShallowReadAccess,
+    ShallowSession, ShallowSessionProvider, SourceExemption, DEFAULT_CATALOG_LIMIT,
+    DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION, SHALLOW_SCANNER_VERSION,
 };
 pub use hydrate::{
     hydrate_session, hydrate_session_at, HydrateSessionOptions, HydrateSessionResult,
@@ -97,9 +100,13 @@ pub fn sync_scoped(scope: SessionScope) -> Result<bool> {
 
 /// Full ingestion for a selected session-presence scope.
 ///
-/// Remote provider connectors are intentionally a capability boundary. Until
-/// one is configured, remote-only ingestion fails loudly; `all` runs every
-/// available connector, which currently means the local registry.
+/// Remote provider connectors are intentionally a capability boundary: a
+/// `remote` request fails loudly unless at least one connector (claude.ai/code
+/// web sessions, Codex cloud tasks — see [`remote`]) is configured on this
+/// machine, and `all` runs local ingestion plus every configured connector.
+/// Remote connectors acquire catalog rows and `remote` presences; remote rows
+/// stay `shallow` because neither provider serves full transcripts through a
+/// supported listing interface yet.
 pub fn sync_scoped_at(db_path: &Path, scope: SessionScope) -> Result<bool> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
     sync_scope_exclusive(db_path, scope)
@@ -107,15 +114,64 @@ pub fn sync_scoped_at(db_path: &Path, scope: SessionScope) -> Result<bool> {
 
 fn sync_scope_exclusive(db_path: &Path, scope: SessionScope) -> Result<bool> {
     validate_sync_scope(scope)?;
-    sync_exclusive(db_path)
+    let mut ran = false;
+    if matches!(scope, SessionScope::Local | SessionScope::All) {
+        ran |= sync_exclusive(db_path)?;
+    }
+    if matches!(scope, SessionScope::Remote | SessionScope::All) {
+        ran |= sync_remote_connectors(db_path, scope)?;
+    }
+    Ok(ran)
 }
 
 fn validate_sync_scope(scope: SessionScope) -> Result<()> {
-    anyhow::ensure!(
-        scope != SessionScope::Remote,
-        "remote session sync is not available: no remote provider connectors are configured"
-    );
+    if scope == SessionScope::Remote {
+        remote::ensure_remote_connectors_configured("sync")?;
+    }
     Ok(())
+}
+
+/// Run every configured remote connector's acquisition into the ledger.
+///
+/// This is the discovery engine at remote scope with no row cap: stamp-guarded
+/// catalog upserts plus `remote` presences, so it deliberately does not take
+/// the sync advisory lock (the same concurrency argument as [`discover`]).
+/// Under `all` scope a machine with no connector configured skips quietly —
+/// that is the documented "runs whatever is available" contract; a remote-only
+/// request was already rejected by [`validate_sync_scope`] before this point.
+fn sync_remote_connectors(db_path: &Path, scope: SessionScope) -> Result<bool> {
+    let statuses = remote::remote_connector_statuses();
+    if !statuses.iter().any(|status| status.configured) {
+        if scope == SessionScope::All {
+            sync_note!("  [remote] no remote provider connectors configured; skipped");
+            return Ok(false);
+        }
+        remote::ensure_remote_connectors_configured("sync")?;
+    }
+    let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
+    let options = DiscoverOptions {
+        scope: SessionScope::Remote,
+        sources: Vec::new(),
+        limit: None,
+    };
+    let summary = discover_sessions(&conn, &options, |_| {})?;
+    for (source, provider) in &summary.providers {
+        sync_note!(
+            "  [remote:{source}] {} session(s): {} discovered, {} unchanged",
+            provider.candidates,
+            provider.discovered,
+            provider.skipped_unchanged
+        );
+    }
+    for diagnostic in &summary.diagnostics {
+        sync_note!(
+            "  [remote:{}] {}: {}",
+            diagnostic.source,
+            diagnostic.locator.as_deref().unwrap_or("(connector)"),
+            diagnostic.error
+        );
+    }
+    Ok(true)
 }
 
 /// Sync local agent history into the DB, then push new records to
@@ -681,9 +737,10 @@ enum SessionsAction {
     /// Enumerates every provider, orders candidates globally by recency, reads
     /// only what the catalog needs, and upserts rows as it goes. Sources whose
     /// bytes have not changed since the last run are served from the catalog.
-    /// The summary `scope` echoes the request; it is not a list of connector
-    /// locations that ran. Remote connectors are not configured yet, so
-    /// `--remote` is unsupported and `--all` currently runs local adapters.
+    /// The summary `scope` echoes the request; `locations_run` reports the
+    /// connector locations that executed. `--remote` requires at least one
+    /// configured remote connector (see docs/remote-connectors.md); `--all`
+    /// runs local adapters plus every configured connector.
     Discover {
         #[command(flatten)]
         scope: SessionScopeArgs,
@@ -1681,8 +1738,12 @@ fn run_session_discovery(
         }
         println!("{payload}");
     } else {
+        let locations_run = match summary.locations_run.is_empty() {
+            true => "none".to_string(),
+            false => summary.locations_run.join(", "),
+        };
         println!(
-            "  {count} session(s): {} discovered, {} unchanged ({} file(s) opened, {} shallow read(s)); requested scope: {}, connector locations run: local",
+            "  {count} session(s): {} discovered, {} unchanged ({} file(s) opened, {} shallow read(s)); requested scope: {}, connector locations run: {locations_run}",
             summary.discovered,
             summary.skipped_unchanged,
             summary.counters.files_opened,

@@ -39,12 +39,14 @@ Collection APIs, including statistics, now use a shared `scope` option: `'local'
 exclusive `--local`, `--remote`, and `--all` flags. Local and remote rows live
 in one ledger and represent presences of the same session, so `all` is
 deduplicated. Direct session and event lookup does not take a scope. Remote
-discovery and sync remain unsupported until provider connectors ship; `all`
-acquisition runs all currently configured adapters.
+discovery and sync run through provider connectors
+([Remote connectors](remote-connectors.md)) and fail explicitly on a machine
+where none is configured; `all` acquisition runs all currently configured
+adapters.
 
-The acquisition result's `scope` echoes what was requested. It is not an
-"executed connector locations" list: `all` currently executes local adapters
-only. Use each returned session's `locations` for observed presences. Search,
+The acquisition result's `scope` echoes what was requested; the separate
+`locationsRun` list reports the connector locations that actually executed.
+Use each returned session's `locations` for observed presences. Search,
 recent, and direct-session history rows also carry `locations`;
 `resumeCommand()` returns `null` when those locations are remote-only.
 

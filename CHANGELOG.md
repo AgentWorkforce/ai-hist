@@ -24,6 +24,25 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Added
 
+- Add remote provider connectors behind the existing `--remote` / `--all`
+  acquisition scopes: `claude-web` lists claude.ai/code web sessions with the
+  OAuth sign-in the Claude Code CLI stored (`~/.claude/.credentials.json`,
+  overridable with `RELAYHISTORY_CLAUDE_CREDENTIALS`; the endpoint moves only
+  via the connector-specific `RELAYHISTORY_CLAUDE_API_BASE_URL`, guarded to
+  https-or-loopback, never via the generic `ANTHROPIC_BASE_URL`), and
+  `codex-cloud` lists Codex cloud tasks through `codex cloud list --json`,
+  paging with `--cursor` inside the CLI's 1–20 `--limit` window
+  (`~/.codex/auth.json` marks it configured). Connector rows land in the
+  shared ledger as shallow catalog rows with a `remote` presence, participate
+  in stamp-guarded rescans, and dedupe against local presences of the same
+  session. `sessions discover --remote`, `sync --remote`, and the remote half
+  of `--all` now execute configured connectors; a remote-only request on a
+  machine with no connector configured keeps failing with the established
+  `no remote provider connectors are configured` error, now naming each
+  connector's reason. Discovery summaries gain `locations_run`, the connector
+  locations that actually executed (the native-addon contract is now 4), and
+  the human summary line reports it in place of the hardcoded `local`. See
+  `docs/remote-connectors.md`.
 - Add transactional targeted session hydration through Rust, N-API, the typed
   `hydrateSession()` SDK API, `ai-hist sessions hydrate`, and MCP
   `hydrate_session`. The result reports indexed-through state, evidence counts,
@@ -41,11 +60,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   filter one cached session ledger; `all`
   deduplicates sessions that have both local and remote presences. Direct
   session/event lookup remains scope-independent. Remote discovery and sync
-  are reserved and report unsupported until provider connectors ship; `all`
-  acquisition runs all configured adapters, which currently means local.
-  Discovery summary `scope` is the requested acquisition scope, while each
-  history/catalog row's `locations` contains observed presences; it is not a claim that a
-  connector ran at every requested location.
+  run through the provider connectors introduced above and fail explicitly on
+  a machine where none is configured; `all` acquisition runs local adapters
+  plus every configured connector. Discovery summary `scope` is the requested
+  acquisition scope and `locations_run` names the connector locations that
+  executed, while each history/catalog row's `locations` contains observed
+  presences.
 - Add native search, recent, session, paged events, statistics, discovery,
   catalog listing, and explicit sync operations. The native-addon contract is
   now version 4.

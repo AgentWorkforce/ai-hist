@@ -146,6 +146,10 @@ export interface DiscoverSessionsOptions {
 export interface DiscoverResult {
   contractVersion: number;
   scope: SessionScope;
+  /** Connector locations that actually executed. `scope` records the ask;
+   * this records what ran — an `all` request executes remote connectors only
+   * where one is configured on this machine. */
+  locationsRun: SessionLocation[];
   sessions: CatalogSession[];
   discovered: number;
   skippedUnchanged: number;
@@ -428,6 +432,14 @@ function catalogSession(value: UnknownRecord): CatalogSession {
   };
 }
 
+export function validateNativeLocation(value: unknown): SessionLocation {
+  if (value === 'local' || value === 'remote') return value;
+  throw new NativeContractMismatchError(
+    `ai-hist-native returned an invalid session location: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
+    'NATIVE_CONTRACT_MISMATCH',
+  );
+}
+
 export function validateNativeScope(value: unknown): SessionScope {
   if (value === 'local' || value === 'remote' || value === 'all') return value;
   throw new NativeContractMismatchError(
@@ -524,6 +536,9 @@ export async function discoverSessions(options: DiscoverSessionsOptions = {}): P
     return {
       contractVersion,
       scope: validateNativeScope(result.scope),
+      locationsRun: Array.isArray(result.locationsRun)
+        ? (result.locationsRun as unknown[]).map(validateNativeLocation)
+        : [],
       sessions: Array.isArray(result.sessions) ? (result.sessions as UnknownRecord[]).map(catalogSession) : [],
       discovered: Number(result.discovered),
       skippedUnchanged: Number(result.skippedUnchanged),

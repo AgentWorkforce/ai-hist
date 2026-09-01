@@ -336,7 +336,15 @@ pub enum ShallowReadAccess {
 pub trait ShallowSessionProvider: Sync {
     /// The `SOURCE_CHOICES` name this adapter covers.
     fn source(&self) -> &'static str;
-    /// Cheap enumeration: directory walk + stat, or one indexed query.
+    /// Where this adapter's evidence lives. Local file-backed adapters keep
+    /// the default; remote connectors (see [`crate::remote`]) override it, and
+    /// the engine records their presences and stamps under that location.
+    fn location(&self) -> SessionLocation {
+        SessionLocation::Local
+    }
+    /// Cheap enumeration: directory walk + stat, or one indexed query. For a
+    /// remote connector the bounded service listing *is* the enumeration —
+    /// there is no cheaper way to learn what exists.
     fn enumerate(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>>;
     /// What [`read_shallow`](ShallowSessionProvider::read_shallow) touches.
     fn read_access(&self) -> ShallowReadAccess {
@@ -527,7 +535,7 @@ fn read_bounded_jsonl(scan: &ScanEnv<'_>, path: &Path) -> Result<BoundedJsonl> {
     Ok(BoundedJsonl { head, tail })
 }
 
-fn excerpt(text: &str) -> String {
+pub(crate) fn excerpt(text: &str) -> String {
     text.trim().chars().take(EXCERPT_MAX_CHARS).collect()
 }
 
@@ -1943,7 +1951,9 @@ pub struct ProviderSummary {
     pub discovered: usize,
     /// Rows served from the catalog because the stamp was unchanged.
     pub skipped_unchanged: usize,
-    /// `true` when enumeration itself failed.
+    /// `true` when enumeration failed for at least one of this source's
+    /// adapters (under `all` scope a source can have a local adapter and a
+    /// remote connector; each failure also leaves its own diagnostic).
     pub failed: bool,
 }
 
@@ -1954,6 +1964,12 @@ pub struct DiscoverySummary {
     pub contract_version: u32,
     /// Scope selected for this discovery run.
     pub scope: SessionScope,
+    /// Connector locations that executed (`"local"`, `"remote"`). The
+    /// requested `scope` records the ask; this records what ran — an `all`
+    /// request executes remote connectors only where one is configured. A
+    /// location whose adapters all failed still executed; the failures are in
+    /// `diagnostics`, and per-provider `failed` flags say which.
+    pub locations_run: Vec<String>,
     /// Rows freshly read and upserted.
     pub discovered: usize,
     /// Rows served from the catalog on an unchanged stamp.
@@ -1980,13 +1996,16 @@ pub struct AllProvidersFailed {
 
 impl std::fmt::Display for AllProvidersFailed {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Adapter-level failures each leave one diagnostic with no locator;
+        // `providers` is keyed by source, which under `all` scope can merge a
+        // local adapter and a remote connector into one entry.
         write!(
             formatter,
             "all {} session provider(s) failed; no provider made progress",
             self.summary
-                .providers
-                .values()
-                .filter(|provider| provider.failed)
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.locator.is_none())
                 .count()
         )
     }
@@ -2001,18 +2020,20 @@ fn stored_stamp(raw: &str) -> String {
 /// Reject an acquisition scope for which no connector is configured.
 ///
 /// Call this before opening the ledger so an unsupported remote-only request
-/// has no database side effects.
+/// has no database side effects. `remote` requires at least one configured
+/// remote connector (see [`crate::remote`]); `all` runs whatever is available
+/// and is never rejected here.
 pub fn validate_discovery_scope(scope: SessionScope) -> Result<()> {
     if scope == SessionScope::Remote {
-        anyhow::bail!(
-            "remote session discovery is not available: no remote provider connectors are configured"
-        );
+        crate::remote::ensure_remote_connectors_configured("discovery")?;
     }
     Ok(())
 }
 
-fn select_providers(options: &DiscoverOptions) -> Result<Vec<Box<dyn ShallowSessionProvider>>> {
-    validate_discovery_scope(options.scope)?;
+fn select_providers(
+    options: &DiscoverOptions,
+    home: &Path,
+) -> Result<Vec<Box<dyn ShallowSessionProvider>>> {
     for source in &options.sources {
         if let Some(exempt) = DISCOVERY_EXEMPTIONS
             .iter()
@@ -2030,7 +2051,27 @@ fn select_providers(options: &DiscoverOptions) -> Result<Vec<Box<dyn ShallowSess
             SOURCE_CHOICES.join(", ")
         );
     }
-    let mut providers = shallow_providers();
+    // Same loud refusal `validate_discovery_scope` gives before the ledger
+    // opens, re-checked here for callers that skip it — and source-aware: a
+    // filter that leaves a remote-only request with nothing configured is
+    // the same unsupported request, scoped down.
+    if options.scope == SessionScope::Remote {
+        crate::remote::ensure_remote_connectors_configured_for_at(
+            "discovery",
+            home,
+            &options.sources,
+        )?;
+    }
+    let mut providers: Vec<Box<dyn ShallowSessionProvider>> = Vec::new();
+    if matches!(options.scope, SessionScope::Local | SessionScope::All) {
+        providers.extend(shallow_providers());
+    }
+    if matches!(options.scope, SessionScope::Remote | SessionScope::All) {
+        providers.extend(crate::remote::configured_remote_providers(
+            home,
+            options.limit,
+        ));
+    }
     if !options.sources.is_empty() {
         providers.retain(|provider| options.sources.iter().any(|s| s == provider.source()));
     }
@@ -2062,29 +2103,58 @@ pub fn discover_sessions(
 pub fn discover_sessions_with_env(
     env: &DiscoveryEnv<'_>,
     options: &DiscoverOptions,
+    on_row: impl FnMut(&ShallowSession),
+) -> Result<DiscoverySummary> {
+    let providers = select_providers(options, &env.home)?;
+    discover_sessions_with_providers(env, options, &providers, on_row)
+}
+
+/// [`discover_sessions_with_env`] over an explicit adapter set.
+///
+/// The engine treats each adapter's [`location`](ShallowSessionProvider::location)
+/// as authoritative: presences, per-location stamps, and skip classification
+/// all use it, so a local file adapter and a remote connector for the same
+/// source coexist in one run without fighting over each other's stamps.
+pub fn discover_sessions_with_providers(
+    env: &DiscoveryEnv<'_>,
+    options: &DiscoverOptions,
+    providers: &[Box<dyn ShallowSessionProvider>],
     mut on_row: impl FnMut(&ShallowSession),
 ) -> Result<DiscoverySummary> {
     let conn = env.conn();
-    let providers = select_providers(options)?;
     let mut summary = DiscoverySummary {
         contract_version: SESSION_CATALOG_CONTRACT_VERSION,
         scope: options.scope,
         exempt_sources: DISCOVERY_EXEMPTIONS.to_vec(),
         ..Default::default()
     };
+    {
+        let mut locations_run: BTreeSet<&'static str> = BTreeSet::new();
+        for provider in providers {
+            locations_run.insert(match provider.location() {
+                SessionLocation::Local => "local",
+                SessionLocation::Remote => "remote",
+            });
+        }
+        summary.locations_run = locations_run.into_iter().map(str::to_string).collect();
+    }
 
-    let mut candidates: Vec<Candidate> = Vec::new();
+    // Candidates keep the index of the adapter that produced them: with `all`
+    // scope one source can be served by a local adapter and a remote
+    // connector at once, so the source name alone no longer identifies the
+    // adapter (or the location) a candidate belongs to.
+    let mut candidates: Vec<(usize, Candidate)> = Vec::new();
     let mut failed_providers = 0usize;
-    for provider in &providers {
+    for (provider_index, provider) in providers.iter().enumerate() {
         let entry = summary
             .providers
             .entry(provider.source().to_string())
             .or_default();
         match provider.enumerate(env) {
             Ok(found) => {
-                entry.candidates = found.len();
+                entry.candidates += found.len();
                 env.note_candidates(found.len() as u64);
-                candidates.extend(found);
+                candidates.extend(found.into_iter().map(|found| (provider_index, found)));
             }
             Err(error) => {
                 entry.failed = true;
@@ -2108,16 +2178,12 @@ pub fn discover_sessions_with_env(
 
     // Global recency ordering. Candidates with no recency signal sort last;
     // ties break on (source, locator) so a run is reproducible.
-    candidates.sort_by(|a, b| {
+    candidates.sort_by(|(_, a), (_, b)| {
         b.recency_hint_ms
             .cmp(&a.recency_hint_ms)
             .then_with(|| a.source.cmp(b.source))
             .then_with(|| a.locator.cmp(&b.locator))
     });
-    let by_source: BTreeMap<&str, &dyn ShallowSessionProvider> = providers
-        .iter()
-        .map(|provider| (provider.source(), provider.as_ref()))
-        .collect();
 
     // The limit counts *emitted sessions*, not candidates. Truncating the
     // candidate list up front let a codex subagent thread or a claude sidecar
@@ -2143,18 +2209,16 @@ pub fn discover_sessions_with_env(
         let mut entries: Vec<WindowEntry<'_>> = Vec::new();
         let mut potential = 0usize;
         while position < candidates.len() && potential < window_cap {
-            let candidate = &candidates[position];
+            let (provider_index, candidate) = &candidates[position];
             position += 1;
-            let Some(provider) = by_source.get(candidate.source) else {
-                continue;
-            };
+            let provider = providers[*provider_index].as_ref();
             let expected = stored_stamp(&candidate.stamp);
             let cached = match candidate.session_id.as_deref() {
                 Some(session_id) => fetch_catalog_row_at_location(
                     conn,
                     candidate.source,
                     session_id,
-                    SessionLocation::Local,
+                    provider.location(),
                 )?,
                 None => fetch_catalog_row_by_path(conn, candidate.source, &candidate.locator)?,
             };
@@ -2185,7 +2249,7 @@ pub fn discover_sessions_with_env(
             potential += 1;
             entries.push(WindowEntry::Read {
                 candidate,
-                provider: *provider,
+                provider,
                 expected,
                 result: None,
             });
@@ -2262,16 +2326,27 @@ pub fn discover_sessions_with_env(
             conn.execute_batch("BEGIN IMMEDIATE")?;
         }
         let mut window_error: Option<anyhow::Error> = None;
-        let mut window_rows = Vec::new();
-        let mut window_sessions = BTreeSet::new();
+        let mut window_rows: Vec<ShallowSession> = Vec::new();
+        // Key -> index into `window_rows`. Under `all` scope one window can
+        // reach the same session through a local adapter and a remote
+        // connector; the later upsert returns the fuller merged row (both
+        // presences), which must replace the earlier one rather than be
+        // dropped, so the emitted row matches what the catalog committed.
+        let mut window_sessions: BTreeMap<(String, String), usize> = BTreeMap::new();
         let mut window_discovered = 0usize;
         let mut window_discovered_by_source: BTreeMap<String, usize> = BTreeMap::new();
         'apply: for entry in entries {
             let (candidate, provider, expected, result) = match entry {
                 WindowEntry::Cached(row) => {
                     let key = (row.source.clone(), row.session_id.clone());
-                    if !emitted_sessions.contains(&key) && window_sessions.insert(key) {
-                        window_rows.push(row);
+                    if !emitted_sessions.contains(&key) {
+                        match window_sessions.get(&key) {
+                            Some(&index) => window_rows[index] = row,
+                            None => {
+                                window_sessions.insert(key, window_rows.len());
+                                window_rows.push(row);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -2322,7 +2397,8 @@ pub fn discover_sessions_with_env(
             // The upsert's RETURNING clause hands back the merged catalog row,
             // so what a caller sees is exactly what the catalog now holds
             // (including a preserved `full` state).
-            let row = match upsert_shallow_session(conn, &session) {
+            let row = match upsert_shallow_session_at_location(conn, &session, provider.location())
+            {
                 Ok(row) => row,
                 Err(error) => {
                     summary.diagnostics.push(DiscoveryDiagnostic {
@@ -2344,8 +2420,14 @@ pub fn discover_sessions_with_env(
                 .entry(candidate.source.to_string())
                 .or_default() += 1;
             let key = (row.source.clone(), row.session_id.clone());
-            if !emitted_sessions.contains(&key) && window_sessions.insert(key) {
-                window_rows.push(row);
+            if !emitted_sessions.contains(&key) {
+                match window_sessions.get(&key) {
+                    Some(&index) => window_rows[index] = row,
+                    None => {
+                        window_sessions.insert(key, window_rows.len());
+                        window_rows.push(row);
+                    }
+                }
             }
         }
         if has_writes {

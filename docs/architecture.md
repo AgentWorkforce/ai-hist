@@ -42,15 +42,17 @@ Scope changes selection, not I/O. Cached collection reads (`sessions list`,
 `search`, and `recent`) stay database-only for every scope. Direct session and
 event lookup already names one session and remains scope-independent.
 
-Acquisition is still explicit. Local discovery and sync are implemented.
-Explicit remote discovery/sync returns an unsupported operation until provider
-connectors ship; the engine must not silently fall back to local work. `all`
-acquisition runs all configured adapters, which currently means the local
-adapters and will include remote adapters when they become available.
-An acquisition result's `scope` records the request, not the set of connector
-locations that executed. Observed locations belong to each session row's
-`locations`; `all` therefore remains the result scope even while only local
-adapters are configured.
+Acquisition is still explicit. Local discovery and sync scan provider files;
+remote discovery and sync run provider connectors (`claude-web` for
+claude.ai/code web sessions, `codex-cloud` for Codex cloud tasks — see
+[Remote connectors](remote-connectors.md)). A connector participates only when
+the provider CLI's stored sign-in is present on the machine. Explicit `remote`
+acquisition with no connector configured returns an unsupported operation; the
+engine must not silently fall back to local work. `all` acquisition runs the
+local adapters plus every configured connector. An acquisition result's
+`scope` records the request; its `locations_run` records which connector
+locations actually executed, and observed presences belong to each session
+row's `locations`.
 
 ## Operation semantics
 
@@ -58,16 +60,16 @@ adapters are configured.
 |---|---:|---|---|
 | `listSessionCatalog*` (`local` / `remote` / `all`) | none | one indexed cache query | empty page |
 | `discoverSessions` (`local`, default) | bounded shallow reads | catalog upserts | creates catalog DB |
-| `discoverSessions` (`remote`) | unsupported until connectors ship | none | unsupported operation |
-| `discoverSessions` (`all`) | all configured adapters (currently local) | catalog upserts | creates catalog DB |
+| `discoverSessions` (`remote`) | configured remote connectors (error when none) | catalog upserts + presences | creates catalog DB |
+| `discoverSessions` (`all`) | local adapters + configured remote connectors | catalog upserts + presences | creates catalog DB |
 | `hydrateSession` | one selected provider session and linked evidence | transactional evidence + checkpoint upsert | `SESSION_NOT_FOUND` |
 | `search`, `recent` (`local` / `remote` / `all`) | none | indexed reads | empty result |
 | `stats` (`local` / `remote` / `all`) | none | indexed aggregate reads | empty result |
 | `getSession` | none | indexed identity read | empty result |
 | `getSessionEventsPage` | none | bounded keyset page | empty page |
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
-| `sync` (`remote`) | unsupported until connectors ship | none | unsupported operation |
-| `sync` (`all`) | all configured adapters (currently local) | migrations + ingestion | creates DB |
+| `sync` (`remote`) | configured remote connectors (error when none) | catalog upserts + presences | creates DB |
+| `sync` (`all`) | full local scan + configured remote connectors | migrations + ingestion | creates DB |
 
 No read operation invokes discovery or sync. A common cold start is:
 

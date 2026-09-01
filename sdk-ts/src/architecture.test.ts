@@ -28,9 +28,10 @@ test('CLI and MCP import only the public SDK for history operations', async () =
   assert.doesNotMatch(cli + mcp, /ai-hist-native|node:sqlite|sql\.js|child_process/);
 });
 
-test('MCP session operations expose scope and current local writes are closed-world', async () => {
+test('MCP session operations expose scope and acquisition is declared open-world', async () => {
   const mcp = await readFile(join(sourceDir, 'mcp-server.ts'), 'utf8');
   assert.match(mcp, /const SESSION_SCOPE = z\.enum\(\['local', 'remote', 'all'\]\)/);
+  assert.match(mcp, /const ACQUIRE = \{ readOnlyHint: false, idempotentHint: true, openWorldHint: true \}/);
   assert.match(mcp, /const LOCAL_WRITE = \{ readOnlyHint: false, idempotentHint: true, openWorldHint: false \}/);
   for (const tool of ['search_history', 'recent_history', 'list_sessions', 'discover_sessions', 'hydrate_session', 'history_stats', 'sync']) {
     const start = mcp.indexOf(`server.tool('${tool}'`);
@@ -39,9 +40,14 @@ test('MCP session operations expose scope and current local writes are closed-wo
     const registration = mcp.slice(start, end === -1 ? undefined : end);
     assert.match(registration, /scope: SESSION_SCOPE\.optional\(\)\.default\('local'\)/, `${tool} defaults scope to local`);
   }
-  for (const tool of ['discover_sessions', 'hydrate_session', 'sync']) {
+  for (const tool of ['discover_sessions', 'sync']) {
     const start = mcp.indexOf(`server.tool('${tool}'`);
     const end = mcp.indexOf("server.tool('", start + 13);
-    assert.match(mcp.slice(start, end === -1 ? undefined : end), /LOCAL_WRITE/, `${tool} is currently local-only`);
+    assert.match(mcp.slice(start, end === -1 ? undefined : end), /ACQUIRE/, `${tool} may reach remote provider connectors`);
+  }
+  {
+    const start = mcp.indexOf("server.tool('hydrate_session'");
+    const end = mcp.indexOf("server.tool('", start + 13);
+    assert.match(mcp.slice(start, end === -1 ? undefined : end), /LOCAL_WRITE/, 'hydrate_session indexes local provider evidence, closed-world');
   }
 });

@@ -22,7 +22,9 @@ These are intentionally different:
 - `sessions list` is cache-only and never reads provider files.
 - `sessions discover` performs bounded shallow reads and refreshes catalog
   metadata.
-- `sync` performs full ingestion for search and event history.
+- `sync` performs full ingestion for search and event history from local
+  provider files; at remote scope it refreshes shallow connector rows and
+  `remote` presences instead (remote listings carry no transcripts).
 
 They use one session ledger. Local and remote describe where a session was
 observed (its presence), not separate kinds of session or separate databases.
@@ -51,12 +53,15 @@ Reads do not trigger hidden provider work. `session` and `events` address an
 already-known session directly, so they are scope-independent and do not
 accept a location flag.
 
-Remote provider connectors are not shipped yet. Until they are, remote
-discovery and ingestion are explicit unsupported operations: `sessions
-discover --remote` and `sync --remote` fail instead of falling back to local
-work. `--all` runs all configured adapters, so today it performs local
-acquisition; it will include remote adapters once they ship. Cached remote/all
-queries are already part of the stable contract.
+Remote acquisition runs through provider connectors: `claude-web` lists your
+claude.ai/code web sessions with the OAuth sign-in the Claude Code CLI stored,
+and `codex-cloud` lists Codex cloud tasks through `codex cloud list --json`.
+A connector is configured when the provider CLI is signed in on this machine;
+see [Remote connectors](remote-connectors.md) for detection, credentials, and
+fidelity. With no connector configured, `sessions discover --remote` and
+`sync --remote` fail explicitly instead of falling back to local work, while
+`--all` runs local adapters plus whatever connectors are configured. Cached
+remote/all queries are part of the stable contract either way.
 
 Discovery results keep those two facts separate: the summary `scope` is the
 scope requested by the caller, while row `locations` are the presences actually

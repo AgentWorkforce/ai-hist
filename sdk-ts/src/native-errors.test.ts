@@ -6,7 +6,7 @@ import test from 'node:test';
 import {
   DatabaseOpenError, NativeContractMismatchError, SessionNotFoundError, UnsupportedOperationError,
   discoverSessions, hydrateSession, listSessionCatalogPage, recent, stats, sync,
-  validateNativeContract, validateNativeScope,
+  validateNativeContract, validateNativeLocation, validateNativeScope,
 } from './index.js';
 
 test('missing database reads are explicit empty cache operations', async () => {
@@ -52,11 +52,23 @@ test('SDK/native contract mismatch is actionable', () => {
       && error.code === 'NATIVE_CONTRACT_MISMATCH'
       && /invalid session scope/.test(error.message),
   );
+  assert.equal(validateNativeLocation('remote'), 'remote');
+  assert.throws(
+    () => validateNativeLocation('cloud'),
+    (error: unknown) => error instanceof NativeContractMismatchError
+      && error.code === 'NATIVE_CONTRACT_MISMATCH'
+      && /invalid session location/.test(error.message),
+  );
 });
 
-test('unsupported remote acquisition has one stable SDK error', async () => {
+test('unconfigured remote acquisition has one stable SDK error', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-unsupported-remote-'));
   const dbPath = join(root, 'history.db');
+  // Connector detection reads the provider CLIs' stored sign-ins under HOME,
+  // so point it at an empty home rather than the machine running the tests.
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  process.env.HOME = root;
+  process.env.USERPROFILE = root;
   try {
     for (const operation of [
       () => discoverSessions({ dbPath, scope: 'remote' }),
@@ -70,6 +82,8 @@ test('unsupported remote acquisition has one stable SDK error', async () => {
       );
     }
   } finally {
+    if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
+    if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.USERPROFILE;
     await rm(root, { recursive: true, force: true });
   }
 });

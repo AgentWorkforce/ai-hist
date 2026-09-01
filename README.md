@@ -42,13 +42,17 @@ ai-hist sessions list --all     # union of both, with each session returned once
 The same `--local` / `--remote` / `--all` contract applies to discovery,
 search, recent history, statistics, and sync. Local and remote are presences of a session,
 not separate catalogs: every result comes from the same session ledger. Reads
-only filter that cached ledger. Remote discovery and remote sync are reserved
-for provider connectors and currently return an unsupported-operation error;
-they never silently fall back to local work. An acquisition summary's `scope`
-echoes the requested scope; it does not claim that connectors exist at every
-location in that scope. In particular, `--all` currently runs local connectors
-only. Each catalog row's `locations` array reports where that session was
-actually observed.
+only filter that cached ledger. Remote discovery and remote sync run through
+provider connectors: `claude-web` lists your claude.ai/code web sessions using
+the OAuth sign-in the Claude Code CLI stored, and `codex-cloud` lists Codex
+cloud tasks through `codex cloud list --json`. A connector is configured when
+the provider's own CLI is signed in on this machine — see
+[docs/remote-connectors.md](docs/remote-connectors.md). With no connector
+configured, remote-only acquisition returns an unsupported-operation error; it
+never silently falls back to local work. `--all` runs the local adapters plus
+every configured connector, and an acquisition summary reports the requested
+`scope` alongside the `locations_run` that actually executed. Each catalog
+row's `locations` array reports where that session was actually observed.
 
 No Rust toolchain, C/C++ compiler, standalone CLI, curl installer, or runtime
 binary download is used.

@@ -72,14 +72,19 @@ fn scope_name(scope: SessionScope) -> String {
     .to_string()
 }
 
-fn ensure_acquisition_scope_supported(scope: SessionScope, operation: &str) -> napi::Result<()> {
+/// Reject remote-only acquisition that no configured remote connector can
+/// serve — none configured at all, or a source filter that excludes every
+/// configured one — keeping the SDK's stable `UNSUPPORTED_OPERATION`
+/// taxonomy. The engine re-validates; this pre-check only classifies the
+/// error.
+fn ensure_acquisition_scope_supported(
+    scope: SessionScope,
+    operation: &str,
+    sources: &[String],
+) -> napi::Result<()> {
     if scope == SessionScope::Remote {
-        return Err(native_error(
-            "UNSUPPORTED_OPERATION",
-            format!(
-                "remote session {operation} is not available: no remote provider connectors are configured"
-            ),
-        ));
+        ai_hist_engine::remote::ensure_remote_connectors_configured_for(operation, sources)
+            .map_err(|error| native_error("UNSUPPORTED_OPERATION", format!("{error:#}")))?;
     }
     Ok(())
 }
@@ -656,6 +661,7 @@ pub struct SourceExemption {
 pub struct DiscoverResult {
     pub contract_version: u32,
     pub scope: String,
+    pub locations_run: Vec<String>,
     pub sessions: Vec<CatalogSession>,
     pub discovered: u32,
     pub skipped_unchanged: u32,
@@ -675,11 +681,12 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
         limit: None,
     });
     let scope = parse_scope(options.scope)?;
-    ensure_acquisition_scope_supported(scope, "discovery")?;
+    let sources = options.sources.unwrap_or_default();
+    ensure_acquisition_scope_supported(scope, "discovery", &sources)?;
     let path = db_path(options.db_path);
     let request = ai_hist_engine::DiscoverOptions {
         scope,
-        sources: options.sources.unwrap_or_default(),
+        sources,
         limit: options.limit.map(|limit| limit as usize),
     };
     let (sessions, summary) = napi::tokio::task::spawn_blocking(move || {
@@ -691,6 +698,7 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
     Ok(DiscoverResult {
         contract_version: summary.contract_version,
         scope: scope_name(scope),
+        locations_run: summary.locations_run,
         sessions: sessions.into_iter().map(CatalogSession::from).collect(),
         discovered: summary.discovered as u32,
         skipped_unchanged: summary.skipped_unchanged as u32,
@@ -864,7 +872,7 @@ pub async fn sync(options: Option<SyncOptions>) -> napi::Result<SyncResult> {
         scope: None,
     });
     let scope = parse_scope(options.scope)?;
-    ensure_acquisition_scope_supported(scope, "sync")?;
+    ensure_acquisition_scope_supported(scope, "sync", &[])?;
     let path = db_path(options.db_path);
     let result_path = path.display().to_string();
     let completed =
