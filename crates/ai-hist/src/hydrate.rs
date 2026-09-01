@@ -341,6 +341,14 @@ fn source_snapshot(
             stamp.push_str(&file_stamp(&evidence.path)?);
             bytes += evidence.path.metadata()?.len() as i64;
             records += complete_jsonl_records(&evidence.path)?;
+            // The metadata sidecar describes the child — its type, model and
+            // spawn depth, and the tool use that started it — so a sidecar
+            // that arrives or changes on its own is still new evidence.
+            let metadata = claude_subagent_meta_path(&evidence.path);
+            if metadata.is_file() {
+                stamp.push('|');
+                stamp.push_str(&file_stamp(&metadata)?);
+            }
         }
     }
     if options.source == "codex" && options.include_related {
@@ -623,10 +631,17 @@ fn first_claude_record(path: &Path) -> Option<Value> {
         .find_map(|line| serde_json::from_str::<Value>(line).ok())
 }
 
+/// Where the `agent-<agentId>.meta.json` sidecar sits beside a subagent
+/// transcript. The provider version that writes one names it after the
+/// transcript, so the path is derived rather than searched for.
+fn claude_subagent_meta_path(transcript: &Path) -> PathBuf {
+    transcript.with_extension("meta.json")
+}
+
 /// The `agent-<agentId>.meta.json` sidecar beside a subagent transcript, when
 /// the provider version writes one.
 fn claude_subagent_meta(transcript: &Path) -> Option<Value> {
-    let path = transcript.with_extension("meta.json");
+    let path = claude_subagent_meta_path(transcript);
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
@@ -1461,6 +1476,154 @@ mod tests {
             )
             .unwrap();
         assert_eq!(placement, (0, 1));
+    }
+
+    #[test]
+    fn reparse_moves_parent_attributed_tool_calls_and_file_edits_to_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        // The child's own tool use: an earlier parser version derived a tool
+        // call and a file edit from it under the parent's identity.
+        let records = concat!(
+            r#"{"sessionId":"session-1","agentId":"abc","isSidechain":true,"uuid":"side-a","cwd":"/work/app","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_child","name":"Edit","input":{"file_path":"/work/app/lib.rs"}}]},"timestamp":"2026-08-31T10:00:03Z"}"#,
+            "\n",
+        );
+        let transcript = claude_parent_with_subagent(dir.path(), records, None, "agent-abc");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'session-1', 1, 'assistant', 'tool_use', 'Edit /work/app/lib.rs', 'side-a:0')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tool_calls \
+             (source, session_id, message_id, tool_use_id, name, target, args_json, ts_ms) \
+             VALUES ('claude', 'session-1', 'side-a', 'toolu_child', 'Edit', '/work/app/lib.rs', '{}', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_edits \
+             (source, session_id, message_id, tool_use_id, file_path, tool_name, ts_ms) \
+             VALUES ('claude', 'session-1', 'side-a', 'toolu_child', '/work/app/lib.rs', 'Edit', 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        // A delegated action belongs to the thread that took it: the parent
+        // must not keep exposing the child's tool call or file edit as its own.
+        let placement: (i64, i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='session-1' AND event_uid='side-a:0'), \
+                   (SELECT COUNT(*) FROM tool_calls WHERE source='claude' AND session_id='session-1' AND tool_use_id='toolu_child'), \
+                   (SELECT COUNT(*) FROM file_edits WHERE source='claude' AND session_id='session-1' AND tool_use_id='toolu_child'), \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='abc' AND event_uid='side-a:0'), \
+                   (SELECT COUNT(*) FROM tool_calls WHERE source='claude' AND session_id='abc' AND tool_use_id='toolu_child'), \
+                   (SELECT COUNT(*) FROM file_edits WHERE source='claude' AND session_id='abc' AND tool_use_id='toolu_child')",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(placement, (0, 0, 0, 1, 1, 1));
+    }
+
+    #[test]
+    fn a_child_named_only_by_a_later_record_still_links() {
+        let dir = tempfile::tempdir().unwrap();
+        // A mixed transcript: the provider started naming the child partway
+        // through, so the identity is not on the first record.
+        let records = concat!(
+            r#"{"sessionId":"session-1","isSidechain":true,"uuid":"side-u","type":"user","message":{"role":"user","content":"delegated instruction"},"timestamp":"2026-08-31T10:00:02Z"}"#,
+            "\n",
+            r#"{"sessionId":"session-1","agentId":"abc","isSidechain":true,"uuid":"side-a","type":"assistant","message":{"role":"assistant","content":"child result"},"timestamp":"2026-08-31T10:00:03Z"}"#,
+            "\n",
+        );
+        let transcript = claude_parent_with_subagent(dir.path(), records, None, "agent-abc");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        assert_eq!(result.related_session_ids, vec!["abc"]);
+        assert!(!result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RELATIONSHIP_UNLINKED_CHILD"));
+        let conn = open_db(&db).unwrap();
+        let placement: (i64, i64) = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='abc'), \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='session-1' AND event_uid='side-a:0')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(placement, (1, 0));
+    }
+
+    #[test]
+    fn a_changed_metadata_sidecar_refreshes_the_child_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = claude_parent_with_subagent(
+            dir.path(),
+            CLAUDE_AGENT_RECORDS,
+            Some(CLAUDE_AGENT_META),
+            "agent-abc",
+        );
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+
+        // The transcript is untouched; only what describes the child changed.
+        fs::write(
+            dir.path()
+                .join(".claude/projects/app/session-1/subagents/agent-abc.meta.json"),
+            "{\"agentType\":\"Explore\",\"description\":\"explore the code\",\"toolUseId\":\"toolu_1\",\"spawnDepth\":2,\"model\":\"haiku\"}",
+        )
+        .unwrap();
+        let refreshed =
+            hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        assert_eq!(refreshed.status, "updated");
+
+        let conn = open_db(&db).unwrap();
+        let row: (Option<String>, Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT child_agent_type, child_agent_name, child_model, spawn_depth \
+                 FROM session_relationships WHERE source='claude' AND child_session_id='abc'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some("Explore".to_string()),
+                Some("explore the code".to_string()),
+                Some("haiku".to_string()),
+                Some(2),
+            )
+        );
     }
 
     #[test]

@@ -6392,7 +6392,8 @@ fn sync_claude_session_metadata(
         let key = path.to_string_lossy().to_string();
         let stamp = file_stamp(&path)?;
         if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
-            && claude_transcript_events_exist(conn, &path)?
+            && (claude_transcript_events_exist(conn, &path)?
+                || claude_sidecar_evidence_exists(conn, &path)?)
         {
             continue;
         }
@@ -6438,6 +6439,35 @@ fn sync_claude_session_metadata(
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
     Ok(())
+}
+
+/// Whether an unchanged subagent sidecar has already been ingested.
+///
+/// A sidecar is deliberately never registered as a session, so the catalog
+/// join [`claude_transcript_events_exist`] makes can never confirm one and
+/// every sidecar would otherwise be re-read and re-ingested on every sync,
+/// however unchanged it is. Its recorded delegation is the equivalent proof,
+/// paired with the events it produced — under the child it named, or under
+/// the parent when it named none — so a wiped or rebuilt database still
+/// re-reads the file.
+fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool> {
+    let locator = path.to_string_lossy();
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM session_relationships r
+            WHERE r.source = 'claude' AND r.evidence_locator = ?
+              AND EXISTS(
+                SELECT 1 FROM session_events e
+                WHERE e.source = 'claude'
+                  AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+              )
+            LIMIT 1
+        )",
+        [locator.as_ref()],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
 }
 
 fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
@@ -6562,13 +6592,17 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
     ingest_claude_transcript_as(conn, path, None)
 }
 
-/// Remove every event a single transcript record produced under one session
-/// id. `message_uuid` is the same identity insertion derives event uids from,
-/// so this reaches the row and all of its per-block siblings — including
+/// Remove everything a single transcript record produced under one session id.
+///
+/// `message_uuid` is the same identity insertion derives event uids from and
+/// stamps on the rows it derives from a record's tool use, so this reaches the
+/// record's events, its tool calls and its file edits together — including
 /// records with no `uuid` of their own, which fall back to the message id or
-/// the file position. The prefix is compared with `substr` rather than `LIKE`
-/// because a provider id may contain `_` or `%`.
-fn delete_claude_events_for_record(
+/// the file position. Leaving the derived rows behind would keep a parent
+/// exposing a delegated thread's actions as its own long after the events
+/// moved to the child. The event prefix is compared with `substr` rather than
+/// `LIKE` because a provider id may contain `_` or `%`.
+fn delete_claude_record_rows(
     conn: &Connection,
     session_id: &str,
     message_uuid: &str,
@@ -6577,6 +6611,14 @@ fn delete_claude_events_for_record(
         "DELETE FROM session_events WHERE source = 'claude' AND session_id = ? \
          AND substr(event_uid, 1, length(?) + 1) = ? || ':'",
         params![session_id, message_uuid, message_uuid],
+    )?;
+    conn.execute(
+        "DELETE FROM tool_calls WHERE source = 'claude' AND session_id = ? AND message_id = ?",
+        params![session_id, message_uuid],
+    )?;
+    conn.execute(
+        "DELETE FROM file_edits WHERE source = 'claude' AND session_id = ? AND message_id = ?",
+        params![session_id, message_uuid],
     )?;
     Ok(())
 }
@@ -6632,14 +6674,14 @@ fn ingest_claude_transcript_as(
             .unwrap_or(&fallback_uid);
         // Heal what an earlier parser version wrote for this record: it
         // attributed every sidechain row to the parent, and stored the rows
-        // this guard now skips. Re-reading the file removes the stale event
-        // under the identity it was written with, so a re-parse moves the
-        // row onto the child instead of duplicating it across both.
+        // this guard now skips. Re-reading the file removes the stale rows
+        // under the identity they were written with, so a re-parse moves them
+        // onto the child instead of duplicating them across both.
         if session_id != record_session_id {
-            delete_claude_events_for_record(conn, record_session_id, message_uuid)?;
+            delete_claude_record_rows(conn, record_session_id, message_uuid)?;
         }
         if skipped_sidechain {
-            delete_claude_events_for_record(conn, session_id, message_uuid)?;
+            delete_claude_record_rows(conn, session_id, message_uuid)?;
             continue;
         }
         let cwd = obj.get("cwd").and_then(Value::as_str);
@@ -9988,6 +10030,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(child_events, 1);
+    }
+
+    #[test]
+    fn an_unchanged_subagent_sidecar_is_not_re_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, named, _) = write_claude_parent_with_subagents(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        // Rewrite the sidecar and record the rewritten file as already seen: a
+        // walk that re-reads every unchanged sidecar, because a sidecar never
+        // has the catalog row the transcript check needs, would ingest this.
+        fs::write(
+            &named,
+            concat!(
+                r#"{"sessionId":"claude-root","agentId":"abc","isSidechain":true,"uuid":"side-b","cwd":"/work/app","type":"assistant","message":{"role":"assistant","content":"later result"},"timestamp":"2026-08-31T11:00:06Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let key = named.to_string_lossy().to_string();
+        state
+            .get_mut("claude_sessions_v2")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(key, json!(file_stamp(&named).unwrap()));
+
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let rewritten = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE source='claude' AND session_id='abc' AND event_uid='side-b:0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(rewritten(&conn), 0);
+
+        // Once the events it produced are gone the sidecar is evidence of
+        // nothing indexed, so the same unchanged stamp reads it again.
+        conn.execute(
+            "DELETE FROM session_events WHERE source='claude' AND session_id='abc'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(rewritten(&conn), 1);
     }
 
     #[test]

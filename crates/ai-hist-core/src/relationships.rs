@@ -401,24 +401,6 @@ pub fn session_tree(
     }];
 
     while let Some(pending) = stack.pop() {
-        if nodes.len() >= max_nodes {
-            truncated = true;
-            // Every parent still waiting on the stack keeps children it will
-            // never get, so all of them are marked, not just the one the
-            // budget happened to stop at.
-            for parent_index in std::iter::once(&pending)
-                .chain(stack.iter())
-                .filter_map(|remaining| remaining.parent_index)
-            {
-                nodes[parent_index].truncated = true;
-            }
-            diagnostics.push(RelationshipDiagnostic {
-                code: "RELATIONSHIP_TREE_TRUNCATED".to_string(),
-                message: format!("tree exceeded max_nodes={max_nodes}"),
-                relationship_uid: None,
-            });
-            break;
-        }
         if !visited.insert(pending.session_id.clone()) {
             // A repeat is only a cycle when the edge points back into this
             // branch's own ancestry. Reaching a node already emitted on
@@ -441,6 +423,27 @@ pub fn session_tree(
                 });
             }
             continue;
+        }
+        // Only a session the tree has not already emitted costs a node, so a
+        // diamond's second arrival at a node — dropped just above — never
+        // spends the budget or reports a complete tree as truncated.
+        if nodes.len() >= max_nodes {
+            truncated = true;
+            // Every parent still waiting on the stack keeps children it will
+            // never get, so all of them are marked, not just the one the
+            // budget happened to stop at.
+            for parent_index in std::iter::once(&pending)
+                .chain(stack.iter())
+                .filter_map(|remaining| remaining.parent_index)
+            {
+                nodes[parent_index].truncated = true;
+            }
+            diagnostics.push(RelationshipDiagnostic {
+                code: "RELATIONSHIP_TREE_TRUNCATED".to_string(),
+                message: format!("tree exceeded max_nodes={max_nodes}"),
+                relationship_uid: None,
+            });
+            break;
         }
         // A child's addressability was recorded when the edge was observed;
         // only the root needs a probe of its own.
@@ -733,6 +736,30 @@ mod tests {
         assert!(!tree.truncated);
         assert!(tree.nodes.iter().all(|node| !node.truncated));
         assert_eq!(tree.nodes[0].child_count, 2);
+    }
+
+    #[test]
+    fn a_diamond_costs_one_node_per_session_against_the_budget() {
+        let (_dir, conn) = database();
+        for (parent, child) in [("root", "b"), ("root", "c"), ("b", "d"), ("c", "d")] {
+            insert_edge(&conn, &Edge::new(parent, child));
+        }
+        // Four unique sessions and a budget of four: the tree is complete, so
+        // the repeated arrival at `d` must not be charged as a fifth node.
+        let tree = session_tree(
+            &conn,
+            "codex",
+            "root",
+            &SessionTreeOptions {
+                max_depth: DEFAULT_TREE_MAX_DEPTH,
+                max_nodes: 4,
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&tree), vec!["root", "b", "d", "c"]);
+        assert!(!tree.truncated);
+        assert!(tree.diagnostics.is_empty());
+        assert!(tree.nodes.iter().all(|node| !node.truncated));
     }
 
     #[test]
