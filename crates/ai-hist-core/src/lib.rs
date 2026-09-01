@@ -11,6 +11,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod convergence;
 /// WS-9 cloud-sync increment 2a: outbox builder (local rows → batch, sync logic only).
 pub mod outbox;
+/// Delegation topology: recorded parent/child relationships and bounded,
+/// cycle-safe traversal over them.
+pub mod relationships;
+
+pub use relationships::{
+    relationship_capabilities, session_children, session_children_page, session_parents,
+    session_relationships, session_tree, RelationshipCapabilities, RelationshipCursor,
+    RelationshipDiagnostic, SessionChildrenPage, SessionRelationship, SessionRelationships,
+    SessionTree, SessionTreeNode, SessionTreeOptions, DEFAULT_CHILDREN_PAGE_LIMIT,
+    DEFAULT_TREE_MAX_DEPTH, DEFAULT_TREE_MAX_NODES, MAX_CHILDREN_PAGE_LIMIT, MAX_TREE_MAX_DEPTH,
+    MAX_TREE_MAX_NODES, SESSION_RELATIONSHIP_CONTRACT_VERSION,
+};
 
 pub const SOURCE_CHOICES: &[&str] = &[
     "claude",
@@ -436,6 +448,15 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
 ];
 const REQUIRED_SESSION_PRESENCE_COLUMNS: &[&str] =
     &["raw_locator", "source_stamp", "discovery_state"];
+/// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
+/// represent related evidence whose child has no provider-recorded identity,
+/// so a database still carrying the v1 table is not current for any read.
+const REQUIRED_SESSION_RELATIONSHIP_COLUMNS: &[&str] = &[
+    "relationship_uid",
+    "identity_status",
+    "evidence_kind",
+    "child_has_events",
+];
 
 /// Indexes the session catalog's fast paths depend on.
 ///
@@ -459,6 +480,8 @@ const REQUIRED_SESSIONS_INDEXES: &[&str] = &[
     "idx_session_events_page",
     "idx_session_presences_location",
     "idx_session_presences_locator",
+    "idx_session_relationships_parent",
+    "idx_session_relationships_child",
 ];
 
 /// Indexes retired from `sessions`: nothing queries them, and each was one
@@ -480,8 +503,15 @@ const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
 const REQUIRED_EVENT_READ_INDEXES: &[&str] =
     &["idx_session_events_source_page", "idx_session_events_page"];
 const REQUIRED_SCOPE_READ_INDEXES: &[&str] = &["idx_session_presences_location"];
+const REQUIRED_RELATIONSHIP_READ_INDEXES: &[&str] = &[
+    "idx_session_relationships_parent",
+    "idx_session_relationships_child",
+];
 const REQUIRED_TRIGGERS: &[&str] = &["delete_session_presences", "delete_session_hydration_state"];
-const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &["session_presences_local_backfill_v1"];
+const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
+    "session_presences_local_backfill_v1",
+    "session_relationships_v2",
+];
 
 /// Whether this database already has everything [`init_db`] would add.
 ///
@@ -507,6 +537,12 @@ pub fn schema_is_catalog_read_current(conn: &Connection) -> Result<bool> {
 /// Whether bounded event pagination has both source-scoped and source-less indexes.
 pub fn schema_is_event_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_EVENT_READ_INDEXES)
+}
+
+/// Whether delegation-topology reads can use their indexed parent and child
+/// lookups over the v2 `session_relationships` shape.
+pub fn schema_is_relationship_read_current(conn: &Connection) -> Result<bool> {
+    schema_has_required_indexes(conn, REQUIRED_RELATIONSHIP_READ_INDEXES)
 }
 
 fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> Result<bool> {
@@ -554,6 +590,16 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     if !REQUIRED_SESSION_PRESENCE_COLUMNS
         .iter()
         .all(|needed| presence_columns.contains(*needed))
+    {
+        return Ok(false);
+    }
+    let relationship_columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('session_relationships')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !REQUIRED_SESSION_RELATIONSHIP_COLUMNS
+        .iter()
+        .all(|needed| relationship_columns.contains(*needed))
     {
         return Ok(false);
     }
@@ -629,8 +675,41 @@ fn init_db_once(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// One observed delegation edge, or one piece of related evidence whose child
+/// has no provider-recorded identity.
+///
+/// Shared by the fresh-database path and the `session_relationships_v2`
+/// rebuild below so the two can never describe different tables. The primary
+/// key is `relationship_uid` rather than the child id: unlinked evidence has
+/// no child id at all, and two sidecars of the same parent must not collapse
+/// into one row.
+const SESSION_RELATIONSHIPS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS session_relationships (
+    source TEXT NOT NULL,
+    parent_session_id TEXT NOT NULL,
+    relationship_uid TEXT NOT NULL,
+    child_session_id TEXT,
+    relationship TEXT NOT NULL,
+    identity_status TEXT NOT NULL CHECK(identity_status IN ('observed','unlinked')),
+    child_agent_type TEXT,
+    child_agent_name TEXT,
+    child_model TEXT,
+    spawn_depth INTEGER,
+    evidence_kind TEXT NOT NULL,
+    evidence_locator TEXT,
+    evidence_ref TEXT,
+    child_has_events INTEGER NOT NULL DEFAULT 0,
+    spawned_at_ms INTEGER,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (source, parent_session_id, relationship_uid)
+);
+"#;
+
 fn init_db_locked(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
+    // Before the trigger below, whose body deletes from this table.
+    conn.execute_batch(SESSION_RELATIONSHIPS_DDL)?;
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -687,14 +766,6 @@ CREATE TABLE IF NOT EXISTS session_hydration_checkpoints (
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (source, session_id, location)
 );
-CREATE TABLE IF NOT EXISTS session_relationships (
-    source TEXT NOT NULL,
-    parent_session_id TEXT NOT NULL,
-    child_session_id TEXT NOT NULL,
-    relationship TEXT NOT NULL,
-    created_ms INTEGER NOT NULL,
-    PRIMARY KEY (source, parent_session_id, child_session_id)
-);
 CREATE TRIGGER IF NOT EXISTS delete_session_presences
 AFTER DELETE ON sessions
 BEGIN
@@ -720,6 +791,7 @@ END;
     // three declarations of the same nine names (CREATE TABLE, this loop, the
     // read-only guard) is two chances to drift, and every catalog column is
     // TEXT, so the guard list is the migration list.
+    migrate_session_relationships_v2(conn)?;
     ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
     ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
@@ -820,6 +892,10 @@ VALUES ('session_presences_local_backfill_v1');
         [],
     )?;
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_relationships_child ON session_relationships(source, child_session_id)",
+        [],
+    )?;
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(source, session_id)",
         [],
     )?;
@@ -862,6 +938,70 @@ VALUES ('session_presences_local_backfill_v1');
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_commit_links_repo ON session_commit_links(repo, branch)",
         [],
+    )?;
+    Ok(())
+}
+
+/// Rebuild `session_relationships` into its v2 shape once.
+///
+/// The v1 primary key `(source, parent_session_id, child_session_id)` required
+/// a child id, so it could not record related evidence a provider does not
+/// give a stable child identity, and it merged several such observations into
+/// a single row. [`ensure_text_columns`] cannot change a primary key, so the
+/// table is rebuilt behind a `schema_migrations` marker. The caller holds the
+/// immediate migration transaction, which makes this crash-atomic and safe
+/// against concurrent first opens.
+///
+/// `legacy_alter_table` keeps the rename from rewriting the
+/// `delete_session_hydration_state` trigger to point at the temporary name;
+/// its body is already correct for v2, where `child_session_id = OLD.session_id`
+/// is NULL-safe false.
+fn migrate_session_relationships_v2(conn: &Connection) -> Result<()> {
+    let migrated: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = 'session_relationships_v2')",
+        [],
+        |row| row.get(0),
+    )?;
+    if migrated {
+        return Ok(());
+    }
+    let uid_columns: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('session_relationships') \
+         WHERE name = 'relationship_uid'",
+        [],
+        |row| row.get(0),
+    )?;
+    if uid_columns == 0 {
+        conn.pragma_update(None, "legacy_alter_table", true)?;
+        let rebuild = (|| -> Result<()> {
+            conn.execute_batch(
+                "ALTER TABLE session_relationships RENAME TO session_relationships_v1;",
+            )?;
+            conn.execute_batch(SESSION_RELATIONSHIPS_DDL)?;
+            // Every v1 row named a child, so all of them carry over as
+            // observed identities. The evidence that established them was not
+            // recorded at the time, which `legacy_hydration` states honestly.
+            conn.execute_batch(
+                r#"
+INSERT OR IGNORE INTO session_relationships
+    (source, parent_session_id, relationship_uid, child_session_id, relationship,
+     identity_status, evidence_kind, child_has_events, created_ms, updated_ms)
+SELECT r.source, r.parent_session_id, 'child:' || r.child_session_id, r.child_session_id,
+       r.relationship, 'observed', 'legacy_hydration',
+       EXISTS(SELECT 1 FROM session_events e
+              WHERE e.source = r.source AND e.session_id = r.child_session_id),
+       r.created_ms, r.created_ms
+FROM session_relationships_v1 r;
+DROP TABLE session_relationships_v1;
+"#,
+            )?;
+            Ok(())
+        })();
+        conn.pragma_update(None, "legacy_alter_table", false)?;
+        rebuild?;
+    }
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_relationships_v2');",
     )?;
     Ok(())
 }
@@ -1862,6 +2002,87 @@ mod tests {
         assert!(schema_is_current(&current).unwrap());
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_relationships_v1_database_migrates_to_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE session_relationships (
+                 source TEXT NOT NULL,
+                 parent_session_id TEXT NOT NULL,
+                 child_session_id TEXT NOT NULL,
+                 relationship TEXT NOT NULL,
+                 created_ms INTEGER NOT NULL,
+                 PRIMARY KEY (source, parent_session_id, child_session_id)
+             );
+             INSERT INTO session_relationships VALUES ('codex', 'root', 'child', 'delegated', 77);",
+        )
+        .unwrap();
+        drop(old);
+
+        let conn = open_db(&path).unwrap();
+        let row: (String, String, String, i64, i64) = conn
+            .query_row(
+                "SELECT relationship_uid, identity_status, evidence_kind, child_has_events, created_ms \
+                 FROM session_relationships WHERE child_session_id = 'child'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "child:child");
+        assert_eq!(row.1, "observed");
+        assert_eq!(row.2, "legacy_hydration");
+        assert_eq!(row.3, 0);
+        assert_eq!(row.4, 77);
+        let marker: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = 'session_relationships_v2')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker);
+        // The cascade trigger survives the rebuild and still reaches the
+        // rebuilt table rather than the renamed original.
+        conn.execute(
+            "INSERT INTO sessions (session_id, source) VALUES ('root', 'codex')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sessions WHERE session_id = 'root' AND source = 'codex'",
+            [],
+        )
+        .unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_relationships", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn unmigrated_relationship_schema_is_not_read_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.db");
+        let current = open_db(&path).unwrap();
+        assert!(schema_is_relationship_read_current(&current).unwrap());
+        current
+            .execute_batch(
+                "DROP INDEX idx_session_relationships_child; \
+                 DELETE FROM schema_migrations WHERE name = 'session_relationships_v2';",
+            )
+            .unwrap();
+        assert!(!schema_is_relationship_read_current(&current).unwrap());
+        assert!(!schema_is_current(&current).unwrap());
+        drop(current);
+
+        let migrated = open_db(&path).unwrap();
+        assert!(schema_is_relationship_read_current(&migrated).unwrap());
     }
 
     #[test]
