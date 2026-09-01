@@ -94,6 +94,72 @@ becomes `null` while the raw string stays available as `argsJson` and
 stored string of their own: it returns the parsed value, or `null` for anything
 that is not a parseable string.
 
+## Delegation topology
+
+Sessions that delegate to subagents form a tree, and it is queryable:
+
+```ts
+import {
+  getSessionRelationships,
+  getSessionTree,
+  sessionEventsIncludingDescendants,
+} from 'ai-hist';
+
+const { asParent, asChild, capabilities } = await getSessionRelationships({
+  source: 'codex',
+  sessionId: rootId,
+});
+const tree = await getSessionTree({ source: 'codex', sessionId: rootId, maxDepth: 8 });
+
+for await (const event of sessionEventsIncludingDescendants({ source: 'codex', sessionId: rootId })) {
+  // event.sessionId is the session that actually produced the event: a
+  // child's event is never rewritten as the parent's.
+  consume(event);
+}
+```
+
+Each `SessionRelationship` reports its `identityStatus`. `observed` means the
+provider named the child, so `childSessionId` is a real session id and
+`childHasEvents` says whether its events are independently addressable through
+`getSessionEventsPage`. `unlinked` means the provider recorded a delegation but
+no stable child identity: `childSessionId` is `null`, the child's output stays
+attributed to the parent, and the row keeps the evidence (`evidenceKind`,
+`evidenceLocator`, `evidenceRef`) that established it. An identity is never
+synthesized.
+
+`capabilities.stableChildIdentity` tells you what to expect from the provider
+before you read a single row: `always` for Codex, `sometimes` for Claude — only
+provider versions that emit a per-child `agentId` name the child — and `never`
+for the remaining sources.
+
+`getSessionTree` returns pre-order `nodes` (the root first), the `unlinked`
+evidence found at any depth, and `diagnostics`. `nodes[0]` is always the root,
+so a session with no children — and a database that does not exist yet — comes
+back as a one-node tree rather than an empty one. Children are ordered by
+`(spawnedAtMs, relationshipUid)` with null spawn times last, so repeated calls
+against the same database return identical results.
+
+Traversal visits each session once, at the position pre-order first reaches it.
+An edge back into the current branch's ancestry is a cycle and emits a
+`RELATIONSHIP_CYCLE` diagnostic instead of looping; an edge to a session already
+emitted on another branch is a diamond and is quietly not expanded twice.
+`maxDepth` (default 32, maximum 64) and `maxNodes` (default 1000, maximum
+10000) bound the work and set `truncated` with a
+`RELATIONSHIP_TREE_DEPTH_LIMIT` or `RELATIONSHIP_TREE_TRUNCATED` diagnostic
+rather than returning a silently short tree. Tree-level `truncated` means a
+budget cut the walk short — a cycle or diamond never sets it — while a node's
+own `truncated` marks children it did not expand.
+
+For large topologies, `getSessionChildrenPage` is the keyset primitive and
+`sessionDescendants` is the async iterator over it, walking descendants
+breadth-first without materializing a tree. It yields the nodes
+`getSessionTree` emits minus the root, with the same `childCount` (linked
+children only, at the depth boundary included) and the same `truncated` rule.
+The order differs: the walker is breadth-first, the tree is pre-order, so a
+consumer that depends on either the root node or `getSessionTree`'s ordering
+has to account for that. `sessionEventsIncludingDescendants` applies its
+`limit` to each session it reads, not to the iteration as a whole.
+
 Native loading failures distinguish unsupported platforms, missing optional
 platform packages, addon load failures, SDK/native contract mismatches, and
 database open failures through stable `RelayHistoryError` subclasses. Provider

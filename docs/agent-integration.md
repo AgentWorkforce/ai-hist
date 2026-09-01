@@ -18,6 +18,11 @@ Use these public operations:
   metadata.
 - `search()`, `recent()`, `getSession()`, and `getSessionEventsPage()` for
   indexed history reads.
+- `getSessionRelationships()` / MCP `get_session_relationships` and
+  `getSessionTree()` / MCP `get_session_tree` for delegation topology, plus
+  the SDK-only `getSessionChildrenPage()`, `sessionDescendants()`, and
+  `sessionEventsIncludingDescendants()` for walking large trees. Every event
+  keeps the session id of the session that produced it.
 - `getSessionToolCallsPage()` / MCP `get_session_tool_calls` and
   `getSessionFileEditsPage()` / MCP `get_session_file_edits` for bounded,
   structured reads of one hydrated session's recorded tool calls and file
@@ -45,7 +50,8 @@ reports which connector locations executed; use session `locations` for
 observed presences.
 
 The CLI equivalents are `sessions list`, `sessions discover`,
-`sessions hydrate`, `sessions tools`, `sessions edits`, `search`, `recent`,
+`sessions hydrate`, `sessions relationships`, `sessions tree`,
+`sessions tools`, `sessions edits`, `search`, `recent`,
 `session`, `events`, `stats`, and `sync`. See
 [Session catalog](session-catalog.md) for discovery and pagination contracts
 and [Architecture](architecture.md) for the process boundary.

@@ -30,6 +30,8 @@ mod codex;
 pub mod discover;
 mod hydrate;
 mod learn;
+/// Recording the delegation evidence each provider leaves behind.
+mod relationships;
 /// Remote session connectors (claude.ai/code web sessions, Codex cloud tasks)
 /// and their availability reporting.
 pub mod remote;
@@ -48,6 +50,8 @@ pub use hydrate::{
     HydrationDiagnostic, HydrationEvidence, HydrationIndexedThrough,
     SESSION_HYDRATION_CONTRACT_VERSION,
 };
+pub(crate) use relationships::now_ms;
+pub use relationships::{record_relationship, ObservedRelationship};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
@@ -5258,31 +5262,57 @@ fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) ->
 /// (session cwds, session branches, prompts inserted).
 type CodexRolloutWalk = (HashMap<String, String>, HashMap<String, String>, usize);
 
-/// Reconcile the catalog registration for a locally observed Codex subagent.
+/// Reconcile the catalog registration for a locally observed subagent.
 ///
 /// A local-only subagent stays out of the catalog. If the same canonical
 /// session was separately discovered remotely, its retained local events are
 /// also local evidence, so both presences and the canonical row must survive.
-fn cleanup_codex_subagent_registration(conn: &Connection, session_id: &str) -> Result<()> {
+///
+/// Deleting a `sessions` row fires `delete_session_hydration_state`, which
+/// cascades away every relationship the row takes part in — as parent as well
+/// as child. Undoing a subagent's registration is not that session going away,
+/// so the observed delegation evidence, including the thread's own outgoing
+/// edges, is carried across the delete. The trigger itself cannot be narrowed
+/// instead: `CREATE TRIGGER IF NOT EXISTS` never replaces the one an existing
+/// database already has.
+fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM session_presences \
-         WHERE source = 'codex' AND session_id = ? AND location = 'local' \
+         WHERE source = ? AND session_id = ? AND location = 'local' \
            AND NOT EXISTS (\
              SELECT 1 FROM session_presences \
-             WHERE source = 'codex' AND session_id = ? AND location = 'remote'\
+             WHERE source = ? AND session_id = ? AND location = 'remote'\
            )",
-        params![session_id, session_id],
+        params![source, session_id, source, session_id],
+    )?;
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS retained_relationships \
+           AS SELECT * FROM session_relationships WHERE 0; \
+         DELETE FROM retained_relationships;",
+    )?;
+    conn.execute(
+        "INSERT INTO retained_relationships SELECT * FROM session_relationships \
+         WHERE source = ? AND (parent_session_id = ? OR child_session_id = ?)",
+        params![source, session_id, session_id],
     )?;
     conn.execute(
         "DELETE FROM sessions \
-         WHERE source = 'codex' AND session_id = ? \
+         WHERE source = ? AND session_id = ? \
            AND NOT EXISTS (\
              SELECT 1 FROM session_presences \
-             WHERE source = 'codex' AND session_id = ?\
+             WHERE source = ? AND session_id = ?\
            )",
-        params![session_id, session_id],
+        params![source, session_id, source, session_id],
+    )?;
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO session_relationships SELECT * FROM retained_relationships; \
+         DELETE FROM retained_relationships;",
     )?;
     Ok(())
+}
+
+fn cleanup_codex_subagent_registration(conn: &Connection, session_id: &str) -> Result<()> {
+    cleanup_subagent_registration(conn, "codex", session_id)
 }
 
 fn codex_session_has_remote_presence(conn: &Connection, session_id: &str) -> Result<bool> {
@@ -5362,6 +5392,17 @@ fn sync_codex_rollouts(
                         branches.remove(session_id);
                         cleanup_codex_subagent_history(conn, session_id)?;
                         cleanup_codex_subagent_registration(conn, session_id)?;
+                        // A database synced before delegation was recorded has
+                        // no topology at all, and its stamps never change
+                        // again. Re-reading one meta line per subagent
+                        // backfills the edge without re-ingesting the rollout.
+                        if !codex_delegation_recorded(conn, session_id)? {
+                            if let Some(meta) = read_codex_session_meta(&rollout)? {
+                                if let Some(parent) = meta.parent_session_id.as_deref() {
+                                    record_codex_delegation(conn, parent, &meta, &rollout)?;
+                                }
+                            }
+                        }
                     }
                 }
                 match recorded_session {
@@ -5418,6 +5459,14 @@ fn sync_codex_rollouts(
             };
             inserted += outcome.prompts;
             events += outcome.events;
+            // Topology is recorded by the full sync too, so delegation is
+            // queryable after a plain `sync` and not only after targeted
+            // hydration of the parent.
+            if meta.is_subagent {
+                if let Some(parent) = meta.parent_session_id.as_deref() {
+                    record_codex_delegation(conn, parent, &meta, &rollout)?;
+                }
+            }
             // Subagent threads (guardian/reviewer spawns) keep their events
             // under their own thread id but stay out of the session list.
             if !meta.is_subagent {
@@ -5487,13 +5536,59 @@ fn load_state_string_map(state: &Map<String, Value>, key: &str) -> HashMap<Strin
         .unwrap_or_default()
 }
 
-fn codex_session_events_exist(conn: &Connection, session_id: &str) -> Result<bool> {
+/// Record one Codex subagent rollout as a delegation of its parent thread.
+///
+/// The rollout's own `session_meta` is the evidence: the file locates it, the
+/// thread id is the child's real identity, and the meta line's timestamp is
+/// when the provider recorded the thread starting.
+fn record_codex_delegation(
+    conn: &Connection,
+    parent_session_id: &str,
+    meta: &CodexSessionMeta,
+    rollout: &Path,
+) -> Result<()> {
+    let locator = rollout.to_string_lossy();
+    record_relationship(
+        conn,
+        &ObservedRelationship {
+            source: "codex",
+            parent_session_id,
+            child_session_id: Some(&meta.session_id),
+            relationship: "delegated",
+            child_agent_type: meta.subagent_label.as_deref(),
+            child_agent_name: None,
+            child_model: None,
+            spawn_depth: None,
+            evidence_kind: "codex_session_meta",
+            evidence_locator: Some(&locator),
+            evidence_ref: meta.parent_thread_id.as_deref(),
+            child_has_events: codex_session_events_exist(conn, &meta.session_id)?,
+            spawned_at_ms: meta.meta_ts_ms,
+        },
+    )
+}
+
+fn codex_delegation_recorded(conn: &Connection, child_session_id: &str) -> Result<bool> {
     let exists: i64 = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_events WHERE source = 'codex' AND session_id = ? LIMIT 1)",
-        [session_id],
+        "SELECT EXISTS(SELECT 1 FROM session_relationships \
+         WHERE source = 'codex' AND child_session_id = ? LIMIT 1)",
+        [child_session_id],
         |row| row.get(0),
     )?;
     Ok(exists != 0)
+}
+
+fn session_events_exist(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_events WHERE source = ? AND session_id = ? LIMIT 1)",
+        params![source, session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+fn codex_session_events_exist(conn: &Connection, session_id: &str) -> Result<bool> {
+    session_events_exist(conn, "codex", session_id)
 }
 
 struct CodexSessionMeta {
@@ -5501,7 +5596,17 @@ struct CodexSessionMeta {
     cwd: String,
     git_branch: Option<String>,
     is_subagent: bool,
+    /// The parent this thread was delegated by, from whichever field the
+    /// provider recorded it in.
     parent_session_id: Option<String>,
+    /// `payload.parent_thread_id`, kept as the provider-native reference even
+    /// when `payload.session_id` is what named the parent.
+    parent_thread_id: Option<String>,
+    /// The label under `payload.source.subagent`, when the rollout carries one.
+    subagent_label: Option<String>,
+    /// The `session_meta` line's own timestamp: when the provider recorded
+    /// this thread starting.
+    meta_ts_ms: Option<i64>,
 }
 
 /// Read the `session_meta` line that opens every rollout file.
@@ -5547,29 +5652,53 @@ fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
         .and_then(|g| g.get("branch"))
         .and_then(Value::as_str)
         .map(str::to_string);
+    let subagent = payload
+        .and_then(|p| p.get("source"))
+        .and_then(Value::as_object)
+        .and_then(|s| s.get("subagent"));
     let is_subagent = payload
         .and_then(|p| p.get("thread_source"))
         .and_then(Value::as_str)
         == Some("subagent")
-        || payload
-            .and_then(|p| p.get("source"))
-            .and_then(Value::as_object)
-            .is_some_and(|s| s.contains_key("subagent"));
-    let parent_session_id = is_subagent
-        .then(|| {
-            payload
-                .and_then(|p| p.get("session_id"))
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty() && *id != session_id)
-                .map(str::to_string)
-        })
+        || subagent.is_some();
+    let named_parent = |key: &str| {
+        payload
+            .and_then(|p| p.get(key))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && *id != session_id)
+            .map(str::to_string)
+    };
+    let parent_thread_id = is_subagent
+        .then(|| named_parent("parent_thread_id"))
         .flatten();
+    let parent_session_id = is_subagent
+        .then(|| named_parent("session_id").or_else(|| parent_thread_id.clone()))
+        .flatten();
+    // The label is an object in the observed rollouts (`{"other":"guardian"}`);
+    // its value names the agent, and its key is the only thing left when the
+    // value is not a string.
+    let subagent_label = subagent.and_then(|value| match value {
+        Value::String(label) => Some(label.clone()),
+        Value::Object(map) => map
+            .values()
+            .find_map(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| map.keys().next().cloned()),
+        _ => None,
+    });
+    let meta_ts_ms = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(parse_iso_ms);
     Ok(Some(CodexSessionMeta {
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
         git_branch,
         is_subagent,
         parent_session_id,
+        parent_thread_id,
+        subagent_label,
+        meta_ts_ms,
     }))
 }
 
@@ -6261,15 +6390,32 @@ fn sync_claude_session_metadata(
     let mut upserted = 0;
     for path in collect_matching_files(root, "", "jsonl")? {
         let key = path.to_string_lossy().to_string();
-        let stamp = file_stamp(&path)?;
+        let stamp = claude_sync_stamp(&path)?;
         if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
-            && claude_transcript_events_exist(conn, &path)?
+            && (claude_transcript_events_exist(conn, &path)?
+                || claude_sidecar_evidence_exists(conn, &path)?)
         {
             continue;
         }
         scanned += 1;
         session_state.insert(key, json!(stamp));
         if let Some(meta) = scan_claude_session_file(&path)? {
+            // A subagent sidecar carries the parent's `sessionId` but is not
+            // that session: registering it would overwrite the parent's
+            // locator with the sidecar path, and ingesting it unattributed
+            // would pull the child's output back onto the parent that
+            // hydration just moved it off.
+            if meta.subagent {
+                // Topology is recorded by the full sync too, so delegation is
+                // queryable after a plain `sync` and not only after targeted
+                // hydration of the parent. The sidecar's records name that
+                // parent, so this walk reaches the same edge from the child's
+                // side, through the very code hydration uses: a named child
+                // is an observed row, an unnamed one is unlinked evidence.
+                let evidence = hydrate::claude_subagent_evidence(path.clone(), &meta);
+                hydrate::ingest_claude_subagent(conn, &meta.session_id, &evidence)?;
+                continue;
+            }
             upsert_session(
                 conn,
                 &meta.session_id,
@@ -6295,6 +6441,52 @@ fn sync_claude_session_metadata(
     Ok(())
 }
 
+/// What a Claude transcript is skipped on when nothing about it changed.
+///
+/// A subagent sidecar's `agent-<agentId>.meta.json` is the only place the
+/// child's type, name, model and spawn depth are recorded, so metadata that
+/// changes beside an untouched transcript is still new evidence and has to
+/// reach `session_relationships`. Hydration stamps its source snapshot by the
+/// same rule.
+fn claude_sync_stamp(path: &Path) -> Result<String> {
+    let mut stamp = file_stamp(path)?;
+    let metadata = hydrate::claude_subagent_meta_path(path);
+    if metadata.is_file() {
+        stamp.push('|');
+        stamp.push_str(&file_stamp(&metadata)?);
+    }
+    Ok(stamp)
+}
+
+/// Whether an unchanged subagent sidecar has already been ingested.
+///
+/// A sidecar is deliberately never registered as a session, so the catalog
+/// join [`claude_transcript_events_exist`] makes can never confirm one and
+/// every sidecar would otherwise be re-read and re-ingested on every sync,
+/// however unchanged it is. Its recorded delegation is the equivalent proof,
+/// paired with the events it produced — under the child it named, or under
+/// the parent when it named none — so a wiped or rebuilt database still
+/// re-reads the file.
+fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool> {
+    let locator = path.to_string_lossy();
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM session_relationships r
+            WHERE r.source = 'claude' AND r.evidence_locator = ?
+              AND EXISTS(
+                SELECT 1 FROM session_events e
+                WHERE e.source = 'claude'
+                  AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+              )
+            LIMIT 1
+        )",
+        [locator.as_ref()],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
 fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
     let raw_path = path.to_string_lossy();
     let exists: i64 = conn.query_row(
@@ -6318,6 +6510,13 @@ struct ClaudeSessionMeta {
     first_ts: i64,
     last_ts: i64,
     last_assistant_text: Option<String>,
+    /// Every identified record is a sidechain row, so this file is a delegated
+    /// sidecar rather than a session of its own — the same rule discovery uses
+    /// to keep sidecars out of the catalog.
+    subagent: bool,
+    /// The child identity the provider recorded, read from the records and
+    /// never from the file name. Absent on versions that do not emit it.
+    agent_id: Option<String>,
 }
 
 fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
@@ -6328,10 +6527,30 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
     let mut first_ts = None;
     let mut last_ts = None;
     let mut last_assistant_text = None;
+    let mut identified_records = 0usize;
+    let mut sidechain_records = 0usize;
+    let mut agent_id: Option<String> = None;
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        if value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        {
+            identified_records += 1;
+            if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+                sidechain_records += 1;
+            }
+        }
+        if agent_id.is_none() {
+            agent_id = value
+                .get("agentId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
+        }
         if session_id.is_none() {
             session_id = value
                 .get("sessionId")
@@ -6381,10 +6600,55 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
         first_ts: first,
         last_ts: last_ts.unwrap_or(first),
         last_assistant_text,
+        subagent: identified_records > 0 && sidechain_records == identified_records,
+        agent_id,
     }))
 }
 
 fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
+    ingest_claude_transcript_as(conn, path, None)
+}
+
+/// Remove everything a single transcript record produced under one session id.
+///
+/// `message_uuid` is the same identity insertion derives event uids from and
+/// stamps on the rows it derives from a record's tool use, so this reaches the
+/// record's events, its tool calls and its file edits together — including
+/// records with no `uuid` of their own, which fall back to the message id or
+/// the file position. Leaving the derived rows behind would keep a parent
+/// exposing a delegated thread's actions as its own long after the events
+/// moved to the child. The event prefix is compared with `substr` rather than
+/// `LIKE` because a provider id may contain `_` or `%`.
+fn delete_claude_record_rows(
+    conn: &Connection,
+    session_id: &str,
+    message_uuid: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM session_events WHERE source = 'claude' AND session_id = ? \
+         AND substr(event_uid, 1, length(?) + 1) = ? || ':'",
+        params![session_id, message_uuid, message_uuid],
+    )?;
+    conn.execute(
+        "DELETE FROM tool_calls WHERE source = 'claude' AND session_id = ? AND message_id = ?",
+        params![session_id, message_uuid],
+    )?;
+    conn.execute(
+        "DELETE FROM file_edits WHERE source = 'claude' AND session_id = ? AND message_id = ?",
+        params![session_id, message_uuid],
+    )?;
+    Ok(())
+}
+
+/// `attributed_session_id` overrides the record's own `sessionId`. Claude
+/// subagent transcripts carry the PARENT's sessionId plus a per-child
+/// `agentId`; when the provider records that agentId we store the child's
+/// events under it so the child is independently addressable.
+fn ingest_claude_transcript_as(
+    conn: &Connection,
+    path: &Path,
+    attributed_session_id: Option<&str>,
+) -> Result<()> {
     let text = fs::read_to_string(path).unwrap_or_default();
     for (line_index, line) in text.lines().enumerate() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -6393,10 +6657,11 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
         let Some(obj) = value.as_object() else {
             continue;
         };
-        let session_id = match obj.get("sessionId").and_then(Value::as_str) {
+        let record_session_id = match obj.get("sessionId").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => s,
             _ => continue,
         };
+        let session_id = attributed_session_id.unwrap_or(record_session_id);
         // Subagent sidecar transcripts share the parent's sessionId with
         // isSidechain rows. The subagent's assistant output is real session
         // activity (text and token spend), but its user-role rows are the
@@ -6406,22 +6671,34 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
             .get("isSidechain")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if sidechain
+        let skipped_sidechain = sidechain
             && obj
                 .get("message")
                 .and_then(|m| m.get("role"))
                 .and_then(Value::as_str)
-                != Some("assistant")
-        {
-            // Heal databases that ingested these rows before this guard:
-            // the uid prefix is this row's uuid, so stale events (and any
-            // per-block siblings) can be removed as the file is re-read.
-            if let Some(uuid) = obj.get("uuid").and_then(Value::as_str) {
-                conn.execute(
-                    "DELETE FROM session_events WHERE source = 'claude' AND session_id = ? AND (event_uid = ? || ':0' OR event_uid LIKE ? || ':%')",
-                    params![session_id, uuid, uuid],
-                )?;
-            }
+                != Some("assistant");
+        let uuid = obj.get("uuid").and_then(Value::as_str);
+        let message = obj.get("message").and_then(Value::as_object);
+        let fallback_uid = format!(
+            "{}:{}",
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("session"),
+            line_index
+        );
+        let message_uuid = uuid
+            .or_else(|| message.and_then(|m| m.get("id")).and_then(Value::as_str))
+            .unwrap_or(&fallback_uid);
+        // Heal what an earlier parser version wrote for this record: it
+        // attributed every sidechain row to the parent, and stored the rows
+        // this guard now skips. Re-reading the file removes the stale rows
+        // under the identity they were written with, so a re-parse moves them
+        // onto the child instead of duplicating them across both.
+        if session_id != record_session_id {
+            delete_claude_record_rows(conn, record_session_id, message_uuid)?;
+        }
+        if skipped_sidechain {
+            delete_claude_record_rows(conn, session_id, message_uuid)?;
             continue;
         }
         let cwd = obj.get("cwd").and_then(Value::as_str);
@@ -6432,19 +6709,6 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
             .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
             .unwrap_or(0);
         let parent_id = obj.get("parentUuid").and_then(Value::as_str);
-        let message = obj.get("message").and_then(Value::as_object);
-        let fallback_uid = format!(
-            "{}:{}",
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("session"),
-            line_index
-        );
-        let message_uuid = obj
-            .get("uuid")
-            .and_then(Value::as_str)
-            .or_else(|| message.and_then(|m| m.get("id")).and_then(Value::as_str))
-            .unwrap_or(&fallback_uid);
         let message_role = message
             .and_then(|m| m.get("role"))
             .and_then(Value::as_str)
@@ -8054,8 +8318,8 @@ fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpoint_sync_state, cleanup_stale_sync_state_temps, cron_schedule, doctor_report,
-        export_history, file_stamp, git_commit_time_ms, git_stdout, import_history,
+        checkpoint_sync_state, claude_sync_stamp, cleanup_stale_sync_state_temps, cron_schedule,
+        doctor_report, export_history, file_stamp, git_commit_time_ms, git_stdout, import_history,
         ingest_claude_transcript, is_sqlite_contention, link_git_commit, load_sync_state,
         parse_trajectory_file, paths_overlap, prepare_sync_and_push_db,
         process_status_with_programs, save_sync_state, search_all, service_command_args,
@@ -9572,6 +9836,358 @@ mod tests {
         assert_eq!(event_count, 4);
     }
 
+    /// One Claude project tree as the provider writes it: a parent transcript,
+    /// a subagent sidecar the provider named with an in-record `agentId` (with
+    /// its `meta.json` beside it), and a sidechain sidecar from a provider
+    /// version that names no child at all. Returns the three transcripts.
+    fn write_claude_parent_with_subagents(
+        root: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let subagents = root.join("app/claude-root/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let parent = root.join("app/claude-root.jsonl");
+        fs::write(
+            &parent,
+            concat!(
+                r#"{"sessionId":"claude-root","uuid":"u1","cwd":"/work/app","type":"user","message":{"role":"user","content":"human prompt"},"timestamp":"2026-08-31T11:00:00Z"}"#, "\n",
+                r#"{"sessionId":"claude-root","uuid":"a1","cwd":"/work/app","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Agent","input":{"prompt":"plan it"}}]},"timestamp":"2026-08-31T11:00:01Z"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let named = subagents.join("agent-abc.jsonl");
+        fs::write(
+            &named,
+            concat!(
+                r#"{"sessionId":"claude-root","agentId":"abc","isSidechain":true,"uuid":"side-u","cwd":"/work/app","type":"user","message":{"role":"user","content":"delegated instruction"},"timestamp":"2026-08-31T11:00:02Z"}"#, "\n",
+                r#"{"sessionId":"claude-root","agentId":"abc","isSidechain":true,"uuid":"side-a","cwd":"/work/app","type":"assistant","message":{"role":"assistant","content":"child result"},"timestamp":"2026-08-31T11:00:03Z"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            subagents.join("agent-abc.meta.json"),
+            r#"{"agentType":"Plan","description":"plan the work","toolUseId":"toolu_1","spawnDepth":1,"model":"test-model"}"#,
+        )
+        .unwrap();
+        let nameless = subagents.join("agent-nameless.jsonl");
+        fs::write(
+            &nameless,
+            concat!(
+                r#"{"sessionId":"claude-root","isSidechain":true,"uuid":"other-u","cwd":"/work/app","type":"user","message":{"role":"user","content":"second instruction"},"timestamp":"2026-08-31T11:00:04Z"}"#, "\n",
+                r#"{"sessionId":"claude-root","isSidechain":true,"uuid":"other-a","cwd":"/work/app","type":"assistant","message":{"role":"assistant","content":"unnamed result"},"timestamp":"2026-08-31T11:00:05Z"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        (parent, named, nameless)
+    }
+
+    struct DelegationRow {
+        parent: String,
+        child: Option<String>,
+        identity_status: String,
+        agent_type: Option<String>,
+        agent_name: Option<String>,
+        model: Option<String>,
+        spawn_depth: Option<i64>,
+        evidence_kind: String,
+        evidence_locator: Option<String>,
+        evidence_ref: Option<String>,
+        child_has_events: bool,
+        spawned_at_ms: Option<i64>,
+        created_ms: i64,
+    }
+
+    fn delegation_row(conn: &Connection, evidence_kind: &str) -> DelegationRow {
+        conn.query_row(
+            "SELECT parent_session_id, child_session_id, identity_status, child_agent_type, \
+                    child_agent_name, child_model, spawn_depth, evidence_kind, evidence_locator, \
+                    evidence_ref, child_has_events, spawned_at_ms, created_ms \
+             FROM session_relationships WHERE source = 'claude' AND evidence_kind = ?",
+            [evidence_kind],
+            |row| {
+                Ok(DelegationRow {
+                    parent: row.get(0)?,
+                    child: row.get(1)?,
+                    identity_status: row.get(2)?,
+                    agent_type: row.get(3)?,
+                    agent_name: row.get(4)?,
+                    model: row.get(5)?,
+                    spawn_depth: row.get(6)?,
+                    evidence_kind: row.get(7)?,
+                    evidence_locator: row.get(8)?,
+                    evidence_ref: row.get(9)?,
+                    child_has_events: row.get(10)?,
+                    spawned_at_ms: row.get(11)?,
+                    created_ms: row.get(12)?,
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn plain_claude_sync_records_a_named_subagent_as_an_observed_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, named, _) = write_claude_parent_with_subagents(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+
+        // No hydration anywhere: a plain sync is the only thing that has ever
+        // read these files.
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        let row = delegation_row(&conn, "claude_subagent_meta");
+        assert_eq!(row.parent, "claude-root");
+        assert_eq!(row.child.as_deref(), Some("abc"));
+        assert_eq!(row.identity_status, "observed");
+        assert_eq!(row.agent_type.as_deref(), Some("Plan"));
+        assert_eq!(row.agent_name.as_deref(), Some("plan the work"));
+        assert_eq!(row.model.as_deref(), Some("test-model"));
+        assert_eq!(row.spawn_depth, Some(1));
+        assert_eq!(row.evidence_kind, "claude_subagent_meta");
+        assert_eq!(
+            row.evidence_locator.as_deref(),
+            Some(named.to_string_lossy().as_ref())
+        );
+        assert_eq!(row.evidence_ref.as_deref(), Some("toolu_1"));
+        assert!(row.child_has_events);
+        assert_eq!(
+            row.spawned_at_ms,
+            super::parse_iso_ms("2026-08-31T11:00:02Z")
+        );
+
+        // The child's output is addressable under the child, its delegated
+        // instruction is nobody's human prompt, and a delegated thread never
+        // becomes a session of its own.
+        let counts: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='abc'), \
+                   (SELECT COUNT(*) FROM history WHERE source='claude' AND session_id='abc'), \
+                   (SELECT COUNT(*) FROM sessions WHERE source='claude' AND session_id='abc'), \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='claude-root' AND event_uid LIKE 'side-%')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 0, 0, 0));
+    }
+
+    #[test]
+    fn plain_claude_sync_records_a_nameless_sidechain_as_unlinked_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, nameless) = write_claude_parent_with_subagents(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        let row = delegation_row(&conn, "claude_sidechain_records");
+        assert_eq!(row.parent, "claude-root");
+        assert_eq!(row.child, None);
+        assert_eq!(row.identity_status, "unlinked");
+        assert!(!row.child_has_events);
+        assert_eq!(
+            row.evidence_locator.as_deref(),
+            Some(nameless.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            row.spawned_at_ms,
+            super::parse_iso_ms("2026-08-31T11:00:04Z")
+        );
+        // Nothing was invented from the file name, and the unnamed child's
+        // output stays where it can still be addressed: on the parent.
+        let placement: (i64, i64) = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_relationships WHERE child_session_id = 'nameless'), \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='claude-root' AND event_uid = 'other-a:0')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(placement, (0, 1));
+    }
+
+    #[test]
+    fn repeated_claude_sync_neither_duplicates_nor_ages_delegation_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        write_claude_parent_with_subagents(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let first = (
+            delegation_row(&conn, "claude_subagent_meta").created_ms,
+            delegation_row(&conn, "claude_sidechain_records").created_ms,
+        );
+
+        // The second walk sees unchanged stamps for every file.
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_relationships", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(
+            (
+                delegation_row(&conn, "claude_subagent_meta").created_ms,
+                delegation_row(&conn, "claude_sidechain_records").created_ms,
+            ),
+            first
+        );
+        let child_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='abc'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_events, 1);
+    }
+
+    #[test]
+    fn an_unchanged_subagent_sidecar_is_not_re_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, named, _) = write_claude_parent_with_subagents(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        // Rewrite the sidecar and record the rewritten file as already seen: a
+        // walk that re-reads every unchanged sidecar, because a sidecar never
+        // has the catalog row the transcript check needs, would ingest this.
+        fs::write(
+            &named,
+            concat!(
+                r#"{"sessionId":"claude-root","agentId":"abc","isSidechain":true,"uuid":"side-b","cwd":"/work/app","type":"assistant","message":{"role":"assistant","content":"later result"},"timestamp":"2026-08-31T11:00:06Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let key = named.to_string_lossy().to_string();
+        state
+            .get_mut("claude_sessions_v2")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(key, json!(claude_sync_stamp(&named).unwrap()));
+
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let rewritten = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE source='claude' AND session_id='abc' AND event_uid='side-b:0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(rewritten(&conn), 0);
+
+        // Once the events it produced are gone the sidecar is evidence of
+        // nothing indexed, so the same unchanged stamp reads it again.
+        conn.execute(
+            "DELETE FROM session_events WHERE source='claude' AND session_id='abc'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(rewritten(&conn), 1);
+    }
+
+    #[test]
+    fn a_changed_metadata_sidecar_refreshes_delegation_during_a_full_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, named, _) = write_claude_parent_with_subagents(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        // The transcript never moves; only what describes the child changes.
+        fs::write(
+            named.with_extension("meta.json"),
+            r#"{"agentType":"Explore","description":"explore the code","toolUseId":"toolu_1","spawnDepth":2,"model":"other-model"}"#,
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        let row = delegation_row(&conn, "claude_subagent_meta");
+        assert_eq!(row.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(row.agent_name.as_deref(), Some("explore the code"));
+        assert_eq!(row.model.as_deref(), Some("other-model"));
+        assert_eq!(row.spawn_depth, Some(2));
+    }
+
+    #[test]
+    fn unchanged_claude_stamps_backfill_missing_delegation_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, named, nameless) = write_claude_parent_with_subagents(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // A database synced before delegation was recorded: the parent is
+        // registered and indexed, so its stamp fast path skips it entirely,
+        // and no topology exists at all.
+        super::upsert_session(
+            &conn,
+            "claude-root",
+            "claude",
+            Some("/work/app"),
+            None,
+            1,
+            2,
+            None,
+            Some(&parent.to_string_lossy()),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'claude-root', 2, 'assistant', 'text', 'kept event', 'a1:0')",
+            [],
+        )
+        .unwrap();
+        let mut claude_sessions = Map::new();
+        for path in [&parent, &named, &nameless] {
+            claude_sessions.insert(
+                path.to_string_lossy().to_string(),
+                json!(claude_sync_stamp(path).unwrap()),
+            );
+        }
+        let mut state = Map::new();
+        state.insert(
+            "claude_sessions_v2".to_string(),
+            Value::Object(claude_sessions),
+        );
+
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        assert_eq!(
+            delegation_row(&conn, "claude_subagent_meta")
+                .child
+                .as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            delegation_row(&conn, "claude_sidechain_records").identity_status,
+            "unlinked"
+        );
+        // The parent itself was never re-read: its stamp skip still holds, so
+        // the walk that backfilled the topology did not re-ingest its prompt.
+        let parent_prompts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source='claude'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_prompts, 0);
+    }
+
     #[test]
     fn claude_control_wrappers_do_not_enter_prompt_history() {
         let dir = tempfile::tempdir().unwrap();
@@ -10266,6 +10882,134 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events, 1);
+    }
+
+    /// State that makes `sync_codex_rollouts` take its stamp-unchanged fast
+    /// path for one already-ingested subagent rollout.
+    fn unchanged_subagent_state(rollout: &std::path::Path, session_id: &str) -> Map<String, Value> {
+        let mut state = Map::new();
+        state.insert(
+            "codex_rollouts_v4".into(),
+            json!({
+                rollout.to_string_lossy().to_string(): {
+                    "stamp": file_stamp(rollout).unwrap(),
+                    "session": session_id,
+                    "subagent": true
+                }
+            }),
+        );
+        state
+    }
+
+    #[test]
+    fn unchanged_subagent_state_backfills_missing_delegation_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/08/01");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-unchanged-sub.jsonl");
+        write_codex_subagent_rollout(&rollout, "sess-unchanged-sub");
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // A database synced before delegation was recorded: the events are
+        // already there, so the rollout is never re-read for its own sake.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1')",
+            [],
+        )
+        .unwrap();
+        let mut state = unchanged_subagent_state(&rollout, "sess-unchanged-sub");
+
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let edge: (String, String, String, i64) = conn
+            .query_row(
+                "SELECT parent_session_id, relationship_uid, evidence_kind, created_ms \
+                 FROM session_relationships \
+                 WHERE source='codex' AND child_session_id='sess-unchanged-sub'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(edge.0, "parent");
+        assert_eq!(edge.1, "child:sess-unchanged-sub");
+        assert_eq!(edge.2, "codex_session_meta");
+
+        // A second pass over the same unchanged state neither duplicates the
+        // row nor re-reads the rollout to rewrite it.
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let (count, created): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(created_ms) FROM session_relationships \
+                 WHERE source='codex' AND child_session_id='sess-unchanged-sub'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(created, edge.3);
+    }
+
+    #[test]
+    fn subagent_registration_cleanup_keeps_the_thread_s_own_delegations() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/08/01");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-unchanged-sub.jsonl");
+        write_codex_subagent_rollout(&rollout, "sess-unchanged-sub");
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // A stale catalog registration for the subagent, which the fast path
+        // removes — firing the cascade that used to take the topology with it.
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) \
+             VALUES ('sess-unchanged-sub', 'codex', '/tmp/proj')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_relationships \
+             (source, parent_session_id, relationship_uid, child_session_id, relationship, \
+              identity_status, evidence_kind, child_has_events, created_ms, updated_ms) \
+             VALUES ('codex', 'sess-unchanged-sub', 'child:grandchild', 'grandchild', 'delegated', \
+                     'observed', 'codex_session_meta', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        let mut state = unchanged_subagent_state(&rollout, "sess-unchanged-sub");
+
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let registrations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions \
+                 WHERE source='codex' AND session_id='sess-unchanged-sub'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(registrations, 0);
+        let edges: Vec<String> = conn
+            .prepare(
+                "SELECT relationship_uid FROM session_relationships \
+                 WHERE source='codex' AND parent_session_id='sess-unchanged-sub'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(edges, vec!["child:grandchild".to_string()]);
     }
 
     #[test]

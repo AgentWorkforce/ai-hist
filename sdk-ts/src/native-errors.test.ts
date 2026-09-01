@@ -51,7 +51,7 @@ test('SDK/native contract mismatch is actionable', () => {
     () => validateNativeContract(999),
     (error: unknown) => error instanceof NativeContractMismatchError
       && error.code === 'NATIVE_CONTRACT_MISMATCH'
-      && /requires native contract 5/.test(error.message),
+      && /requires native contract 6/.test(error.message),
   );
   assert.throws(
     () => validateNativeScope('cloud'),

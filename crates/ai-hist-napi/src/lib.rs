@@ -7,21 +7,31 @@
 use std::path::{Path, PathBuf};
 
 use ai_hist_core::{
-    default_db_path, open_db, open_db_readonly, recent as core_recent,
+    default_db_path, open_db, open_db_readonly, recent as core_recent, relationship_capabilities,
     schema_is_catalog_read_current, schema_is_event_read_current, schema_is_evidence_read_current,
-    schema_is_read_current, search as core_search, session as core_session,
+    schema_is_read_current, schema_is_relationship_read_current, search as core_search,
+    session as core_session, session_children_page as core_session_children_page,
     session_events_page as core_session_events_page,
     session_file_edits_page as core_session_file_edits_page, session_locations,
-    session_tool_calls_page as core_session_tool_calls_page, stats_scoped as core_stats_scoped,
-    HistoryEntry, QueryFilter, SessionEvent as CoreSessionEvent,
+    session_relationships as core_session_relationships,
+    session_tool_calls_page as core_session_tool_calls_page, session_tree as core_session_tree,
+    stats_scoped as core_stats_scoped, HistoryEntry, QueryFilter,
+    RelationshipCapabilities as CoreRelationshipCapabilities,
+    RelationshipCursor as CoreRelationshipCursor,
+    RelationshipDiagnostic as CoreRelationshipDiagnostic, SessionEvent as CoreSessionEvent,
     SessionEventCursor as CoreEventCursor, SessionEvidenceCursor as CoreEvidenceCursor,
-    SessionFileEdit as CoreSessionFileEdit, SessionScope, SessionToolCall as CoreSessionToolCall,
-    SESSION_EVIDENCE_CONTRACT_VERSION,
+    SessionFileEdit as CoreSessionFileEdit, SessionRelationship as CoreSessionRelationship,
+    SessionRelationships as CoreSessionRelationships, SessionScope,
+    SessionToolCall as CoreSessionToolCall, SessionTree as CoreSessionTree,
+    SessionTreeNode as CoreSessionTreeNode, SessionTreeOptions as CoreSessionTreeOptions,
+    DEFAULT_CHILDREN_PAGE_LIMIT, DEFAULT_TREE_MAX_DEPTH, DEFAULT_TREE_MAX_NODES,
+    MAX_CHILDREN_PAGE_LIMIT, MAX_TREE_MAX_DEPTH, MAX_TREE_MAX_NODES,
+    SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_RELATIONSHIP_CONTRACT_VERSION,
 };
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 5;
+pub const NATIVE_CONTRACT_VERSION: u32 = 6;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -1086,6 +1096,400 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
             })
             .collect(),
     })
+}
+
+const CATALOG_SOURCES: &[&str] = &["claude", "codex", "cursor", "grok", "relay", "opencode"];
+
+/// Reject an unusable identity before opening anything, so a typo is an
+/// argument error rather than an empty result that looks like real data.
+fn validate_relationship_identity(source: &str, session_id: &str) -> napi::Result<()> {
+    if session_id.trim().is_empty() {
+        return Err(native_error(
+            "INVALID_ARGUMENT",
+            "sessionId must not be empty",
+        ));
+    }
+    if !CATALOG_SOURCES.contains(&source) {
+        return Err(native_error(
+            "INVALID_ARGUMENT",
+            format!("unsupported catalog source '{source}'"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bound(value: Option<i64>, name: &str, default: u32, max: u32) -> napi::Result<u32> {
+    let value = match value {
+        Some(value) => value,
+        None => return Ok(default),
+    };
+    if !(1..=i64::from(max)).contains(&value) {
+        return Err(native_error(
+            "INVALID_ARGUMENT",
+            format!("{name} must be between 1 and {max} (got {value})"),
+        ));
+    }
+    Ok(value as u32)
+}
+
+#[napi(object)]
+pub struct NativeSessionRelationship {
+    pub source: String,
+    pub parent_session_id: String,
+    pub child_session_id: Option<String>,
+    pub relationship: String,
+    pub identity_status: String,
+    pub child_agent_type: Option<String>,
+    pub child_agent_name: Option<String>,
+    pub child_model: Option<String>,
+    pub spawn_depth: Option<i64>,
+    pub evidence_kind: String,
+    pub evidence_locator: Option<String>,
+    pub evidence_ref: Option<String>,
+    pub child_has_events: bool,
+    pub spawned_at_ms: Option<i64>,
+    pub created_ms: i64,
+    pub relationship_uid: String,
+}
+
+impl From<CoreSessionRelationship> for NativeSessionRelationship {
+    fn from(relationship: CoreSessionRelationship) -> Self {
+        Self {
+            source: relationship.source,
+            parent_session_id: relationship.parent_session_id,
+            child_session_id: relationship.child_session_id,
+            relationship: relationship.relationship,
+            identity_status: relationship.identity_status,
+            child_agent_type: relationship.child_agent_type,
+            child_agent_name: relationship.child_agent_name,
+            child_model: relationship.child_model,
+            spawn_depth: relationship.spawn_depth,
+            evidence_kind: relationship.evidence_kind,
+            evidence_locator: relationship.evidence_locator,
+            evidence_ref: relationship.evidence_ref,
+            child_has_events: relationship.child_has_events,
+            spawned_at_ms: relationship.spawned_at_ms,
+            created_ms: relationship.created_ms,
+            relationship_uid: relationship.relationship_uid,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct NativeRelationshipCapabilities {
+    pub source: String,
+    pub stable_child_identity: String,
+    pub records_agent_type: bool,
+    pub records_spawn_time: bool,
+    pub records_evidence_locator: bool,
+}
+
+impl From<CoreRelationshipCapabilities> for NativeRelationshipCapabilities {
+    fn from(capabilities: CoreRelationshipCapabilities) -> Self {
+        Self {
+            source: capabilities.source,
+            stable_child_identity: capabilities.stable_child_identity,
+            records_agent_type: capabilities.records_agent_type,
+            records_spawn_time: capabilities.records_spawn_time,
+            records_evidence_locator: capabilities.records_evidence_locator,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct NativeRelationshipDiagnostic {
+    pub code: String,
+    pub message: String,
+    pub relationship_uid: Option<String>,
+}
+
+impl From<CoreRelationshipDiagnostic> for NativeRelationshipDiagnostic {
+    fn from(diagnostic: CoreRelationshipDiagnostic) -> Self {
+        Self {
+            code: diagnostic.code,
+            message: diagnostic.message,
+            relationship_uid: diagnostic.relationship_uid,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct NativeSessionRelationships {
+    pub contract_version: u32,
+    pub source: String,
+    pub session_id: String,
+    pub as_parent: Vec<NativeSessionRelationship>,
+    pub as_child: Vec<NativeSessionRelationship>,
+    pub capabilities: NativeRelationshipCapabilities,
+    pub diagnostics: Vec<NativeRelationshipDiagnostic>,
+}
+
+impl From<CoreSessionRelationships> for NativeSessionRelationships {
+    fn from(relationships: CoreSessionRelationships) -> Self {
+        Self {
+            contract_version: relationships.contract_version,
+            source: relationships.source,
+            session_id: relationships.session_id,
+            as_parent: relationships
+                .as_parent
+                .into_iter()
+                .map(NativeSessionRelationship::from)
+                .collect(),
+            as_child: relationships
+                .as_child
+                .into_iter()
+                .map(NativeSessionRelationship::from)
+                .collect(),
+            capabilities: relationships.capabilities.into(),
+            diagnostics: relationships
+                .diagnostics
+                .into_iter()
+                .map(NativeRelationshipDiagnostic::from)
+                .collect(),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct NativeSessionTreeNode {
+    pub source: String,
+    pub session_id: String,
+    pub depth: u32,
+    pub parent_session_id: Option<String>,
+    pub relationship: Option<NativeSessionRelationship>,
+    pub child_count: u32,
+    pub has_events: bool,
+    pub truncated: bool,
+}
+
+impl From<CoreSessionTreeNode> for NativeSessionTreeNode {
+    fn from(node: CoreSessionTreeNode) -> Self {
+        Self {
+            source: node.source,
+            session_id: node.session_id,
+            depth: node.depth,
+            parent_session_id: node.parent_session_id,
+            relationship: node.relationship.map(NativeSessionRelationship::from),
+            child_count: node.child_count,
+            has_events: node.has_events,
+            truncated: node.truncated,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct NativeSessionTree {
+    pub contract_version: u32,
+    pub source: String,
+    pub root_session_id: String,
+    pub nodes: Vec<NativeSessionTreeNode>,
+    pub unlinked: Vec<NativeSessionRelationship>,
+    pub capabilities: NativeRelationshipCapabilities,
+    pub diagnostics: Vec<NativeRelationshipDiagnostic>,
+    pub truncated: bool,
+    pub max_depth_reached: u32,
+}
+
+impl From<CoreSessionTree> for NativeSessionTree {
+    fn from(tree: CoreSessionTree) -> Self {
+        Self {
+            contract_version: tree.contract_version,
+            source: tree.source,
+            root_session_id: tree.root_session_id,
+            nodes: tree
+                .nodes
+                .into_iter()
+                .map(NativeSessionTreeNode::from)
+                .collect(),
+            unlinked: tree
+                .unlinked
+                .into_iter()
+                .map(NativeSessionRelationship::from)
+                .collect(),
+            capabilities: tree.capabilities.into(),
+            diagnostics: tree
+                .diagnostics
+                .into_iter()
+                .map(NativeRelationshipDiagnostic::from)
+                .collect(),
+            truncated: tree.truncated,
+            max_depth_reached: tree.max_depth_reached,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct RelationshipCursor {
+    pub spawned_at_ms: Option<i64>,
+    pub relationship_uid: String,
+}
+
+#[napi(object)]
+pub struct NativeSessionChildrenPage {
+    pub children: Vec<NativeSessionRelationship>,
+    pub next_cursor: Option<RelationshipCursor>,
+}
+
+#[napi(object)]
+pub struct RelationshipOptions {
+    pub source: String,
+    pub session_id: String,
+    pub db_path: Option<String>,
+}
+
+#[napi(object)]
+pub struct SessionTreeOptions {
+    pub source: String,
+    pub session_id: String,
+    pub db_path: Option<String>,
+    pub max_depth: Option<i64>,
+    pub max_nodes: Option<i64>,
+}
+
+#[napi(object)]
+pub struct SessionChildrenPageOptions {
+    pub source: String,
+    pub session_id: String,
+    pub db_path: Option<String>,
+    pub limit: Option<i64>,
+    pub after: Option<RelationshipCursor>,
+}
+
+/// Direct delegation relationships for one session, in both directions.
+/// A missing database is an empty result, not an error.
+#[napi]
+pub async fn get_session_relationships(
+    options: RelationshipOptions,
+) -> napi::Result<NativeSessionRelationships> {
+    validate_relationship_identity(&options.source, &options.session_id)?;
+    let path = db_path(options.db_path);
+    let source = options.source;
+    let session_id = options.session_id;
+    // Capabilities are a property of the provider, not of this database, so
+    // an empty result still answers what the provider could record.
+    let empty = NativeSessionRelationships {
+        contract_version: SESSION_RELATIONSHIP_CONTRACT_VERSION,
+        source: source.clone(),
+        session_id: session_id.clone(),
+        as_parent: Vec::new(),
+        as_child: Vec::new(),
+        capabilities: relationship_capabilities(&source).into(),
+        diagnostics: Vec::new(),
+    };
+    read_database_with_schema(
+        path,
+        empty,
+        schema_is_relationship_read_current,
+        move |conn| Ok(core_session_relationships(conn, &source, &session_id)?.into()),
+    )
+    .await
+}
+
+/// The complete descendant delegation tree for one session: pre-order,
+/// cycle-safe, and bounded by `maxDepth` / `maxNodes`.
+#[napi]
+pub async fn get_session_tree(options: SessionTreeOptions) -> napi::Result<NativeSessionTree> {
+    validate_relationship_identity(&options.source, &options.session_id)?;
+    let max_depth = validate_bound(
+        options.max_depth,
+        "maxDepth",
+        DEFAULT_TREE_MAX_DEPTH,
+        MAX_TREE_MAX_DEPTH,
+    )?;
+    let max_nodes = validate_bound(
+        options.max_nodes,
+        "maxNodes",
+        DEFAULT_TREE_MAX_NODES,
+        MAX_TREE_MAX_NODES,
+    )?;
+    let path = db_path(options.db_path);
+    let source = options.source;
+    let session_id = options.session_id;
+    // A tree always contains its root, so the missing-database answer is the
+    // same shape a real empty tree has: one node, no descendants.
+    let empty = NativeSessionTree {
+        contract_version: SESSION_RELATIONSHIP_CONTRACT_VERSION,
+        source: source.clone(),
+        root_session_id: session_id.clone(),
+        nodes: vec![NativeSessionTreeNode {
+            source: source.clone(),
+            session_id: session_id.clone(),
+            depth: 0,
+            parent_session_id: None,
+            relationship: None,
+            child_count: 0,
+            has_events: false,
+            truncated: false,
+        }],
+        unlinked: Vec::new(),
+        capabilities: relationship_capabilities(&source).into(),
+        diagnostics: Vec::new(),
+        truncated: false,
+        max_depth_reached: 0,
+    };
+    read_database_with_schema(
+        path,
+        empty,
+        schema_is_relationship_read_current,
+        move |conn| {
+            let tree = core_session_tree(
+                conn,
+                &source,
+                &session_id,
+                &CoreSessionTreeOptions {
+                    max_depth,
+                    max_nodes,
+                },
+            )?;
+            Ok(tree.into())
+        },
+    )
+    .await
+}
+
+/// One bounded page of a session's direct children, in the same total order
+/// the tree traversal uses.
+#[napi]
+pub async fn get_session_children_page(
+    options: SessionChildrenPageOptions,
+) -> napi::Result<NativeSessionChildrenPage> {
+    validate_relationship_identity(&options.source, &options.session_id)?;
+    let limit = validate_limit(
+        options.limit,
+        DEFAULT_CHILDREN_PAGE_LIMIT,
+        MAX_CHILDREN_PAGE_LIMIT,
+    )?;
+    let path = db_path(options.db_path);
+    let source = options.source;
+    let session_id = options.session_id;
+    let after = options.after.map(|cursor| CoreRelationshipCursor {
+        spawned_at_ms: cursor.spawned_at_ms,
+        relationship_uid: cursor.relationship_uid,
+    });
+    read_database_with_schema(
+        path,
+        NativeSessionChildrenPage {
+            children: Vec::new(),
+            next_cursor: None,
+        },
+        schema_is_relationship_read_current,
+        move |conn| {
+            let page =
+                core_session_children_page(conn, &source, &session_id, limit, after.as_ref())?;
+            Ok(NativeSessionChildrenPage {
+                children: page
+                    .children
+                    .into_iter()
+                    .map(NativeSessionRelationship::from)
+                    .collect(),
+                next_cursor: page.next_cursor.map(|cursor| RelationshipCursor {
+                    spawned_at_ms: cursor.spawned_at_ms,
+                    relationship_uid: cursor.relationship_uid,
+                }),
+            })
+        },
+    )
+    .await
 }
 
 #[napi(object)]

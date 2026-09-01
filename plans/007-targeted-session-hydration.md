@@ -29,6 +29,9 @@
   child task prompts to human prompt history. Claude sidechain evidence remains
   attributed according to the existing parser until the provider exposes a
   stable distinct child identity.
+- The relationship row, its provider evidence, and the public query and
+  traversal APIs are specified in
+  [008 — Session delegation topology](008-session-delegation-topology.md).
 
 ## Concurrency
 

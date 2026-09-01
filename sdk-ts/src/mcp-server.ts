@@ -7,7 +7,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import {
   discoverSessions, getSession, getSessionEventsPage, getSessionFileEditsPage,
-  getSessionToolCallsPage, hydrateSession, listSessionCatalogPage, recent, search, stats, sync,
+  getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
+  listSessionCatalogPage, recent, search, stats, sync,
 } from './index.js';
 
 const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
@@ -85,6 +86,22 @@ server.tool('get_session_events', 'Get one bounded page of normalized events.', 
   session_id: z.string(), source: SOURCE.optional(), limit: z.number().int().min(1).max(1000).optional().default(200),
   after: z.object({ tsMs: z.number().int(), id: z.number().int() }).optional(),
 }, READ, ({ session_id, source, limit, after }) => call(() => getSessionEventsPage(session_id, { source, limit, after })));
+
+server.tool('get_session_relationships',
+  'Direct delegation relationships for one session, in both directions (as parent and as child).', {
+  source: CATALOG_SOURCE,
+  session_id: z.string().min(1),
+}, READ, ({ source, session_id }) => call(() => getSessionRelationships({ source, sessionId: session_id })));
+
+server.tool('get_session_tree',
+  'Complete descendant delegation tree for one session, with cycle protection and deterministic ordering. Child events are not flattened into the parent.', {
+  source: CATALOG_SOURCE,
+  session_id: z.string().min(1),
+  max_depth: z.number().int().min(1).max(64).optional(),
+  max_nodes: z.number().int().min(1).max(10000).optional(),
+}, READ, ({ source, session_id, max_depth, max_nodes }) => call(() => getSessionTree({
+  source, sessionId: session_id, maxDepth: max_depth, maxNodes: max_nodes,
+})));
 
 // Tool calls and file edits are keyed by (source, session_id): a session id
 // alone can name two sessions from two providers. A cursor's `tsMs` may be

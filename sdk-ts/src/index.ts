@@ -9,9 +9,10 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const NATIVE_CONTRACT_VERSION = 5;
+export const NATIVE_CONTRACT_VERSION = 6;
 export const SESSION_CATALOG_CONTRACT_VERSION = 2;
 export const SESSION_HYDRATION_CONTRACT_VERSION = 1;
+export const SESSION_RELATIONSHIP_CONTRACT_VERSION = 1;
 export const SESSION_EVIDENCE_CONTRACT_VERSION = 1;
 
 /**
@@ -240,6 +241,133 @@ export interface SessionEventsPage {
   nextCursor: EventCursor | null;
 }
 
+export type RelationshipType = 'delegated';
+export type IdentityStatus = 'observed' | 'unlinked';
+export type StableChildIdentity = 'always' | 'sometimes' | 'never';
+
+/**
+ * One observed delegation edge. `childSessionId` is null when the provider
+ * recorded the delegation but no stable child identity, in which case
+ * `identityStatus` is `unlinked` and the child's output stays attributed to
+ * the parent.
+ */
+export interface SessionRelationship {
+  source: CatalogSource;
+  parentSessionId: string;
+  childSessionId: string | null;
+  relationship: RelationshipType;
+  identityStatus: IdentityStatus;
+  childAgentType: string | null;
+  childAgentName: string | null;
+  childModel: string | null;
+  spawnDepth: number | null;
+  evidenceKind: string;
+  evidenceLocator: string | null;
+  evidenceRef: string | null;
+  childHasEvents: boolean;
+  spawnedAtMs: number | null;
+  createdMs: number;
+  relationshipUid: string;
+}
+
+/** What a provider is able to record about its own delegations. */
+export interface RelationshipCapabilities {
+  source: CatalogSource;
+  stableChildIdentity: StableChildIdentity;
+  recordsAgentType: boolean;
+  recordsSpawnTime: boolean;
+  recordsEvidenceLocator: boolean;
+}
+
+export interface RelationshipDiagnostic {
+  code: string;
+  message: string;
+  relationshipUid: string | null;
+}
+
+export interface GetSessionRelationshipsOptions {
+  source: CatalogSource;
+  sessionId: string;
+  dbPath?: string;
+}
+
+export interface SessionRelationships {
+  contractVersion: number;
+  source: CatalogSource;
+  sessionId: string;
+  /** Edges where this session is the delegating parent. */
+  asParent: SessionRelationship[];
+  /** Edges where this session is the delegated child. */
+  asChild: SessionRelationship[];
+  capabilities: RelationshipCapabilities;
+  diagnostics: RelationshipDiagnostic[];
+}
+
+export interface SessionTreeNode {
+  source: CatalogSource;
+  sessionId: string;
+  depth: number;
+  parentSessionId: string | null;
+  /** The edge that reached this node; null for the root. */
+  relationship: SessionRelationship | null;
+  childCount: number;
+  hasEvents: boolean;
+  /** Children exist but were not expanded (depth/node budget, or a cycle). */
+  truncated: boolean;
+}
+
+export interface GetSessionTreeOptions extends GetSessionRelationshipsOptions {
+  /** Default 32, maximum 64. */
+  maxDepth?: number;
+  /** Default 1000, maximum 10000. */
+  maxNodes?: number;
+}
+
+export interface SessionTree {
+  contractVersion: number;
+  source: CatalogSource;
+  rootSessionId: string;
+  /** Pre-order and deterministic; `nodes[0]` is the root when it exists. */
+  nodes: SessionTreeNode[];
+  /** Related evidence at any depth with no stable child identity. */
+  unlinked: SessionRelationship[];
+  capabilities: RelationshipCapabilities;
+  diagnostics: RelationshipDiagnostic[];
+  truncated: boolean;
+  maxDepthReached: number;
+}
+
+export interface RelationshipCursor {
+  spawnedAtMs: number | null;
+  relationshipUid: string;
+}
+
+export interface SessionChildrenPage {
+  children: SessionRelationship[];
+  nextCursor: RelationshipCursor | null;
+}
+
+export interface GetSessionChildrenPageOptions extends GetSessionRelationshipsOptions {
+  /** Default 100, maximum 1000. */
+  limit?: number;
+  after?: RelationshipCursor;
+}
+
+export interface SessionDescendantsOptions extends GetSessionRelationshipsOptions {
+  maxDepth?: number;
+  pageLimit?: number;
+}
+
+export interface DescendantEventsOptions {
+  source: CatalogSource;
+  dbPath?: string;
+  /** Events read per session, not a total for the iteration. */
+  limit?: number;
+  maxDepth?: number;
+  /** Defaults to true. */
+  includeRoot?: boolean;
+}
+
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
 export interface SessionToolCall {
@@ -342,8 +470,15 @@ interface NativeBinding {
   listSessionCatalogPage(options?: object): Promise<UnknownRecord>;
   discoverSessions(options?: object): Promise<UnknownRecord>;
   hydrateSession(options: object): Promise<UnknownRecord>;
+  getSessionRelationships(options: object): Promise<UnknownRecord>;
+  getSessionTree(options: object): Promise<UnknownRecord>;
+  getSessionChildrenPage(options: object): Promise<UnknownRecord>;
   sync(options?: object): Promise<UnknownRecord>;
 }
+
+const RELATIONSHIP_TYPES: readonly string[] = ['delegated'];
+const DEFAULT_TREE_MAX_DEPTH = 32;
+const MAX_TREE_MAX_DEPTH = 64;
 
 const SUPPORTED_PLATFORMS = new Set([
   'darwin-arm64', 'darwin-x64',
@@ -562,6 +697,15 @@ function sessionEvent(value: UnknownRecord): SessionEvent {
   };
 }
 
+function assertRelationshipContract(value: number): void {
+  if (value !== SESSION_RELATIONSHIP_CONTRACT_VERSION) {
+    throw new NativeContractMismatchError(
+      `ai-hist expects relationship contract ${SESSION_RELATIONSHIP_CONTRACT_VERSION}, but native returned ${value}.`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+}
+
 /**
  * Provider JSON is stored as the raw string the provider wrote. A row whose
  * string cannot be parsed still belongs in its page, so parsing yields null
@@ -629,6 +773,118 @@ function assertEvidenceContract(value: number): void {
       `ai-hist expects session evidence contract ${SESSION_EVIDENCE_CONTRACT_VERSION}, but native returned ${value}.`,
       'NATIVE_CONTRACT_MISMATCH',
     );
+  }
+}
+
+function catalogSource(value: unknown): CatalogSource {
+  if (typeof value === 'string' && CATALOG_SOURCES.includes(value)) return value as CatalogSource;
+  throw new NativeContractMismatchError(
+    `ai-hist-native returned an invalid catalog source: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
+    'NATIVE_CONTRACT_MISMATCH',
+  );
+}
+
+function relationshipType(value: unknown): RelationshipType {
+  if (typeof value === 'string' && RELATIONSHIP_TYPES.includes(value)) return value as RelationshipType;
+  throw new NativeContractMismatchError(
+    `ai-hist-native returned an invalid relationship type: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
+    'NATIVE_CONTRACT_MISMATCH',
+  );
+}
+
+function identityStatus(value: unknown): IdentityStatus {
+  if (value === 'observed' || value === 'unlinked') return value;
+  throw new NativeContractMismatchError(
+    `ai-hist-native returned an invalid relationship identity status: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
+    'NATIVE_CONTRACT_MISMATCH',
+  );
+}
+
+function stableChildIdentity(value: unknown): StableChildIdentity {
+  if (value === 'always' || value === 'sometimes' || value === 'never') return value;
+  throw new NativeContractMismatchError(
+    `ai-hist-native returned an invalid stable child identity: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
+    'NATIVE_CONTRACT_MISMATCH',
+  );
+}
+
+function relationship(value: UnknownRecord): SessionRelationship {
+  return {
+    source: catalogSource(value.source),
+    parentSessionId: String(value.parentSessionId),
+    childSessionId: nullableString(value.childSessionId),
+    relationship: relationshipType(value.relationship),
+    identityStatus: identityStatus(value.identityStatus),
+    childAgentType: nullableString(value.childAgentType),
+    childAgentName: nullableString(value.childAgentName),
+    childModel: nullableString(value.childModel),
+    spawnDepth: typeof value.spawnDepth === 'number' ? value.spawnDepth : null,
+    evidenceKind: String(value.evidenceKind),
+    evidenceLocator: nullableString(value.evidenceLocator),
+    evidenceRef: nullableString(value.evidenceRef),
+    childHasEvents: value.childHasEvents === true,
+    spawnedAtMs: typeof value.spawnedAtMs === 'number' ? value.spawnedAtMs : null,
+    createdMs: Number(value.createdMs),
+    relationshipUid: String(value.relationshipUid),
+  };
+}
+
+function relationships(value: unknown): SessionRelationship[] {
+  return Array.isArray(value) ? (value as UnknownRecord[]).map(relationship) : [];
+}
+
+function relationshipCapabilities(value: unknown): RelationshipCapabilities {
+  const row = (value ?? {}) as UnknownRecord;
+  return {
+    source: catalogSource(row.source),
+    stableChildIdentity: stableChildIdentity(row.stableChildIdentity),
+    recordsAgentType: row.recordsAgentType === true,
+    recordsSpawnTime: row.recordsSpawnTime === true,
+    recordsEvidenceLocator: row.recordsEvidenceLocator === true,
+  };
+}
+
+function relationshipDiagnostics(value: unknown): RelationshipDiagnostic[] {
+  return Array.isArray(value) ? (value as UnknownRecord[]).map((item) => ({
+    code: String(item.code),
+    message: String(item.message),
+    relationshipUid: nullableString(item.relationshipUid),
+  })) : [];
+}
+
+function treeNode(value: UnknownRecord): SessionTreeNode {
+  return {
+    source: catalogSource(value.source),
+    sessionId: String(value.sessionId),
+    depth: Number(value.depth),
+    parentSessionId: nullableString(value.parentSessionId),
+    relationship: value.relationship && typeof value.relationship === 'object'
+      ? relationship(value.relationship as UnknownRecord)
+      : null,
+    childCount: Number(value.childCount),
+    hasEvents: value.hasEvents === true,
+    truncated: value.truncated === true,
+  };
+}
+
+function relationshipCursor(value: unknown): RelationshipCursor | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as UnknownRecord;
+  return {
+    spawnedAtMs: typeof row.spawnedAtMs === 'number' ? row.spawnedAtMs : null,
+    relationshipUid: String(row.relationshipUid),
+  };
+}
+
+function validateSessionRef(options: GetSessionRelationshipsOptions, operation: string): void {
+  if (!options || typeof options !== 'object') {
+    throw new InvalidArgumentError(`${operation} options are required`, 'INVALID_ARGUMENT');
+  }
+  if (!CATALOG_SOURCES.includes(options.source)) {
+    throw new InvalidArgumentError(`invalid catalog source: ${String(options.source)}`, 'INVALID_ARGUMENT');
+  }
+  if (typeof options.sessionId !== 'string' || options.sessionId.trim() === '') {
+    throw new InvalidArgumentError('sessionId must not be empty', 'INVALID_ARGUMENT');
   }
 }
 
@@ -825,6 +1081,31 @@ export async function getSessionEvents(sessionId: string, options: Omit<EventsPa
   return events;
 }
 
+/**
+ * Direct delegation relationships for one session, in both directions. A
+ * missing database returns an empty, well-formed result whose `capabilities`
+ * still describe what the provider is able to record.
+ */
+export async function getSessionRelationships(options: GetSessionRelationshipsOptions): Promise<SessionRelationships> {
+  validateSessionRef(options, 'getSessionRelationships');
+  return nativeCall(async (native) => {
+    const value = await native.getSessionRelationships({
+      source: options.source, sessionId: options.sessionId, dbPath: options.dbPath,
+    });
+    const contractVersion = Number(value.contractVersion);
+    assertRelationshipContract(contractVersion);
+    return {
+      contractVersion,
+      source: String(value.source) as CatalogSource,
+      sessionId: String(value.sessionId),
+      asParent: relationships(value.asParent),
+      asChild: relationships(value.asChild),
+      capabilities: relationshipCapabilities(value.capabilities),
+      diagnostics: relationshipDiagnostics(value.diagnostics),
+    };
+  });
+}
+
 export async function getSessionToolCallsPage(
   source: Source, sessionId: string, options: EvidencePageOptions = {},
 ): Promise<SessionToolCallsPage> {
@@ -840,6 +1121,34 @@ export async function getSessionToolCallsPage(
       sessionId: String(page.sessionId),
       toolCalls: Array.isArray(page.toolCalls) ? (page.toolCalls as UnknownRecord[]).map(sessionToolCall) : [],
       nextCursor: evidenceCursor(page.nextCursor),
+    };
+  });
+}
+
+/**
+ * The complete descendant delegation tree for one session: pre-order,
+ * cycle-safe, and bounded by `maxDepth` and `maxNodes`. Child events keep
+ * their own session identity and are never flattened into the root.
+ */
+export async function getSessionTree(options: GetSessionTreeOptions): Promise<SessionTree> {
+  validateSessionRef(options, 'getSessionTree');
+  return nativeCall(async (native) => {
+    const value = await native.getSessionTree({
+      source: options.source, sessionId: options.sessionId, dbPath: options.dbPath,
+      maxDepth: options.maxDepth, maxNodes: options.maxNodes,
+    });
+    const contractVersion = Number(value.contractVersion);
+    assertRelationshipContract(contractVersion);
+    return {
+      contractVersion,
+      source: String(value.source) as CatalogSource,
+      rootSessionId: String(value.rootSessionId),
+      nodes: Array.isArray(value.nodes) ? (value.nodes as UnknownRecord[]).map(treeNode) : [],
+      unlinked: relationships(value.unlinked),
+      capabilities: relationshipCapabilities(value.capabilities),
+      diagnostics: relationshipDiagnostics(value.diagnostics),
+      truncated: value.truncated === true,
+      maxDepthReached: Number(value.maxDepthReached),
     };
   });
 }
@@ -880,6 +1189,114 @@ export async function getSessionFileEditsPage(
       nextCursor: evidenceCursor(page.nextCursor),
     };
   });
+}
+
+/**
+ * One bounded page of a session's direct children, in the same total order
+ * the tree traversal uses: `(spawnedAtMs, relationshipUid)`, nulls last.
+ */
+export async function getSessionChildrenPage(options: GetSessionChildrenPageOptions): Promise<SessionChildrenPage> {
+  validateSessionRef(options, 'getSessionChildrenPage');
+  return nativeCall(async (native) => {
+    const page = await native.getSessionChildrenPage({
+      source: options.source, sessionId: options.sessionId, dbPath: options.dbPath, limit: options.limit,
+      after: options.after ? {
+        ...options.after,
+        spawnedAtMs: options.after.spawnedAtMs ?? undefined,
+      } : undefined,
+    });
+    return {
+      children: relationships(page.children),
+      nextCursor: relationshipCursor(page.nextCursor),
+    };
+  });
+}
+
+/**
+ * Lazily walks a session's descendants breadth-first over the paged children
+ * primitive, without materializing a large tree. Unlinked evidence has no
+ * traversable identity and is skipped; use `getSessionTree` when you need it.
+ */
+export async function* sessionDescendants(options: SessionDescendantsOptions): AsyncGenerator<SessionTreeNode> {
+  validateSessionRef(options, 'sessionDescendants');
+  const maxDepth = Math.min(Math.max(Math.trunc(options.maxDepth ?? DEFAULT_TREE_MAX_DEPTH), 1), MAX_TREE_MAX_DEPTH);
+  const request = { source: options.source, dbPath: options.dbPath };
+  const visited = new Set<string>([options.sessionId]);
+  // Each walked session's parent, so a repeated edge can be told apart: back
+  // into this branch's own ancestry it is a cycle, anywhere else it is a
+  // diamond, which leaves nothing unexplored. `getSessionTree` draws the same
+  // line, and the two must not disagree about what `truncated` means.
+  const parentOf = new Map<string, string | null>([[options.sessionId, null]]);
+  const isAncestor = (from: string, candidate: string): boolean => {
+    let current: string | null | undefined = from;
+    while (current !== null && current !== undefined) {
+      if (current === candidate) return true;
+      current = parentOf.get(current) ?? null;
+    }
+    return false;
+  };
+  let frontier: SessionTreeNode[] = [{
+    source: options.source, sessionId: options.sessionId, depth: 0, parentSessionId: null,
+    relationship: null, childCount: 0, hasEvents: false, truncated: false,
+  }];
+  while (frontier.length > 0) {
+    const next: SessionTreeNode[] = [];
+    for (const node of frontier) {
+      const expand = node.depth < maxDepth;
+      const children: SessionRelationship[] = [];
+      let after: RelationshipCursor | undefined;
+      do {
+        const page = await getSessionChildrenPage({
+          ...request, sessionId: node.sessionId, limit: options.pageLimit, after,
+        });
+        children.push(...page.children);
+        after = page.nextCursor ?? undefined;
+      } while (after);
+      // Unlinked evidence has no traversable identity, so it is never a child
+      // this walk owes the caller — at the depth boundary included.
+      const linked = children.filter((edge): edge is SessionRelationship & { childSessionId: string } =>
+        edge.identityStatus === 'observed' && edge.childSessionId !== null);
+      node.childCount = linked.length;
+      node.truncated = expand
+        ? linked.some((edge) => isAncestor(node.sessionId, edge.childSessionId))
+        : linked.length > 0;
+      if (node.depth > 0) yield node;
+      if (!expand) continue;
+      for (const edge of linked) {
+        if (visited.has(edge.childSessionId)) continue;
+        visited.add(edge.childSessionId);
+        parentOf.set(edge.childSessionId, node.sessionId);
+        next.push({
+          source: edge.source, sessionId: edge.childSessionId, depth: node.depth + 1,
+          parentSessionId: node.sessionId, relationship: edge, childCount: 0,
+          hasEvents: edge.childHasEvents, truncated: false,
+        });
+      }
+    }
+    frontier = next;
+  }
+}
+
+/**
+ * The root session's events followed by each descendant's events, in
+ * descendant traversal order. Every yielded event keeps the `sessionId` of the
+ * session that actually produced it: a child's event is never rewritten as a
+ * parent's.
+ */
+export async function* sessionEventsIncludingDescendants(
+  options: DescendantEventsOptions & { sessionId: string },
+): AsyncGenerator<SessionEvent> {
+  validateSessionRef(options, 'sessionEventsIncludingDescendants');
+  const events = { dbPath: options.dbPath, source: options.source, limit: options.limit };
+  if (options.includeRoot !== false) {
+    yield* sessionEvents(options.sessionId, events);
+  }
+  for await (const node of sessionDescendants({
+    source: options.source, sessionId: options.sessionId, dbPath: options.dbPath, maxDepth: options.maxDepth,
+  })) {
+    if (!node.hasEvents) continue;
+    yield* sessionEvents(node.sessionId, events);
+  }
 }
 
 export async function* sessionFileEdits(
