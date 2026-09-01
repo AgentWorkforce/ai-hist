@@ -5267,6 +5267,14 @@ type CodexRolloutWalk = (HashMap<String, String>, HashMap<String, String>, usize
 /// A local-only subagent stays out of the catalog. If the same canonical
 /// session was separately discovered remotely, its retained local events are
 /// also local evidence, so both presences and the canonical row must survive.
+///
+/// Deleting a `sessions` row fires `delete_session_hydration_state`, which
+/// cascades away every relationship the row takes part in — as parent as well
+/// as child. Undoing a subagent's registration is not that session going away,
+/// so the observed delegation evidence, including the thread's own outgoing
+/// edges, is carried across the delete. The trigger itself cannot be narrowed
+/// instead: `CREATE TRIGGER IF NOT EXISTS` never replaces the one an existing
+/// database already has.
 fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM session_presences \
@@ -5277,6 +5285,16 @@ fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &s
            )",
         params![source, session_id, source, session_id],
     )?;
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS retained_relationships \
+           AS SELECT * FROM session_relationships WHERE 0; \
+         DELETE FROM retained_relationships;",
+    )?;
+    conn.execute(
+        "INSERT INTO retained_relationships SELECT * FROM session_relationships \
+         WHERE source = ? AND (parent_session_id = ? OR child_session_id = ?)",
+        params![source, session_id, session_id],
+    )?;
     conn.execute(
         "DELETE FROM sessions \
          WHERE source = ? AND session_id = ? \
@@ -5285,6 +5303,10 @@ fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &s
              WHERE source = ? AND session_id = ?\
            )",
         params![source, session_id, source, session_id],
+    )?;
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO session_relationships SELECT * FROM retained_relationships; \
+         DELETE FROM retained_relationships;",
     )?;
     Ok(())
 }
@@ -5370,6 +5392,17 @@ fn sync_codex_rollouts(
                         branches.remove(session_id);
                         cleanup_codex_subagent_history(conn, session_id)?;
                         cleanup_codex_subagent_registration(conn, session_id)?;
+                        // A database synced before delegation was recorded has
+                        // no topology at all, and its stamps never change
+                        // again. Re-reading one meta line per subagent
+                        // backfills the edge without re-ingesting the rollout.
+                        if !codex_delegation_recorded(conn, session_id)? {
+                            if let Some(meta) = read_codex_session_meta(&rollout)? {
+                                if let Some(parent) = meta.parent_session_id.as_deref() {
+                                    record_codex_delegation(conn, parent, &meta, &rollout)?;
+                                }
+                            }
+                        }
                     }
                 }
                 match recorded_session {
@@ -5533,6 +5566,16 @@ fn record_codex_delegation(
             spawned_at_ms: meta.meta_ts_ms,
         },
     )
+}
+
+fn codex_delegation_recorded(conn: &Connection, child_session_id: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_relationships \
+         WHERE source = 'codex' AND child_session_id = ? LIMIT 1)",
+        [child_session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
 }
 
 fn session_events_exist(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
@@ -6356,6 +6399,18 @@ fn sync_claude_session_metadata(
         scanned += 1;
         session_state.insert(key, json!(stamp));
         if let Some(meta) = scan_claude_session_file(&path)? {
+            // A subagent sidecar carries the parent's `sessionId` but is not
+            // that session: registering it would overwrite the parent's
+            // locator with the sidecar path, and ingesting it unattributed
+            // would pull the child's output back onto the parent that
+            // hydration just moved it off.
+            if meta.subagent {
+                ingest_claude_transcript_as(conn, &path, meta.agent_id.as_deref())?;
+                if let Some(agent_id) = meta.agent_id.as_deref() {
+                    cleanup_subagent_registration(conn, "claude", agent_id)?;
+                }
+                continue;
+            }
             upsert_session(
                 conn,
                 &meta.session_id,
@@ -6404,6 +6459,13 @@ struct ClaudeSessionMeta {
     first_ts: i64,
     last_ts: i64,
     last_assistant_text: Option<String>,
+    /// Every identified record is a sidechain row, so this file is a delegated
+    /// sidecar rather than a session of its own — the same rule discovery uses
+    /// to keep sidecars out of the catalog.
+    subagent: bool,
+    /// The child identity the provider recorded, read from the records and
+    /// never from the file name. Absent on versions that do not emit it.
+    agent_id: Option<String>,
 }
 
 fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
@@ -6414,10 +6476,30 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
     let mut first_ts = None;
     let mut last_ts = None;
     let mut last_assistant_text = None;
+    let mut identified_records = 0usize;
+    let mut sidechain_records = 0usize;
+    let mut agent_id: Option<String> = None;
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        if value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        {
+            identified_records += 1;
+            if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+                sidechain_records += 1;
+            }
+        }
+        if agent_id.is_none() {
+            agent_id = value
+                .get("agentId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
+        }
         if session_id.is_none() {
             session_id = value
                 .get("sessionId")
@@ -6467,6 +6549,8 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
         first_ts: first,
         last_ts: last_ts.unwrap_or(first),
         last_assistant_text,
+        subagent: identified_records > 0 && sidechain_records == identified_records,
+        agent_id,
     }))
 }
 
@@ -6475,20 +6559,20 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
 }
 
 /// Remove every event a single transcript record produced under one session
-/// id. The uid prefix is the record's uuid, so this reaches the row and all of
-/// its per-block siblings.
+/// id. `message_uuid` is the same identity insertion derives event uids from,
+/// so this reaches the row and all of its per-block siblings — including
+/// records with no `uuid` of their own, which fall back to the message id or
+/// the file position. The prefix is compared with `substr` rather than `LIKE`
+/// because a provider id may contain `_` or `%`.
 fn delete_claude_events_for_record(
     conn: &Connection,
     session_id: &str,
-    uuid: Option<&str>,
+    message_uuid: &str,
 ) -> Result<()> {
-    let Some(uuid) = uuid else {
-        return Ok(());
-    };
     conn.execute(
         "DELETE FROM session_events WHERE source = 'claude' AND session_id = ? \
-         AND (event_uid = ? || ':0' OR event_uid LIKE ? || ':%')",
-        params![session_id, uuid, uuid],
+         AND substr(event_uid, 1, length(?) + 1) = ? || ':'",
+        params![session_id, message_uuid, message_uuid],
     )?;
     Ok(())
 }
@@ -6531,26 +6615,6 @@ fn ingest_claude_transcript_as(
                 .and_then(Value::as_str)
                 != Some("assistant");
         let uuid = obj.get("uuid").and_then(Value::as_str);
-        // Heal what an earlier parser version wrote for this record: it
-        // attributed every sidechain row to the parent, and stored the rows
-        // this guard now skips. Re-reading the file removes the stale event
-        // under the identity it was written with, so a re-parse moves the
-        // row onto the child instead of duplicating it across both.
-        if session_id != record_session_id {
-            delete_claude_events_for_record(conn, record_session_id, uuid)?;
-        }
-        if skipped_sidechain {
-            delete_claude_events_for_record(conn, session_id, uuid)?;
-            continue;
-        }
-        let cwd = obj.get("cwd").and_then(Value::as_str);
-        let project = cwd;
-        let git_branch = obj.get("gitBranch").and_then(Value::as_str);
-        let ts_ms = obj
-            .get("timestamp")
-            .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
-            .unwrap_or(0);
-        let parent_id = obj.get("parentUuid").and_then(Value::as_str);
         let message = obj.get("message").and_then(Value::as_object);
         let fallback_uid = format!(
             "{}:{}",
@@ -6562,6 +6626,26 @@ fn ingest_claude_transcript_as(
         let message_uuid = uuid
             .or_else(|| message.and_then(|m| m.get("id")).and_then(Value::as_str))
             .unwrap_or(&fallback_uid);
+        // Heal what an earlier parser version wrote for this record: it
+        // attributed every sidechain row to the parent, and stored the rows
+        // this guard now skips. Re-reading the file removes the stale event
+        // under the identity it was written with, so a re-parse moves the
+        // row onto the child instead of duplicating it across both.
+        if session_id != record_session_id {
+            delete_claude_events_for_record(conn, record_session_id, message_uuid)?;
+        }
+        if skipped_sidechain {
+            delete_claude_events_for_record(conn, session_id, message_uuid)?;
+            continue;
+        }
+        let cwd = obj.get("cwd").and_then(Value::as_str);
+        let project = cwd;
+        let git_branch = obj.get("gitBranch").and_then(Value::as_str);
+        let ts_ms = obj
+            .get("timestamp")
+            .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
+            .unwrap_or(0);
+        let parent_id = obj.get("parentUuid").and_then(Value::as_str);
         let message_role = message
             .and_then(|m| m.get("role"))
             .and_then(Value::as_str)
@@ -10383,6 +10467,134 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events, 1);
+    }
+
+    /// State that makes `sync_codex_rollouts` take its stamp-unchanged fast
+    /// path for one already-ingested subagent rollout.
+    fn unchanged_subagent_state(rollout: &std::path::Path, session_id: &str) -> Map<String, Value> {
+        let mut state = Map::new();
+        state.insert(
+            "codex_rollouts_v4".into(),
+            json!({
+                rollout.to_string_lossy().to_string(): {
+                    "stamp": file_stamp(rollout).unwrap(),
+                    "session": session_id,
+                    "subagent": true
+                }
+            }),
+        );
+        state
+    }
+
+    #[test]
+    fn unchanged_subagent_state_backfills_missing_delegation_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/08/01");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-unchanged-sub.jsonl");
+        write_codex_subagent_rollout(&rollout, "sess-unchanged-sub");
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // A database synced before delegation was recorded: the events are
+        // already there, so the rollout is never re-read for its own sake.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1')",
+            [],
+        )
+        .unwrap();
+        let mut state = unchanged_subagent_state(&rollout, "sess-unchanged-sub");
+
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let edge: (String, String, String, i64) = conn
+            .query_row(
+                "SELECT parent_session_id, relationship_uid, evidence_kind, created_ms \
+                 FROM session_relationships \
+                 WHERE source='codex' AND child_session_id='sess-unchanged-sub'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(edge.0, "parent");
+        assert_eq!(edge.1, "child:sess-unchanged-sub");
+        assert_eq!(edge.2, "codex_session_meta");
+
+        // A second pass over the same unchanged state neither duplicates the
+        // row nor re-reads the rollout to rewrite it.
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let (count, created): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(created_ms) FROM session_relationships \
+                 WHERE source='codex' AND child_session_id='sess-unchanged-sub'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(created, edge.3);
+    }
+
+    #[test]
+    fn subagent_registration_cleanup_keeps_the_thread_s_own_delegations() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/08/01");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-unchanged-sub.jsonl");
+        write_codex_subagent_rollout(&rollout, "sess-unchanged-sub");
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // A stale catalog registration for the subagent, which the fast path
+        // removes — firing the cascade that used to take the topology with it.
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) \
+             VALUES ('sess-unchanged-sub', 'codex', '/tmp/proj')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_relationships \
+             (source, parent_session_id, relationship_uid, child_session_id, relationship, \
+              identity_status, evidence_kind, child_has_events, created_ms, updated_ms) \
+             VALUES ('codex', 'sess-unchanged-sub', 'child:grandchild', 'grandchild', 'delegated', \
+                     'observed', 'codex_session_meta', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        let mut state = unchanged_subagent_state(&rollout, "sess-unchanged-sub");
+
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let registrations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions \
+                 WHERE source='codex' AND session_id='sess-unchanged-sub'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(registrations, 0);
+        let edges: Vec<String> = conn
+            .prepare(
+                "SELECT relationship_uid FROM session_relationships \
+                 WHERE source='codex' AND parent_session_id='sess-unchanged-sub'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(edges, vec!["child:grandchild".to_string()]);
     }
 
     #[test]

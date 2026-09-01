@@ -228,4 +228,38 @@ fn delegation_topology_survives_the_whole_acquisition_path() {
         )
         .unwrap();
     assert_eq!(placement, (1, 0));
+    drop(conn);
+
+    // A later full sync walks the same provider files again. It must not undo
+    // what hydration established: no re-attribution of the child's output, no
+    // catalog row for a delegated thread, no lost topology.
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    let after: (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT \
+               (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='abc'), \
+               (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='claude-root' AND event_uid LIKE 'side-%'), \
+               (SELECT COUNT(*) FROM sessions), \
+               (SELECT COUNT(*) FROM session_relationships)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(after, (1, 0, 2, 4));
+    let raw_path: String = conn
+        .query_row(
+            "SELECT raw_path FROM sessions WHERE source='claude' AND session_id='claude-root'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(raw_path.ends_with("claude-root.jsonl"));
+    assert_eq!(
+        session_tree(&conn, "codex", "root", &SessionTreeOptions::default())
+            .unwrap()
+            .nodes
+            .len(),
+        4
+    );
 }

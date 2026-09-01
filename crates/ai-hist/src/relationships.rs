@@ -60,6 +60,23 @@ impl ObservedRelationship<'_> {
 /// metadata an earlier one captured.
 pub fn record_relationship(conn: &Connection, observed: &ObservedRelationship<'_>) -> Result<()> {
     let now = now_ms();
+    // An observation that finally names the child supersedes the unlinked row
+    // an earlier provider version left for the same artifact: one file is not
+    // both a linked and an unlinked delegation. Its uid is keyed on the
+    // locator, so without this the stale row would outlive the upgrade.
+    if let (Some(_), Some(locator)) = (observed.child_session_id, observed.evidence_locator) {
+        conn.execute(
+            "DELETE FROM session_relationships \
+             WHERE source = ? AND parent_session_id = ? AND evidence_locator = ? \
+               AND identity_status = ?",
+            params![
+                observed.source,
+                observed.parent_session_id,
+                locator,
+                ai_hist_core::relationships::IDENTITY_UNLINKED,
+            ],
+        )?;
+    }
     conn.execute(
         "INSERT INTO session_relationships \
          (source, parent_session_id, relationship_uid, child_session_id, relationship, \
@@ -203,6 +220,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = open_db(&dir.path().join("history.db")).unwrap();
         record_relationship(&conn, &observed("root", None, "/tmp/agent-a.jsonl")).unwrap();
+        // A second sidecar the provider still does not name must survive the
+        // upgrade of the first one.
+        record_relationship(&conn, &observed("root", None, "/tmp/agent-b.jsonl")).unwrap();
         record_relationship(&conn, &observed("root", Some("abc"), "/tmp/agent-a.jsonl")).unwrap();
         record_relationship(&conn, &observed("root", Some("abc"), "/tmp/agent-a.jsonl")).unwrap();
         let children = session_children(&conn, "claude", "root").unwrap();
@@ -214,5 +234,15 @@ mod tests {
         assert_eq!(observed_child.child_session_id.as_deref(), Some("abc"));
         assert_eq!(observed_child.relationship_uid, "child:abc");
         assert!(observed_child.child_has_events);
+        // The superseded row for the same artifact is retired, not kept
+        // alongside the identity that replaced it.
+        assert_eq!(
+            children
+                .iter()
+                .filter(|child| child.identity_status == "unlinked")
+                .map(|child| child.evidence_locator.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["/tmp/agent-b.jsonl".to_string()]
+        );
     }
 }
