@@ -413,6 +413,8 @@ const REQUIRED_TABLES: &[&str] = &[
     "session_tags",
     "sessions",
     "session_presences",
+    "session_hydration_checkpoints",
+    "session_relationships",
     "schema_migrations",
     "discovery_skips",
 ];
@@ -478,7 +480,7 @@ const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
 const REQUIRED_EVENT_READ_INDEXES: &[&str] =
     &["idx_session_events_source_page", "idx_session_events_page"];
 const REQUIRED_SCOPE_READ_INDEXES: &[&str] = &["idx_session_presences_location"];
-const REQUIRED_TRIGGERS: &[&str] = &["delete_session_presences"];
+const REQUIRED_TRIGGERS: &[&str] = &["delete_session_presences", "delete_session_hydration_state"];
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &["session_presences_local_backfill_v1"];
 
 /// Whether this database already has everything [`init_db`] would add.
@@ -672,11 +674,41 @@ CREATE TABLE IF NOT EXISTS session_presences (
     discovery_state TEXT,
     PRIMARY KEY (source, session_id, location)
 );
+CREATE TABLE IF NOT EXISTS session_hydration_checkpoints (
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    location TEXT NOT NULL CHECK(location IN ('local', 'remote')),
+    source_stamp TEXT,
+    parser_version INTEGER NOT NULL,
+    last_event_at_ms INTEGER,
+    source_bytes INTEGER NOT NULL DEFAULT 0,
+    records_parsed INTEGER NOT NULL DEFAULT 0,
+    include_related INTEGER NOT NULL DEFAULT 1,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (source, session_id, location)
+);
+CREATE TABLE IF NOT EXISTS session_relationships (
+    source TEXT NOT NULL,
+    parent_session_id TEXT NOT NULL,
+    child_session_id TEXT NOT NULL,
+    relationship TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    PRIMARY KEY (source, parent_session_id, child_session_id)
+);
 CREATE TRIGGER IF NOT EXISTS delete_session_presences
 AFTER DELETE ON sessions
 BEGIN
     DELETE FROM session_presences
     WHERE source = OLD.source AND session_id = OLD.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS delete_session_hydration_state
+AFTER DELETE ON sessions
+BEGIN
+    DELETE FROM session_hydration_checkpoints
+    WHERE source = OLD.source AND session_id = OLD.session_id;
+    DELETE FROM session_relationships
+    WHERE source = OLD.source
+      AND (parent_session_id = OLD.session_id OR child_session_id = OLD.session_id);
 END;
 "#,
     )?;
@@ -781,6 +813,10 @@ VALUES ('session_presences_local_backfill_v1');
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_presences_locator ON session_presences(location, source, raw_locator)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_relationships_parent ON session_relationships(source, parent_session_id)",
         [],
     )?;
     conn.execute(
@@ -1702,21 +1738,64 @@ pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> 
         .backup(DatabaseName::Main, &tmp, None)
         .map_err(|source| SourceDatabaseError::new(opencode_db, source))?;
     let src = Connection::open(&tmp)?;
+    src.execute_batch("CREATE INDEX IF NOT EXISTS ai_hist_sync_part_session ON part(session_id);")?;
+    let session_ids = src
+        .prepare("SELECT id FROM session WHERE id IS NOT NULL AND id <> ''")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut inserted = 0;
+    for session_id in session_ids {
+        inserted += sync_opencode_session_from_connection(conn, &src, &session_id)?;
+    }
+    Ok(inserted)
+}
+
+/// Ingest one OpenCode session with session-keyed queries against the live
+/// source database. Unlike global sync this never copies or enumerates the
+/// complete provider store.
+pub fn sync_opencode_session(
+    conn: &Connection,
+    opencode_db: &Path,
+    session_id: &str,
+) -> Result<usize> {
+    let src = Connection::open_with_flags(
+        opencode_db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening {}", opencode_db.display()))?;
+    src.busy_timeout(std::time::Duration::from_secs(5))?;
+    src.execute_batch("BEGIN")?;
+    let result = sync_opencode_session_from_connection(conn, &src, session_id);
+    let _ = src.execute_batch("ROLLBACK");
+    result
+}
+
+fn sync_opencode_session_from_connection(
+    conn: &Connection,
+    src: &Connection,
+    session_id: &str,
+) -> Result<usize> {
     let mut stmt = src.prepare(
-        "SELECT s.id, s.directory, p.data, COALESCE(p.time_created, m.time_created, s.time_created) FROM part p JOIN message m ON m.id = p.message_id JOIN session s ON s.id = p.session_id WHERE json_extract(m.data, '$.role') = 'user' AND json_extract(p.data, '$.type') = 'text' ORDER BY p.time_created ASC",
+        "SELECT s.directory, p.data, COALESCE(p.time_created, m.time_created, s.time_created) \
+         FROM session s \
+         JOIN part p ON p.session_id = s.id \
+         JOIN message m ON m.id = p.message_id \
+         WHERE s.id = ? \
+           AND json_extract(m.data, '$.role') = 'user' \
+           AND json_extract(p.data, '$.type') = 'text' \
+         ORDER BY COALESCE(p.time_created, m.time_created, s.time_created) ASC",
     )?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map([session_id], |row| {
             Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut inserted = 0;
-    for (session_id, project, data, timestamp_ms) in rows {
+    for (project, data, timestamp_ms) in rows {
         let value: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
         let prompt = value
             .get("text")
@@ -1731,7 +1810,7 @@ pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> 
             &HistoryEntry {
                 id: 0,
                 source: "opencode".into(),
-                session_id: Some(session_id),
+                session_id: Some(session_id.to_string()),
                 project,
                 prompt: prompt.to_string(),
                 prompt_hash: Some(prompt_hash(prompt)),

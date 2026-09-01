@@ -26,6 +26,26 @@ argument; provider `--source` filters remain orthogonal to location scope.
 
 ## The two operations
 
+After those two catalog operations, targeted hydration acquires full evidence
+for one selected identity:
+
+```ts
+const sessions = await listSessionCatalog({ limit: 100 });
+await hydrateSession({ source: sessions[0].source, sessionId: sessions[0].sessionId });
+```
+
+Hydration requires the catalog row, never invokes discovery or global sync,
+and upgrades `discoveryState` to `full` transactionally. Here `full` means
+indexed through the returned source stamp, not that a live coding session has
+ended. File providers validate the saved locator against the expected provider
+root; OpenCode uses session-keyed queries against its live read-only database.
+Relay reports `HYDRATION_UNSUPPORTED` until a full-evidence connector exists.
+
+Codex child rollouts retain provider-native IDs and are linked through
+`session_relationships`; delegated task prompts are not stored as human prompt
+history. Set `includeRelated: false` or use CLI `--no-related` to acquire only
+the selected thread.
+
 | | `ai-hist sessions list` | `ai-hist sessions discover` |
 |---|---|---|
 | Reads | the cached ledger only | configured provider locations, with bounded reads |

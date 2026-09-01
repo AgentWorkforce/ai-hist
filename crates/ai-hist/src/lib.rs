@@ -3,8 +3,8 @@ use ai_hist_core::{
     default_db_path, import_json, insert_history, normalize_tag_name, open_db, open_db_readonly,
     parse_cursor_text, prompt_hash, raw_fts_query_error, recent, resume_command,
     schema_is_catalog_read_current, schema_is_current, search, session, session_events,
-    session_file_edits, session_tool_calls, sync_opencode_db, untag_session, HistoryEntry,
-    QueryFilter, SourceDatabaseError, SOURCE_CHOICES,
+    session_file_edits, session_tool_calls, sync_opencode_db, sync_opencode_session, untag_session,
+    HistoryEntry, QueryFilter, SourceDatabaseError, SOURCE_CHOICES,
 };
 pub use ai_hist_core::{SessionLocation, SessionScope};
 use anyhow::{Context, Result};
@@ -28,6 +28,7 @@ mod codex;
 /// Fast, shallow coding-agent session discovery and the cache-only catalog
 /// listing that backs it.
 pub mod discover;
+mod hydrate;
 mod learn;
 
 pub use discover::{
@@ -38,6 +39,11 @@ pub use discover::{
     SessionCatalogPage, ShallowReadAccess, ShallowSession, ShallowSessionProvider, SourceExemption,
     DEFAULT_CATALOG_LIMIT, DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION,
     SHALLOW_SCANNER_VERSION,
+};
+pub use hydrate::{
+    hydrate_session, hydrate_session_at, HydrateSessionOptions, HydrateSessionResult,
+    HydrationDiagnostic, HydrationEvidence, HydrationIndexedThrough,
+    SESSION_HYDRATION_CONTRACT_VERSION,
 };
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -5434,6 +5440,7 @@ struct CodexSessionMeta {
     cwd: String,
     git_branch: Option<String>,
     is_subagent: bool,
+    parent_session_id: Option<String>,
 }
 
 /// Read the `session_meta` line that opens every rollout file.
@@ -5487,11 +5494,21 @@ fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
             .and_then(|p| p.get("source"))
             .and_then(Value::as_object)
             .is_some_and(|s| s.contains_key("subagent"));
+    let parent_session_id = is_subagent
+        .then(|| {
+            payload
+                .and_then(|p| p.get("session_id"))
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty() && *id != session_id)
+                .map(str::to_string)
+        })
+        .flatten();
     Ok(Some(CodexSessionMeta {
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
         git_branch,
         is_subagent,
+        parent_session_id,
     }))
 }
 
@@ -6379,6 +6396,39 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
         let Some(content) = message.and_then(|m| m.get("content")) else {
             continue;
         };
+        if !sidechain
+            && message_role == "user"
+            && obj.get("isMeta").and_then(Value::as_bool) != Some(true)
+        {
+            let prompt = if let Some(text) = content.as_str() {
+                text.trim().to_string()
+            } else {
+                content
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|block| block.get("text").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            if !prompt.is_empty() && !discover::is_claude_control_prompt(&prompt) {
+                insert_history(
+                    conn,
+                    &HistoryEntry {
+                        id: 0,
+                        source: "claude".into(),
+                        session_id: Some(session_id.to_string()),
+                        project: project.map(str::to_string),
+                        prompt_hash: Some(prompt_hash(&prompt)),
+                        prompt,
+                        timestamp_ms: ts_ms,
+                    },
+                )?;
+            }
+        }
         if let Some(s) = content.as_str() {
             if !s.trim().is_empty() {
                 let role = if message_role == "assistant" {
@@ -7022,22 +7072,8 @@ fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -
                 let mut line = String::new();
                 while let Some(position) = source.next_line(&mut line)? {
                     consumed = position;
-                    match parse_cursor_text(&line) {
-                        Ok(Some(prompt)) => {
-                            inserted += insert_history(
-                                conn,
-                                &HistoryEntry {
-                                    id: 0,
-                                    source: "cursor".into(),
-                                    session_id: Some(session_id.clone()),
-                                    project: Some(project_path.clone()),
-                                    prompt_hash: Some(prompt_hash(&prompt)),
-                                    prompt,
-                                    timestamp_ms: ts_ms,
-                                },
-                            )?;
-                        }
-                        Ok(None) => {}
+                    match ingest_cursor_line(conn, &line, &session_id, &project_path, ts_ms) {
+                        Ok(count) => inserted += count,
                         Err(_) => errors += 1,
                     }
                 }
@@ -7058,6 +7094,30 @@ fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -
         sync_note!("  [cursor] +{inserted} rows from {files_seen} files{suffix}");
     }
     Ok(inserted)
+}
+
+fn ingest_cursor_line(
+    conn: &Connection,
+    line: &str,
+    session_id: &str,
+    project: &str,
+    timestamp_ms: i64,
+) -> Result<usize> {
+    let Some(prompt) = parse_cursor_text(line)? else {
+        return Ok(0);
+    };
+    insert_history(
+        conn,
+        &HistoryEntry {
+            id: 0,
+            source: "cursor".into(),
+            session_id: Some(session_id.to_string()),
+            project: Some(project.to_string()),
+            prompt_hash: Some(prompt_hash(&prompt)),
+            prompt,
+            timestamp_ms,
+        },
+    )
 }
 
 fn sorted_dirs(root: &Path) -> Result<Vec<PathBuf>> {
@@ -7109,31 +7169,7 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
         match scan_grok_session_file(&chat) {
             Ok(Some(session)) => {
                 let raw_path = chat.to_string_lossy().to_string();
-                upsert_session(
-                    conn,
-                    &session.session_id,
-                    "grok",
-                    session.cwd.as_deref(),
-                    session.git_branch.as_deref(),
-                    session.first_ts,
-                    session.last_ts,
-                    session.last_assistant_text.as_deref(),
-                    Some(&raw_path),
-                )?;
-                for (idx, prompt) in session.prompts.iter().enumerate() {
-                    inserted += insert_history(
-                        conn,
-                        &HistoryEntry {
-                            id: 0,
-                            source: "grok".into(),
-                            session_id: Some(session.session_id.clone()),
-                            project: session.cwd.clone(),
-                            prompt_hash: Some(prompt_hash(prompt)),
-                            prompt: prompt.clone(),
-                            timestamp_ms: session.first_ts + idx as i64,
-                        },
-                    )?;
-                }
+                inserted += ingest_grok_session(conn, &session, &raw_path)?;
                 sessions += 1;
                 grok_state.insert(key, json!(stamp));
             }
@@ -7151,6 +7187,36 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
             String::new()
         };
         sync_note!("  [grok] +{inserted} rows from {sessions} sessions{suffix}");
+    }
+    Ok(inserted)
+}
+
+fn ingest_grok_session(conn: &Connection, session: &GrokSession, raw_path: &str) -> Result<usize> {
+    upsert_session(
+        conn,
+        &session.session_id,
+        "grok",
+        session.cwd.as_deref(),
+        session.git_branch.as_deref(),
+        session.first_ts,
+        session.last_ts,
+        session.last_assistant_text.as_deref(),
+        Some(raw_path),
+    )?;
+    let mut inserted = 0;
+    for (idx, prompt) in session.prompts.iter().enumerate() {
+        inserted += insert_history(
+            conn,
+            &HistoryEntry {
+                id: 0,
+                source: "grok".into(),
+                session_id: Some(session.session_id.clone()),
+                project: session.cwd.clone(),
+                prompt_hash: Some(prompt_hash(prompt)),
+                prompt: prompt.clone(),
+                timestamp_ms: session.first_ts + idx as i64,
+            },
+        )?;
     }
     Ok(inserted)
 }
@@ -9443,6 +9509,33 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(event_count, 4);
+    }
+
+    #[test]
+    fn claude_control_wrappers_do_not_enter_prompt_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"s-control\",\"uuid\":\"control\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"<command-message>generated wrapper\"}}\n",
+                "{\"sessionId\":\"s-control\",\"uuid\":\"human\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"real prompt\"}}\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let prompts: Vec<String> = conn
+            .prepare("SELECT prompt FROM history ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(prompts, vec!["real prompt"]);
     }
 
     #[test]

@@ -11,7 +11,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
   mandatory Node-API engine.
 - Rust engine consumers must recompile for the scoped session API. Public
   catalog/discovery option, page, summary, and row structs now carry scope or
-  location data, and the native/catalog contract versions are now 3 and 2.
+  location data; that scoped-session change advanced the native/catalog
+  contract versions to 3 and 2 at the time.
   The legacy-named `list_sessions_local*` and `discover_sessions_local*`
   wrappers reject non-local options instead of silently rewriting them; use
   their `*_scoped*` counterparts for `remote` or `all`.
@@ -22,6 +23,17 @@ Notable changes to the native `ai-hist` CLI are documented here.
   exits with an explanation.
 
 ### Added
+
+- Add transactional targeted session hydration through Rust, N-API, the typed
+  `hydrateSession()` SDK API, `ai-hist sessions hydrate`, and MCP
+  `hydrate_session`. The result reports indexed-through state, evidence counts,
+  related sessions, and bounded-work diagnostics without returning a transcript.
+- Add automatic `session_hydration_checkpoints` and `session_relationships`
+  migrations. Existing databases upgrade in place on their next writable open.
+- Add bounded live OpenCode hydration queries keyed by session ID; targeted
+  hydration never copies or scans the complete OpenCode database.
+- Add a real-catalog hydration benchmark that selects provider-diverse local
+  sessions and reports first-call plus unchanged-checkpoint latency.
 
 - Add a consistent session location scope to collection operations: `--local`,
   `--remote`, and `--all` are mutually exclusive, with local as the default.
@@ -36,7 +48,7 @@ Notable changes to the native `ai-hist` CLI are documented here.
   connector ran at every requested location.
 - Add native search, recent, session, paged events, statistics, discovery,
   catalog listing, and explicit sync operations. The native-addon contract is
-  now version 3.
+  now version 4.
 - Add deterministic bounded event pagination using `(ts_ms, id)`.
 
 - Add `ai-hist sessions list` and `ai-hist sessions discover`: a shallow session
