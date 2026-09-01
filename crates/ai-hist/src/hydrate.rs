@@ -453,7 +453,7 @@ fn ingest_claude(conn: &Connection, options: &HydrateSessionOptions, path: &Path
     ingest_claude_transcript(conn, path)?;
     if options.include_related {
         for evidence in claude_subagents(path, &options.session_id)? {
-            ingest_claude_subagent(conn, options, &evidence)?;
+            ingest_claude_subagent(conn, &options.session_id, &evidence)?;
         }
     }
     Ok(())
@@ -467,9 +467,14 @@ fn ingest_claude(conn: &Connection, options: &HydrateSessionOptions, path: &Path
 /// Without one this provider version simply does not name the child, so the
 /// sidechain assistant output stays on the parent exactly as before and the
 /// row records unlinked evidence rather than a fabricated identity.
-fn ingest_claude_subagent(
+///
+/// Shared with the full sync walk, which meets the same sidecars from the
+/// other direction: one sidecar produces the same events and the same
+/// `session_relationships` row whichever path reaches it first, and the row
+/// is an idempotent upsert so the path that arrives second changes nothing.
+pub(crate) fn ingest_claude_subagent(
     conn: &Connection,
-    options: &HydrateSessionOptions,
+    parent_session_id: &str,
     evidence: &ClaudeSubagentEvidence,
 ) -> Result<()> {
     let locator = evidence.path.to_string_lossy().to_string();
@@ -481,7 +486,7 @@ fn ingest_claude_subagent(
                 conn,
                 &ObservedRelationship {
                     source: "claude",
-                    parent_session_id: &options.session_id,
+                    parent_session_id,
                     child_session_id: Some(agent_id),
                     relationship: "delegated",
                     child_agent_type: evidence.agent_type.as_deref(),
@@ -502,7 +507,7 @@ fn ingest_claude_subagent(
                 conn,
                 &ObservedRelationship {
                     source: "claude",
-                    parent_session_id: &options.session_id,
+                    parent_session_id,
                     child_session_id: None,
                     relationship: "delegated",
                     child_agent_type: evidence.agent_type.as_deref(),
@@ -522,7 +527,7 @@ fn ingest_claude_subagent(
 
 /// One Claude subagent transcript beside a parent's, with whatever identity
 /// and description the provider recorded for it.
-struct ClaudeSubagentEvidence {
+pub(crate) struct ClaudeSubagentEvidence {
     path: PathBuf,
     /// The in-record `agentId`. `None` for provider versions that do not emit
     /// it.
@@ -533,6 +538,56 @@ struct ClaudeSubagentEvidence {
     spawn_depth: Option<i64>,
     tool_use_id: Option<String>,
     first_ts_ms: Option<i64>,
+}
+
+/// Read one subagent sidecar's delegation evidence.
+///
+/// `meta` is the scan of this same file, whose `agent_id` is the child's
+/// identity as the provider recorded it: the file name embeds the same id,
+/// but a name is not evidence, and deriving an identity from it would invent
+/// one for provider versions that never recorded any. Everything else the
+/// delegation is described by comes from the sibling
+/// `agent-<agentId>.meta.json`, or from the transcript's first record when
+/// that sidecar does not exist.
+pub(crate) fn claude_subagent_evidence(
+    path: PathBuf,
+    meta: &ClaudeSessionMeta,
+) -> ClaudeSubagentEvidence {
+    let first = first_claude_record(&path);
+    let record_str = |key: &str| {
+        first
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let sidecar = claude_subagent_meta(&path);
+    let meta_str = |key: &str| {
+        sidecar
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    ClaudeSubagentEvidence {
+        agent_id: meta.agent_id.clone(),
+        agent_type: meta_str("agentType").or_else(|| record_str("attributionAgent")),
+        description: meta_str("description"),
+        model: meta_str("model"),
+        spawn_depth: sidecar
+            .as_ref()
+            .and_then(|value| value.get("spawnDepth"))
+            .and_then(Value::as_i64),
+        tool_use_id: meta_str("toolUseId"),
+        first_ts_ms: first.as_ref().and_then(|value| {
+            value
+                .get("timestamp")
+                .and_then(|ts| ts.as_str().and_then(parse_iso_ms).or_else(|| ts.as_i64()))
+        }),
+        path,
+    }
 }
 
 /// Every subagent transcript belonging to one parent session.
@@ -551,52 +606,13 @@ fn claude_subagents(transcript: &Path, session_id: &str) -> Result<Vec<ClaudeSub
         }
         // A subagent transcript's records carry the PARENT's sessionId, which
         // is what ties this file to the session being hydrated.
-        let belongs = scan_claude_session_file(&candidate)
-            .ok()
-            .flatten()
-            .is_some_and(|meta| meta.session_id == session_id);
-        if !belongs {
+        let Some(meta) = scan_claude_session_file(&candidate).ok().flatten() else {
+            continue;
+        };
+        if meta.session_id != session_id {
             continue;
         }
-        let first = first_claude_record(&candidate);
-        let record_str = |key: &str| {
-            first
-                .as_ref()
-                .and_then(|value| value.get(key))
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        };
-        // The child's identity is read from the record and from nowhere else.
-        // The file name happens to embed the same id, but a name is not
-        // evidence: deriving an identity from it would invent one for
-        // provider versions that never recorded it.
-        let agent_id = record_str("agentId");
-        let meta = claude_subagent_meta(&candidate);
-        let meta_str = |key: &str| {
-            meta.as_ref()
-                .and_then(|value| value.get(key))
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        };
-        evidence.push(ClaudeSubagentEvidence {
-            agent_id,
-            agent_type: meta_str("agentType").or_else(|| record_str("attributionAgent")),
-            description: meta_str("description"),
-            model: meta_str("model"),
-            spawn_depth: meta
-                .as_ref()
-                .and_then(|value| value.get("spawnDepth"))
-                .and_then(Value::as_i64),
-            tool_use_id: meta_str("toolUseId"),
-            first_ts_ms: first.as_ref().and_then(|value| {
-                value
-                    .get("timestamp")
-                    .and_then(|ts| ts.as_str().and_then(parse_iso_ms).or_else(|| ts.as_i64()))
-            }),
-            path: candidate,
-        });
+        evidence.push(claude_subagent_evidence(candidate, &meta));
     }
     Ok(evidence)
 }

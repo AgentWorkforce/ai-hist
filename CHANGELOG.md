@@ -50,9 +50,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
   version already ingested — so topology is queryable without targeted
   hydration, and existing databases migrate automatically through the
   `session_relationships_v2` marker. A full `sync` also treats a Claude
-  subagent sidecar as delegated evidence rather than a session: it keeps the
-  child's output under the child, and leaves the parent's own provider locator
-  alone.
+  subagent sidecar as delegated evidence rather than a session: it records the
+  same observed row (or, for a sidechain the provider never named, the same
+  unlinked evidence) that targeted hydration records, keeps the child's output
+  under the child, and leaves the parent's own provider locator alone.
 - Add remote provider connectors behind the existing `--remote` / `--all`
   acquisition scopes: `claude-web` lists claude.ai/code web sessions with the
   OAuth sign-in the Claude Code CLI stored (`~/.claude/.credentials.json`,
