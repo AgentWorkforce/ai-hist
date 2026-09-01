@@ -6390,7 +6390,7 @@ fn sync_claude_session_metadata(
     let mut upserted = 0;
     for path in collect_matching_files(root, "", "jsonl")? {
         let key = path.to_string_lossy().to_string();
-        let stamp = file_stamp(&path)?;
+        let stamp = claude_sync_stamp(&path)?;
         if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
             && (claude_transcript_events_exist(conn, &path)?
                 || claude_sidecar_evidence_exists(conn, &path)?)
@@ -6439,6 +6439,23 @@ fn sync_claude_session_metadata(
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
     Ok(())
+}
+
+/// What a Claude transcript is skipped on when nothing about it changed.
+///
+/// A subagent sidecar's `agent-<agentId>.meta.json` is the only place the
+/// child's type, name, model and spawn depth are recorded, so metadata that
+/// changes beside an untouched transcript is still new evidence and has to
+/// reach `session_relationships`. Hydration stamps its source snapshot by the
+/// same rule.
+fn claude_sync_stamp(path: &Path) -> Result<String> {
+    let mut stamp = file_stamp(path)?;
+    let metadata = hydrate::claude_subagent_meta_path(path);
+    if metadata.is_file() {
+        stamp.push('|');
+        stamp.push_str(&file_stamp(&metadata)?);
+    }
+    Ok(stamp)
 }
 
 /// Whether an unchanged subagent sidecar has already been ingested.
@@ -8301,8 +8318,8 @@ fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpoint_sync_state, cleanup_stale_sync_state_temps, cron_schedule, doctor_report,
-        export_history, file_stamp, git_commit_time_ms, git_stdout, import_history,
+        checkpoint_sync_state, claude_sync_stamp, cleanup_stale_sync_state_temps, cron_schedule,
+        doctor_report, export_history, file_stamp, git_commit_time_ms, git_stdout, import_history,
         ingest_claude_transcript, is_sqlite_contention, link_git_commit, load_sync_state,
         parse_trajectory_file, paths_overlap, prepare_sync_and_push_db,
         process_status_with_programs, save_sync_state, search_all, service_command_args,
@@ -10057,7 +10074,7 @@ mod tests {
             .get_mut("claude_sessions_v2")
             .and_then(Value::as_object_mut)
             .unwrap()
-            .insert(key, json!(file_stamp(&named).unwrap()));
+            .insert(key, json!(claude_sync_stamp(&named).unwrap()));
 
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
         let rewritten = |conn: &Connection| -> i64 {
@@ -10080,6 +10097,30 @@ mod tests {
         .unwrap();
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
         assert_eq!(rewritten(&conn), 1);
+    }
+
+    #[test]
+    fn a_changed_metadata_sidecar_refreshes_delegation_during_a_full_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, named, _) = write_claude_parent_with_subagents(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        // The transcript never moves; only what describes the child changes.
+        fs::write(
+            named.with_extension("meta.json"),
+            r#"{"agentType":"Explore","description":"explore the code","toolUseId":"toolu_1","spawnDepth":2,"model":"other-model"}"#,
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        let row = delegation_row(&conn, "claude_subagent_meta");
+        assert_eq!(row.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(row.agent_name.as_deref(), Some("explore the code"));
+        assert_eq!(row.model.as_deref(), Some("other-model"));
+        assert_eq!(row.spawn_depth, Some(2));
     }
 
     #[test]
@@ -10114,7 +10155,7 @@ mod tests {
         for path in [&parent, &named, &nameless] {
             claude_sessions.insert(
                 path.to_string_lossy().to_string(),
-                json!(file_stamp(path).unwrap()),
+                json!(claude_sync_stamp(path).unwrap()),
             );
         }
         let mut state = Map::new();

@@ -348,6 +348,7 @@ fn source_snapshot(
             if metadata.is_file() {
                 stamp.push('|');
                 stamp.push_str(&file_stamp(&metadata)?);
+                bytes += metadata.metadata()?.len() as i64;
             }
         }
     }
@@ -634,7 +635,7 @@ fn first_claude_record(path: &Path) -> Option<Value> {
 /// Where the `agent-<agentId>.meta.json` sidecar sits beside a subagent
 /// transcript. The provider version that writes one names it after the
 /// transcript, so the path is derived rather than searched for.
-fn claude_subagent_meta_path(transcript: &Path) -> PathBuf {
+pub(crate) fn claude_subagent_meta_path(transcript: &Path) -> PathBuf {
     transcript.with_extension("meta.json")
 }
 
@@ -1624,6 +1625,41 @@ mod tests {
                 Some(2),
             )
         );
+    }
+
+    #[test]
+    fn hydration_metrics_count_every_file_the_run_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = claude_parent_with_subagent(
+            dir.path(),
+            CLAUDE_AGENT_RECORDS,
+            Some(CLAUDE_AGENT_META),
+            "agent-abc",
+        );
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        let subagents = dir.path().join(".claude/projects/app/session-1/subagents");
+        // The metadata sidecar is evidence the run acquired like any other, so
+        // its bytes belong in what the metrics report was read.
+        let expected: i64 = [
+            transcript,
+            subagents.join("agent-abc.jsonl"),
+            subagents.join("agent-abc.meta.json"),
+        ]
+        .iter()
+        .map(|path| fs::metadata(path).unwrap().len() as i64)
+        .sum();
+        let metrics = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "HYDRATION_METRICS")
+            .unwrap();
+        assert_eq!(metrics.source_bytes, Some(expected));
     }
 
     #[test]
