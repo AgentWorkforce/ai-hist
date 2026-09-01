@@ -39,6 +39,37 @@ fn write_claude_credentials(home: &Path, expires_at_ms: i64) -> PathBuf {
 
 const FAR_FUTURE_MS: i64 = 4_102_444_800_000; // 2100-01-01
 
+/// Serializes the availability tests and clears the ambient
+/// `RELAYHISTORY_CLAUDE_CREDENTIALS` override for their duration, restoring
+/// whatever value the process had once the guard drops.
+static CREDENTIALS_OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
+
+struct ClearedCredentialsOverride {
+    previous: Option<std::ffi::OsString>,
+    _serialized: std::sync::MutexGuard<'static, ()>,
+}
+
+fn without_credentials_override() -> ClearedCredentialsOverride {
+    let guard = CREDENTIALS_OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = std::env::var_os("RELAYHISTORY_CLAUDE_CREDENTIALS");
+    std::env::remove_var("RELAYHISTORY_CLAUDE_CREDENTIALS");
+    ClearedCredentialsOverride {
+        previous,
+        _serialized: guard,
+    }
+}
+
+impl Drop for ClearedCredentialsOverride {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("RELAYHISTORY_CLAUDE_CREDENTIALS", value),
+            None => std::env::remove_var("RELAYHISTORY_CLAUDE_CREDENTIALS"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // claude-web
 // ---------------------------------------------------------------------------
@@ -427,7 +458,7 @@ fn codex_provider_follows_the_cursor_across_pages() {
 fn statuses_report_missing_credentials_with_the_paths_looked_at() {
     // A developer's ambient credentials override must not leak into the
     // isolated home this test asserts against.
-    std::env::remove_var("RELAYHISTORY_CLAUDE_CREDENTIALS");
+    let _cleared = without_credentials_override();
     let home = tempfile::tempdir().unwrap();
     let statuses = remote_connector_statuses_at(home.path());
     assert_eq!(statuses.len(), 2);
@@ -451,7 +482,7 @@ fn statuses_report_missing_credentials_with_the_paths_looked_at() {
 
 #[test]
 fn a_source_filter_that_excludes_every_configured_connector_is_unsupported() {
-    std::env::remove_var("RELAYHISTORY_CLAUDE_CREDENTIALS");
+    let _cleared = without_credentials_override();
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join(".codex")).unwrap();
     std::fs::write(home.path().join(".codex/auth.json"), "{}").unwrap();

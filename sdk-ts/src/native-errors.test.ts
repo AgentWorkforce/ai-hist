@@ -6,7 +6,7 @@ import test from 'node:test';
 import {
   DatabaseOpenError, NativeContractMismatchError, SessionNotFoundError, UnsupportedOperationError,
   discoverSessions, hydrateSession, listSessionCatalogPage, recent, stats, sync,
-  validateNativeContract, validateNativeScope,
+  validateNativeContract, validateNativeLocation, validateNativeScope,
 } from './index.js';
 
 test('missing database reads are explicit empty cache operations', async () => {
@@ -51,6 +51,13 @@ test('SDK/native contract mismatch is actionable', () => {
     (error: unknown) => error instanceof NativeContractMismatchError
       && error.code === 'NATIVE_CONTRACT_MISMATCH'
       && /invalid session scope/.test(error.message),
+  );
+  assert.equal(validateNativeLocation('remote'), 'remote');
+  assert.throws(
+    () => validateNativeLocation('cloud'),
+    (error: unknown) => error instanceof NativeContractMismatchError
+      && error.code === 'NATIVE_CONTRACT_MISMATCH'
+      && /invalid session location/.test(error.message),
   );
 });
 
