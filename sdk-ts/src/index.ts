@@ -352,6 +352,7 @@ export interface SessionDescendantsOptions extends GetSessionRelationshipsOption
 export interface DescendantEventsOptions {
   source: CatalogSource;
   dbPath?: string;
+  /** Events read per session, not a total for the iteration. */
   limit?: number;
   maxDepth?: number;
   /** Defaults to true. */
@@ -617,7 +618,7 @@ function assertRelationshipContract(value: number): void {
   if (value !== SESSION_RELATIONSHIP_CONTRACT_VERSION) {
     throw new NativeContractMismatchError(
       `ai-hist expects relationship contract ${SESSION_RELATIONSHIP_CONTRACT_VERSION}, but native returned ${value}.`,
-      'RELATIONSHIP_CONTRACT_MISMATCH',
+      'NATIVE_CONTRACT_MISMATCH',
     );
   }
 }

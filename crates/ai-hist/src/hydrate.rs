@@ -68,6 +68,9 @@ struct SourceSnapshot {
     bytes: i64,
     records: i64,
     path: Option<PathBuf>,
+    /// Claude subagent sidecars, parsed once while stamping the source so the
+    /// ingestion pass does not walk and re-parse the same files.
+    claude_subagents: Vec<ClaudeSubagentEvidence>,
 }
 
 fn hydration_error(code: &str, message: impl std::fmt::Display) -> anyhow::Error {
@@ -126,7 +129,13 @@ fn hydrate_session_at_with_home(
     // has a provider-native uniqueness key, so interruption followed by retry is
     // safe for both new and growing sessions.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    ingest_selected(&tx, options, &target, snapshot.path.as_deref())?;
+    ingest_selected(
+        &tx,
+        options,
+        &target,
+        snapshot.path.as_deref(),
+        &snapshot.claude_subagents,
+    )?;
     tx.execute(
         "UPDATE sessions SET discovery_state = 'full', source_stamp = ?, parser_version = ? \
          WHERE source = ? AND session_id = ?",
@@ -308,6 +317,7 @@ fn source_snapshot(
             // complete `part` table on older stores missing its usual index.
             records: 0,
             path: Some(path),
+            claude_subagents: Vec::new(),
         });
     }
 
@@ -335,8 +345,10 @@ fn source_snapshot(
     } else {
         file_stamp(&path)?
     };
+    let mut subagents = Vec::new();
     if options.source == "claude" && options.include_related {
-        for evidence in claude_subagents(&path, &options.session_id)? {
+        subagents = claude_subagents(&path, &options.session_id)?;
+        for evidence in &subagents {
             stamp.push('|');
             stamp.push_str(&file_stamp(&evidence.path)?);
             bytes += evidence.path.metadata()?.len() as i64;
@@ -365,6 +377,7 @@ fn source_snapshot(
         bytes,
         records,
         path: Some(path),
+        claude_subagents: subagents,
     })
 }
 
@@ -418,9 +431,10 @@ fn ingest_selected(
     options: &HydrateSessionOptions,
     target: &CatalogTarget,
     path: Option<&Path>,
+    claude_subagents: &[ClaudeSubagentEvidence],
 ) -> Result<()> {
     match options.source.as_str() {
-        "claude" => ingest_claude(conn, options, path.unwrap()),
+        "claude" => ingest_claude(conn, options, path.unwrap(), claude_subagents),
         "codex" => ingest_codex(conn, options, path.unwrap()),
         "cursor" => ingest_cursor(conn, options, target, path.unwrap()),
         "grok" => ingest_grok(conn, options, path.unwrap()),
@@ -435,7 +449,12 @@ fn ingest_selected(
     }
 }
 
-fn ingest_claude(conn: &Connection, options: &HydrateSessionOptions, path: &Path) -> Result<()> {
+fn ingest_claude(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    path: &Path,
+    subagents: &[ClaudeSubagentEvidence],
+) -> Result<()> {
     let meta = scan_claude_session_file(path)?.ok_or_else(|| {
         hydration_error(
             "SESSION_SOURCE_MISMATCH",
@@ -460,10 +479,10 @@ fn ingest_claude(conn: &Connection, options: &HydrateSessionOptions, path: &Path
         Some(&path.to_string_lossy()),
     )?;
     ingest_claude_transcript(conn, path)?;
-    if options.include_related {
-        for evidence in claude_subagents(path, &options.session_id)? {
-            ingest_claude_subagent(conn, &options.session_id, &evidence)?;
-        }
+    // The snapshot already walked and parsed these sidecars to stamp them, so
+    // this pass indexes that evidence instead of finding it a second time.
+    for evidence in subagents {
+        ingest_claude_subagent(conn, &options.session_id, evidence)?;
     }
     Ok(())
 }
@@ -536,6 +555,7 @@ pub(crate) fn ingest_claude_subagent(
 
 /// One Claude subagent transcript beside a parent's, with whatever identity
 /// and description the provider recorded for it.
+#[derive(Debug)]
 pub(crate) struct ClaudeSubagentEvidence {
     path: PathBuf,
     /// The in-record `agentId`. `None` for provider versions that do not emit

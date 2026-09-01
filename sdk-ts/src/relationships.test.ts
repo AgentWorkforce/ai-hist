@@ -66,6 +66,29 @@ function childIds(children: SessionRelationship[]): Array<string | null> {
   return children.map((child) => child.childSessionId);
 }
 
+/**
+ * One Claude subagent transcript: its records carry the parent's `sessionId`
+ * and the provider names the child with `agentId`, so the same child can be
+ * reached from more than one parent.
+ */
+async function claudeSubagent(
+  project: string,
+  options: { file: string; parent: string; agent: string; at: string },
+): Promise<void> {
+  const common = { sessionId: options.parent, agentId: options.agent, isSidechain: true, cwd: '/work/app' };
+  await writeFile(join(project, options.file), [
+    JSON.stringify({
+      ...common, uuid: `${options.file}-u`, type: 'user',
+      message: { role: 'user', content: `${options.agent} instruction` }, timestamp: options.at,
+    }),
+    JSON.stringify({
+      ...common, uuid: `${options.file}-a`, type: 'assistant',
+      message: { role: 'assistant', content: `${options.agent} result` }, timestamp: options.at,
+    }),
+    '',
+  ].join('\n'));
+}
+
 test('missing databases answer relationship queries with provider capabilities', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-relationships-empty-'));
   const dbPath = join(root, 'missing', 'history.db');
@@ -327,6 +350,45 @@ test('claude evidence without a stable child identity stays unlinked', async () 
     assert.deepEqual(tree.nodes.map((node) => node.sessionId), ['session-1']);
     assert.deepEqual(tree.unlinked, relationships.asParent);
     assert.deepEqual(tree.diagnostics.map((item) => item.code), ['RELATIONSHIP_UNLINKED_CHILD']);
+  });
+});
+
+test('a shared child is emitted once and read the same way by both readers', async () => {
+  await withHome('relayhistory-relationships-diamond-', async (home, dbPath) => {
+    const project = join(home, '.claude', 'projects', 'app');
+    await mkdir(project, { recursive: true });
+    await writeFile(join(project, 'session-root.jsonl'), [
+      JSON.stringify({
+        sessionId: 'root', uuid: 'root-u', cwd: '/work/app', type: 'user',
+        message: { role: 'user', content: 'root prompt' }, timestamp: '2026-08-31T10:00:00Z',
+      }),
+      '',
+    ].join('\n'));
+    // Both children delegate to the same subagent, so the two branches meet
+    // again at `shared`: a diamond, not a cycle.
+    await claudeSubagent(project, { file: 'agent-child-a.jsonl', parent: 'root', agent: 'child-a', at: '2026-08-31T10:00:01Z' });
+    await claudeSubagent(project, { file: 'agent-child-b.jsonl', parent: 'root', agent: 'child-b', at: '2026-08-31T10:00:02Z' });
+    await claudeSubagent(project, { file: 'agent-shared-a.jsonl', parent: 'child-a', agent: 'shared', at: '2026-08-31T10:00:03Z' });
+    await claudeSubagent(project, { file: 'agent-shared-b.jsonl', parent: 'child-b', agent: 'shared', at: '2026-08-31T10:00:04Z' });
+    await sync({ dbPath });
+
+    const tree = await getSessionTree({ source: 'claude', sessionId: 'root', dbPath });
+    assert.deepEqual(tree.nodes.map((node) => node.sessionId), ['root', 'child-a', 'shared', 'child-b']);
+    // Meeting `shared` again leaves nothing unexplored, so neither parent is
+    // marked truncated and no budget was reached.
+    assert.deepEqual(tree.nodes.map((node) => [node.sessionId, node.childCount, node.truncated]), [
+      ['root', 2, false], ['child-a', 1, false], ['shared', 0, false], ['child-b', 1, false],
+    ]);
+    assert.equal(tree.truncated, false);
+    assert.deepEqual(tree.diagnostics, []);
+
+    const walked: SessionTreeNode[] = [];
+    for await (const node of sessionDescendants({ source: 'claude', sessionId: 'root', dbPath })) {
+      walked.push(node);
+    }
+    assert.equal(walked.filter((node) => node.sessionId === 'shared').length, 1);
+    const byId = (nodes: SessionTreeNode[]) => [...nodes].sort((left, right) => left.sessionId.localeCompare(right.sessionId));
+    assert.deepEqual(byId(walked), byId(tree.nodes.slice(1)));
   });
 });
 

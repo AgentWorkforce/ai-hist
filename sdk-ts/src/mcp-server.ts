@@ -96,8 +96,8 @@ server.tool('get_session_tree',
   'Complete descendant delegation tree for one session, with cycle protection and deterministic ordering. Child events are not flattened into the parent.', {
   source: CATALOG_SOURCE,
   session_id: z.string().min(1),
-  max_depth: z.number().int().min(1).max(64).optional().default(32),
-  max_nodes: z.number().int().min(1).max(10000).optional().default(1000),
+  max_depth: z.number().int().min(1).max(64).optional(),
+  max_nodes: z.number().int().min(1).max(10000).optional(),
 }, READ, ({ source, session_id, max_depth, max_nodes }) => call(() => getSessionTree({
   source, sessionId: session_id, maxDepth: max_depth, maxNodes: max_nodes,
 })));

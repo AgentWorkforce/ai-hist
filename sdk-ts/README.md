@@ -131,7 +131,8 @@ breadth-first without materializing a tree. It yields the nodes
 children only, at the depth boundary included) and the same `truncated` rule.
 The order differs: the walker is breadth-first, the tree is pre-order, so a
 consumer that depends on either the root node or `getSessionTree`'s ordering
-has to account for that.
+has to account for that. `sessionEventsIncludingDescendants` applies its
+`limit` to each session it reads, not to the iteration as a whole.
 
 Native loading failures distinguish unsupported platforms, missing optional
 platform packages, addon load failures, SDK/native contract mismatches, and
