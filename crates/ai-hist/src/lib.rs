@@ -5603,8 +5603,8 @@ struct CodexSessionMeta {
     /// The parent this thread was delegated by, from whichever field the
     /// provider recorded it in.
     parent_session_id: Option<String>,
-    /// `payload.parent_thread_id`, kept as the provider-native reference even
-    /// when `payload.session_id` is what named the parent.
+    /// The provider-native parent-thread reference, whether top-level or in a
+    /// structured thread-spawn source, kept separately from legacy `session_id`.
     parent_thread_id: Option<String>,
     /// The label under `payload.source.subagent`, when the rollout carries one.
     subagent_label: Option<String>,
@@ -5613,13 +5613,56 @@ struct CodexSessionMeta {
     meta_ts_ms: Option<i64>,
 }
 
+/// Resolve the parent identity from every Codex session-meta shape observed in
+/// local rollouts. Newer producers use the explicit top-level field, spawned
+/// agents can retain it inside their structured source, and older producers
+/// used `session_id` for the parent conversation.
+fn codex_parent_thread_id(
+    payload: Option<&serde_json::Map<String, Value>>,
+    session_id: &str,
+) -> Option<String> {
+    let valid_parent = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && *id != session_id)
+            .map(str::to_string)
+    };
+
+    valid_parent(payload.and_then(|p| p.get("parent_thread_id"))).or_else(|| {
+        valid_parent(
+            payload
+                .and_then(|p| p.get("source"))
+                .and_then(Value::as_object)
+                .and_then(|source| source.get("subagent"))
+                .and_then(Value::as_object)
+                .and_then(|subagent| subagent.get("thread_spawn"))
+                .and_then(Value::as_object)
+                .and_then(|spawn| spawn.get("parent_thread_id")),
+        )
+    })
+}
+
+fn codex_parent_session_id(
+    payload: Option<&serde_json::Map<String, Value>>,
+    session_id: &str,
+) -> Option<String> {
+    codex_parent_thread_id(payload, session_id).or_else(|| {
+        payload
+            .and_then(|p| p.get("session_id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && *id != session_id)
+            .map(str::to_string)
+    })
+}
+
 /// Read the `session_meta` line that opens every rollout file.
 ///
-/// Sessions key on `payload.id` — the per-thread id. Newer rollouts also
-/// carry `payload.session_id`, but that names the *parent* conversation for
-/// subagent threads; keying on it would collapse every subagent into its
-/// parent. Subagent threads are detected instead (`thread_source`, or the
-/// object form of `payload.source`) and excluded from session registration.
+/// Sessions key on `payload.id` — the per-thread id. Subagent rollouts can
+/// carry their parent in `parent_thread_id`, a structured thread-spawn source,
+/// or the legacy `session_id`; keying on any of those would collapse every
+/// subagent into its parent. Subagent threads are detected instead
+/// (`thread_source`, or the object form of `payload.source`) and excluded from
+/// session registration.
 fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
     let first = fs::read_to_string(path)
         .ok()
@@ -5665,18 +5708,11 @@ fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
         .and_then(Value::as_str)
         == Some("subagent")
         || subagent.is_some();
-    let named_parent = |key: &str| {
-        payload
-            .and_then(|p| p.get(key))
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty() && *id != session_id)
-            .map(str::to_string)
-    };
     let parent_thread_id = is_subagent
-        .then(|| named_parent("parent_thread_id"))
+        .then(|| codex_parent_thread_id(payload, session_id))
         .flatten();
     let parent_session_id = is_subagent
-        .then(|| named_parent("session_id").or_else(|| parent_thread_id.clone()))
+        .then(|| codex_parent_session_id(payload, session_id))
         .flatten();
     // The label is an object in the observed rollouts (`{"other":"guardian"}`);
     // its value names the agent, and its key is the only thing left when the
@@ -10518,6 +10554,75 @@ mod tests {
 
     fn codex_meta(path: &std::path::Path) -> super::CodexSessionMeta {
         super::read_codex_session_meta(path).unwrap().unwrap()
+    }
+
+    #[test]
+    fn codex_parent_resolution_supports_current_structured_and_legacy_metadata() {
+        let cases = [
+            (
+                json!({
+                    "id": "child",
+                    "parent_thread_id": "top-level-parent",
+                    "session_id": "legacy-parent",
+                    "source": {"subagent": {"thread_spawn": {
+                        "parent_thread_id": "nested-parent",
+                        "depth": 1
+                    }}}
+                }),
+                Some("top-level-parent"),
+            ),
+            (
+                json!({
+                    "id": "child",
+                    "source": {"subagent": {"thread_spawn": {
+                        "parent_thread_id": "nested-parent",
+                        "depth": 1
+                    }}}
+                }),
+                Some("nested-parent"),
+            ),
+            (
+                json!({"id": "child", "session_id": "legacy-parent"}),
+                Some("legacy-parent"),
+            ),
+            (
+                json!({
+                    "id": "child",
+                    "parent_thread_id": "child",
+                    "session_id": "",
+                    "source": {"subagent": {"thread_spawn": {
+                        "parent_thread_id": "child",
+                        "depth": 1
+                    }}}
+                }),
+                None,
+            ),
+        ];
+
+        for (payload, expected) in cases {
+            assert_eq!(
+                super::codex_parent_session_id(payload.as_object(), "child").as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn codex_marker_only_guardian_remains_an_unlinked_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-guardian.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":"2026-08-31T10:00:00.000Z","type":"session_meta","payload":{"id":"guardian","cwd":"/tmp/proj","source":{"subagent":{"other":"guardian"}}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let meta = codex_meta(&path);
+        assert!(meta.is_subagent);
+        assert_eq!(meta.parent_session_id, None);
     }
 
     fn response_user(ts: &str, text: &str) -> String {
