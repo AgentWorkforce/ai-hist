@@ -29,6 +29,8 @@ npm install --global ai-hist
 ai-hist sessions discover --limit 100
 ai-hist sessions list --limit 100
 ai-hist sessions hydrate codex 01a04f0c-... --json
+ai-hist sessions tools codex 01a04f0c-... --limit 50 --json
+ai-hist sessions edits codex 01a04f0c-... --limit 50 --json
 ```
 
 Session-set commands share one mutually exclusive location scope:
@@ -77,6 +79,8 @@ import {
   hydrateSession,
   listSessionCatalog,
   getSessionEventsPage,
+  getSessionToolCallsPage,
+  getSessionFileEditsPage,
   search,
   sync,
 } from 'ai-hist';
@@ -92,6 +96,12 @@ const firstEvents = sessions[0]
       limit: 200,
     })
   : null;
+const firstTools = sessions[0]
+  ? await getSessionToolCallsPage(sessions[0].source, sessions[0].sessionId, { limit: 200 })
+  : null;
+const firstEdits = sessions[0]
+  ? await getSessionFileEditsPage(sessions[0].source, sessions[0].sessionId, { limit: 200 })
+  : null;
 const matches = await search('migration', { limit: 20, scope: 'all' });
 await sync({ scope: 'local' }); // explicit full ingestion; local is the default
 ```
@@ -99,7 +109,9 @@ await sync({ scope: 'local' }); // explicit full ingestion; local is the default
 `listSessionCatalog` is cache-only. `discoverSessions` performs bounded shallow
 provider discovery and updates the shared ledger. `hydrateSession` fully
 indexes one existing catalog identity and returns evidence counts rather than
-the transcript; repeating it is safe as a live session grows. `sync` performs
+the transcript; repeating it is safe as a live session grows. The tool call and
+file edit pages read that hydrated evidence back as structured rows and require
+both a source and a session ID, because provider session IDs collide. `sync` performs
 full global ingestion. Reads never silently turn into discovery, hydration, or
 sync. Hydration includes linked subagent evidence by default; CLI callers can
 pass `--no-related`.
@@ -111,7 +123,8 @@ npx -y ai-hist-mcp
 ```
 
 MCP exposes thin adapters for search, recent history, catalog listing,
-discovery, targeted hydration, sessions, paged events, statistics, and sync.
+discovery, targeted hydration, sessions, paged events, paged tool calls and
+file edits, statistics, and sync.
 
 ## Supported production matrix
 

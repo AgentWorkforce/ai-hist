@@ -21,8 +21,9 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 5, catalog contract version 3, and hydration contract version 1, normalizes nullable fields, maps
-native errors, and supplies pagination helpers.
+version 5, catalog contract version 3, hydration contract version 1, and session
+evidence contract version 1, normalizes nullable fields, maps native errors,
+and supplies pagination helpers.
 
 The CLI and MCP server import only the SDK's public functions. They do not
 open SQLite, import `ai-hist-native`, scan providers, or invoke another CLI.
@@ -67,6 +68,7 @@ row's `locations`.
 | `stats` (`local` / `remote` / `all`) | none | indexed aggregate reads | empty result |
 | `getSession` | none | indexed identity read | empty result |
 | `getSessionEventsPage` | none | bounded keyset page | empty page |
+| `getSessionToolCallsPage`, `getSessionFileEditsPage` | none | bounded keyset page over one source's session | empty page |
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
 | `sync` (`remote`) | configured remote connectors (error when none) | catalog upserts + presences | creates DB |
 | `sync` (`all`) | full local scan + configured remote connectors | migrations + ingestion | creates DB |
@@ -86,7 +88,11 @@ checkpoints make unchanged calls constant-work after source resolution, and
 `session_relationships` preserves Codex child identities without flattening
 their events into the selected root.
 
-Events use `(ts_ms, id)` keyset pagination. Catalog ordering is
+Events use `(ts_ms, id)` keyset pagination. Tool calls and file edits use the
+same keyset shape over `(ts_ms IS NULL, ts_ms, id)`: both tables allow a null
+timestamp, so undated rows sort last and the cursor carries a nullable
+`ts_ms`. Those two pages require a source as well as a session id, because a
+session id alone can name one session per provider. Catalog ordering is
 `(last_activity_ms DESC, source ASC, session_id ASC)`, with null timestamps at
 the tail. These total orders prevent duplicate or omitted rows at timestamp
 ties.

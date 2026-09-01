@@ -28,6 +28,32 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Added
 
+- Add first-class structured access to a hydrated session's recorded tool
+  calls and file edits: `session_tool_calls_page` / `session_file_edits_page`
+  in the Rust engine, `getSessionToolCallsPage` / `getSessionFileEditsPage`
+  (plus the `sessionToolCalls` / `sessionFileEdits` async iterators and the
+  `getSessionToolCalls` / `getSessionFileEdits` collecting conveniences) in the
+  TypeScript SDK, `ai-hist sessions tools` and `ai-hist sessions edits`, and
+  MCP `get_session_tool_calls` / `get_session_file_edits`. Every one of them
+  requires both a source and a session ID, because provider session IDs
+  collide and evidence from two providers must never merge; a source this
+  build has no provider for is rejected rather than answered with an empty
+  page. Pages are keyset
+  paginated over `(ts_ms IS NULL, ts_ms, id)` — undated rows sort last and the
+  cursor's `ts_ms` is nullable — and carry session evidence contract 1.
+  File edit rows now also expose `message_id`, `structured_patch_json`,
+  `git_branch`, and `cwd`. Stored provider JSON reaches the SDK as the raw
+  indexed string and is parsed into `args` / `structuredPatch`; an absent or
+  unparseable value becomes `null` while `argsJson` / `structuredPatchJson`
+  keep the original, so one bad payload cannot fail a page. New
+  `idx_tool_calls_page_v2` and `idx_file_edits_page_v2` indexes back the access
+  path, ordering on `(source, session_id, (ts_ms IS NULL), ts_ms, id)` so a
+  page is read in order rather than sorted; existing databases add them, and
+  drop the superseded `idx_tool_calls_page` / `idx_file_edits_page` and the
+  now-redundant `idx_tool_calls_session` / `idx_file_edits_session`, on their
+  next writable open. The native-addon contract is now 5.
+- `ai-hist events --json` file-edit records additively carry `message_id`,
+  `structured_patch_json`, `git_branch`, and `cwd`.
 - Add remote provider connectors behind the existing `--remote` / `--all`
   acquisition scopes: `claude-web` lists claude.ai/code web sessions with the
   OAuth sign-in the Claude Code CLI stored (`~/.claude/.credentials.json`,
