@@ -9,9 +9,10 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const NATIVE_CONTRACT_VERSION = 4;
+export const NATIVE_CONTRACT_VERSION = 5;
 export const SESSION_CATALOG_CONTRACT_VERSION = 2;
 export const SESSION_HYDRATION_CONTRACT_VERSION = 1;
+export const SESSION_EVIDENCE_CONTRACT_VERSION = 1;
 
 export type Source = 'claude' | 'codex' | 'cursor' | 'grok' | 'relay' | 'trajectory' | 'opencode';
 export type CatalogSource = Exclude<Source, 'trajectory'>;
@@ -231,6 +232,72 @@ export interface SessionEventsPage {
   nextCursor: EventCursor | null;
 }
 
+export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+export interface SessionToolCall {
+  id: number;
+  source: Source;
+  sessionId: string;
+  messageId: string | null;
+  toolUseId: string;
+  name: string;
+  target: string | null;
+  /** Parsed provider arguments, or null when absent or unparseable. */
+  args: JsonValue | null;
+  /** The stored argument string exactly as indexed, parseable or not. */
+  argsJson: string | null;
+  isError: boolean | null;
+  tsMs: number | null;
+}
+
+export interface SessionFileEdit {
+  id: number;
+  source: Source;
+  sessionId: string;
+  messageId: string | null;
+  toolUseId: string;
+  filePath: string;
+  toolName: string | null;
+  linesAdded: number | null;
+  linesRemoved: number | null;
+  /** Parsed provider patch, or null when absent or unparseable. */
+  structuredPatch: JsonValue | null;
+  /** The stored patch string exactly as indexed, parseable or not. */
+  structuredPatchJson: string | null;
+  userModified: boolean | null;
+  tsMs: number | null;
+  gitBranch: string | null;
+  cwd: string | null;
+}
+
+/**
+ * Continuation for tool call and file edit pages. `tsMs` is nullable because
+ * both records may be indexed without a timestamp and are ordered last.
+ */
+export interface EvidenceCursor { tsMs: number | null; id: number }
+
+export interface EvidencePageOptions {
+  dbPath?: string;
+  limit?: number;
+  after?: EvidenceCursor;
+}
+
+export interface SessionToolCallsPage {
+  contractVersion: number;
+  source: Source;
+  sessionId: string;
+  toolCalls: SessionToolCall[];
+  nextCursor: EvidenceCursor | null;
+}
+
+export interface SessionFileEditsPage {
+  contractVersion: number;
+  source: Source;
+  sessionId: string;
+  fileEdits: SessionFileEdit[];
+  nextCursor: EvidenceCursor | null;
+}
+
 export interface Stats {
   scope: SessionScope;
   total: number;
@@ -253,6 +320,8 @@ interface NativeBinding {
   recent(options?: object): Promise<UnknownRecord[]>;
   getSession(sessionId: string, options?: object): Promise<UnknownRecord[]>;
   getSessionEventsPage(sessionId: string, options?: object): Promise<UnknownRecord>;
+  getSessionToolCallsPage(source: string, sessionId: string, options?: object): Promise<UnknownRecord>;
+  getSessionFileEditsPage(source: string, sessionId: string, options?: object): Promise<UnknownRecord>;
   stats(options?: object): Promise<UnknownRecord>;
   listSessionCatalog(options?: object): Promise<UnknownRecord[]>;
   listSessionCatalogPage(options?: object): Promise<UnknownRecord>;
@@ -478,6 +547,75 @@ function sessionEvent(value: UnknownRecord): SessionEvent {
   };
 }
 
+/**
+ * Provider JSON is stored as the raw string the provider wrote. A row whose
+ * string cannot be parsed still belongs in its page, so parsing yields null
+ * and the caller reads the raw companion field instead of losing the row.
+ */
+export function parseStoredJson(raw: unknown): JsonValue | null {
+  if (typeof raw !== 'string') return null;
+  try {
+    return JSON.parse(raw) as JsonValue;
+  } catch {
+    return null;
+  }
+}
+
+function nullableNumber(value: unknown): number | null {
+  return typeof value === 'number' ? value : null;
+}
+
+function nullableBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null;
+}
+
+function sessionToolCall(value: UnknownRecord): SessionToolCall {
+  return {
+    id: Number(value.id), source: String(value.source) as Source, sessionId: String(value.sessionId),
+    messageId: nullableString(value.messageId), toolUseId: String(value.toolUseId),
+    name: String(value.name), target: nullableString(value.target),
+    args: parseStoredJson(value.argsJson), argsJson: nullableString(value.argsJson),
+    isError: nullableBoolean(value.isError), tsMs: nullableNumber(value.tsMs),
+  };
+}
+
+function sessionFileEdit(value: UnknownRecord): SessionFileEdit {
+  return {
+    id: Number(value.id), source: String(value.source) as Source, sessionId: String(value.sessionId),
+    messageId: nullableString(value.messageId), toolUseId: String(value.toolUseId),
+    filePath: String(value.filePath), toolName: nullableString(value.toolName),
+    linesAdded: nullableNumber(value.linesAdded), linesRemoved: nullableNumber(value.linesRemoved),
+    structuredPatch: parseStoredJson(value.structuredPatchJson),
+    structuredPatchJson: nullableString(value.structuredPatchJson),
+    userModified: nullableBoolean(value.userModified), tsMs: nullableNumber(value.tsMs),
+    gitBranch: nullableString(value.gitBranch), cwd: nullableString(value.cwd),
+  };
+}
+
+function evidenceCursor(value: unknown): EvidenceCursor | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as UnknownRecord;
+  return { tsMs: nullableNumber(row.tsMs), id: Number(row.id) };
+}
+
+function assertEvidenceContract(value: number): void {
+  if (value !== SESSION_EVIDENCE_CONTRACT_VERSION) {
+    throw new NativeContractMismatchError(
+      `ai-hist expects session evidence contract ${SESSION_EVIDENCE_CONTRACT_VERSION}, but native returned ${value}.`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+}
+
+function evidenceIdentity(source: unknown, sessionId: unknown, operation: string): void {
+  if (typeof source !== 'string' || source.trim() === '') {
+    throw new InvalidArgumentError(`${operation} requires a source`, 'INVALID_ARGUMENT');
+  }
+  if (typeof sessionId !== 'string' || sessionId.trim() === '') {
+    throw new InvalidArgumentError(`${operation} requires a sessionId`, 'INVALID_ARGUMENT');
+  }
+}
+
 export function defaultDbPath(): string {
   if (process.env.AI_HIST_DB !== undefined) return process.env.AI_HIST_DB;
   if (process.env.XDG_DATA_HOME !== undefined) {
@@ -642,6 +780,78 @@ export async function getSessionEvents(sessionId: string, options: Omit<EventsPa
   const events: SessionEvent[] = [];
   for await (const event of sessionEvents(sessionId, options)) events.push(event);
   return events;
+}
+
+export async function getSessionToolCallsPage(
+  source: Source, sessionId: string, options: EvidencePageOptions = {},
+): Promise<SessionToolCallsPage> {
+  evidenceIdentity(source, sessionId, 'getSessionToolCallsPage');
+  return nativeCall(async (native) => {
+    const page = await native.getSessionToolCallsPage(source, sessionId, options);
+    assertEvidenceContract(Number(page.contractVersion));
+    return {
+      contractVersion: Number(page.contractVersion),
+      source: String(page.source) as Source,
+      sessionId: String(page.sessionId),
+      toolCalls: Array.isArray(page.toolCalls) ? (page.toolCalls as UnknownRecord[]).map(sessionToolCall) : [],
+      nextCursor: evidenceCursor(page.nextCursor),
+    };
+  });
+}
+
+export async function* sessionToolCalls(
+  source: Source, sessionId: string, options: Omit<EvidencePageOptions, 'after'> = {},
+): AsyncGenerator<SessionToolCall> {
+  let after: EvidenceCursor | undefined;
+  do {
+    const page = await getSessionToolCallsPage(source, sessionId, { ...options, after });
+    for (const call of page.toolCalls) yield call;
+    after = page.nextCursor ?? undefined;
+  } while (after);
+}
+
+export async function getSessionToolCalls(
+  source: Source, sessionId: string, options: Omit<EvidencePageOptions, 'after'> = {},
+): Promise<SessionToolCall[]> {
+  const calls: SessionToolCall[] = [];
+  for await (const call of sessionToolCalls(source, sessionId, options)) calls.push(call);
+  return calls;
+}
+
+export async function getSessionFileEditsPage(
+  source: Source, sessionId: string, options: EvidencePageOptions = {},
+): Promise<SessionFileEditsPage> {
+  evidenceIdentity(source, sessionId, 'getSessionFileEditsPage');
+  return nativeCall(async (native) => {
+    const page = await native.getSessionFileEditsPage(source, sessionId, options);
+    assertEvidenceContract(Number(page.contractVersion));
+    return {
+      contractVersion: Number(page.contractVersion),
+      source: String(page.source) as Source,
+      sessionId: String(page.sessionId),
+      fileEdits: Array.isArray(page.fileEdits) ? (page.fileEdits as UnknownRecord[]).map(sessionFileEdit) : [],
+      nextCursor: evidenceCursor(page.nextCursor),
+    };
+  });
+}
+
+export async function* sessionFileEdits(
+  source: Source, sessionId: string, options: Omit<EvidencePageOptions, 'after'> = {},
+): AsyncGenerator<SessionFileEdit> {
+  let after: EvidenceCursor | undefined;
+  do {
+    const page = await getSessionFileEditsPage(source, sessionId, { ...options, after });
+    for (const edit of page.fileEdits) yield edit;
+    after = page.nextCursor ?? undefined;
+  } while (after);
+}
+
+export async function getSessionFileEdits(
+  source: Source, sessionId: string, options: Omit<EvidencePageOptions, 'after'> = {},
+): Promise<SessionFileEdit[]> {
+  const edits: SessionFileEdit[] = [];
+  for await (const edit of sessionFileEdits(source, sessionId, options)) edits.push(edit);
+  return edits;
 }
 
 export async function stats(options: StatsOptions = {}): Promise<Stats> {

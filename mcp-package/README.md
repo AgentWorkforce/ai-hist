@@ -10,9 +10,13 @@ The server imports only `ai-hist` public functions. It never opens SQLite,
 loads the native addon directly, scans provider files, or invokes a CLI.
 
 Tools: `search_history`, `recent_history`, `list_sessions`,
-`discover_sessions`, `hydrate_session`, `get_session`, `get_session_events`, `history_stats`, and
+`discover_sessions`, `hydrate_session`, `get_session`, `get_session_events`,
+`get_session_tool_calls`, `get_session_file_edits`, `history_stats`, and
 `sync`. Search, recent history, session listing, discovery, statistics, and sync accept a
 `scope` of `local`, `remote`, or `all`; scope defaults to `local`.
+`get_session_tool_calls` and `get_session_file_edits` are bounded, cursor-paged
+reads that require both a `source` and a `session_id`, because provider session
+IDs collide.
 
 Cached reads support all three scopes. Remote acquisition runs through
 provider connectors (claude.ai/code web sessions, Codex cloud tasks) that are

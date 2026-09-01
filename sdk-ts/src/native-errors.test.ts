@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
-  DatabaseOpenError, NativeContractMismatchError, SessionNotFoundError, UnsupportedOperationError,
-  discoverSessions, hydrateSession, listSessionCatalogPage, recent, stats, sync,
+  DatabaseOpenError, InvalidArgumentError, NativeContractMismatchError, SessionNotFoundError,
+  UnsupportedOperationError, discoverSessions, getSessionFileEditsPage, getSessionToolCallsPage,
+  hydrateSession, listSessionCatalogPage, recent, stats, sync,
   validateNativeContract, validateNativeLocation, validateNativeScope,
 } from './index.js';
 
@@ -15,6 +16,12 @@ test('missing database reads are explicit empty cache operations', async () => {
   try {
     assert.deepEqual(await listSessionCatalogPage({ dbPath, limit: 20 }), {
       contractVersion: 2, scope: 'local', sessions: [], nextCursor: null,
+    });
+    assert.deepEqual(await getSessionToolCallsPage('claude', 'missing', { dbPath }), {
+      contractVersion: 1, source: 'claude', sessionId: 'missing', toolCalls: [], nextCursor: null,
+    });
+    assert.deepEqual(await getSessionFileEditsPage('claude', 'missing', { dbPath }), {
+      contractVersion: 1, source: 'claude', sessionId: 'missing', fileEdits: [], nextCursor: null,
     });
     assert.deepEqual(await recent({ dbPath, limit: 20 }), []);
     assert.deepEqual(await stats({ dbPath }), {
@@ -44,7 +51,7 @@ test('SDK/native contract mismatch is actionable', () => {
     () => validateNativeContract(999),
     (error: unknown) => error instanceof NativeContractMismatchError
       && error.code === 'NATIVE_CONTRACT_MISMATCH'
-      && /requires native contract 4/.test(error.message),
+      && /requires native contract 5/.test(error.message),
   );
   assert.throws(
     () => validateNativeScope('cloud'),
@@ -84,6 +91,26 @@ test('unconfigured remote acquisition has one stable SDK error', async () => {
   } finally {
     if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
     if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.USERPROFILE;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('evidence pages reject out-of-range limits at the native boundary', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-evidence-limit-'));
+  const dbPath = join(root, 'history.db');
+  try {
+    for (const operation of [
+      () => getSessionToolCallsPage('claude', 'any', { dbPath, limit: 0 }),
+      () => getSessionFileEditsPage('claude', 'any', { dbPath, limit: 5_000 }),
+    ]) {
+      await assert.rejects(
+        operation(),
+        (error: unknown) => error instanceof InvalidArgumentError
+          && error.code === 'INVALID_ARGUMENT'
+          && /limit must be between 1 and 1000/.test(error.message),
+      );
+    }
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

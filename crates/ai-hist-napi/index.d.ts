@@ -74,6 +74,66 @@ export interface SessionEventsPage {
   events: Array<NativeSessionEvent>
   nextCursor?: EventCursor
 }
+export interface NativeSessionToolCall {
+  id: number
+  source: string
+  sessionId: string
+  messageId?: string
+  toolUseId: string
+  name: string
+  target?: string
+  /**
+   * Stored provider arguments, unparsed. The SDK owns JSON parsing so an
+   * unreadable value cannot fail a whole page at the boundary.
+   */
+  argsJson?: string
+  isError?: boolean
+  tsMs?: number
+}
+export interface NativeSessionFileEdit {
+  id: number
+  source: string
+  sessionId: string
+  messageId?: string
+  toolUseId: string
+  filePath: string
+  toolName?: string
+  linesAdded?: number
+  linesRemoved?: number
+  /** Stored provider patch, unparsed, for the same reason as `args_json`. */
+  structuredPatchJson?: string
+  userModified?: boolean
+  tsMs?: number
+  gitBranch?: string
+  cwd?: string
+}
+/**
+ * Continuation for tool call and file edit pages. `tsMs` is nullable because
+ * both tables order their undated rows last.
+ */
+export interface EvidenceCursor {
+  tsMs?: number
+  id: number
+}
+export interface EvidencePageOptions {
+  dbPath?: string
+  limit?: number
+  after?: EvidenceCursor
+}
+export interface SessionToolCallsPage {
+  contractVersion: number
+  source: string
+  sessionId: string
+  toolCalls: Array<NativeSessionToolCall>
+  nextCursor?: EvidenceCursor
+}
+export interface SessionFileEditsPage {
+  contractVersion: number
+  source: string
+  sessionId: string
+  fileEdits: Array<NativeSessionFileEdit>
+  nextCursor?: EvidenceCursor
+}
 export interface SourceCount {
   source: string
   count: number
@@ -103,6 +163,15 @@ export declare function recent(options?: HistoryQueryOptions | undefined | null)
 export declare function getSession(sessionId: string, options?: SessionOptions | undefined | null): Promise<Array<NativeHistoryEntry>>
 /** One bounded page of normalized events for a session. */
 export declare function getSessionEventsPage(sessionId: string, options?: EventsPageOptions | undefined | null): Promise<SessionEventsPage>
+/**
+ * One bounded page of recorded tool calls for one session.
+ *
+ * Both `source` and `sessionId` are required: provider session ids are not
+ * globally unique, so an id-only lookup could interleave two sessions.
+ */
+export declare function getSessionToolCallsPage(source: string, sessionId: string, options?: EvidencePageOptions | undefined | null): Promise<SessionToolCallsPage>
+/** One bounded page of recorded file edits for one session. */
+export declare function getSessionFileEditsPage(source: string, sessionId: string, options?: EvidencePageOptions | undefined | null): Promise<SessionFileEditsPage>
 /** Database statistics over already-indexed data. */
 export declare function stats(options?: StatsOptions | undefined | null): Promise<NativeStats>
 export interface CatalogSession {
