@@ -89,6 +89,16 @@ pub const HEAD_SCAN_MAX_LINES: usize = 400;
 pub const TAIL_SCAN_MAX_BYTES: u64 = 64 * 1024;
 /// Character cap for stored text excerpts, matching `last_assistant_text`.
 pub const EXCERPT_MAX_CHARS: usize = 4096;
+/// Unicode White_Space characters recognized by Rust's `str::trim`.
+///
+/// SQLite's one-argument `trim` removes only U+0020, so SQL predicates that
+/// decide whether an excerpt is substantive must pass this exact character
+/// set explicitly to stay in lockstep with [`excerpt`].
+pub const EXCERPT_TRIM_WHITESPACE: &str = concat!(
+    "\u{0009}\u{000A}\u{000B}\u{000C}\u{000D}\u{0020}\u{0085}\u{00A0}",
+    "\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}",
+    "\u{2007}\u{2008}\u{2009}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}"
+);
 /// Default row cap for `list_session_catalog` when the caller gives none.
 pub const DEFAULT_CATALOG_LIMIT: i64 = 50;
 
@@ -1466,7 +1476,7 @@ impl ShallowSessionProvider for OpencodeProvider {
                  AND json_extract(m.data, '$.role') = 'user' \
                  AND json_extract(p.data, '$.type') = 'text' \
                  AND json_type(p.data, '$.text') = 'text' \
-                 AND trim(substr(json_extract(p.data, '$.text'), 1, ?)) <> '' \
+                 AND trim(substr(json_extract(p.data, '$.text'), 1, ?), ?) <> '' \
                  ORDER BY {order} ASC LIMIT 1"
             );
             scan.note_query();
@@ -1476,7 +1486,8 @@ impl ShallowSessionProvider for OpencodeProvider {
                     params![
                         EXCERPT_MAX_CHARS as i64,
                         &candidate.locator,
-                        EXCERPT_MAX_CHARS as i64
+                        EXCERPT_MAX_CHARS as i64,
+                        EXCERPT_TRIM_WHITESPACE
                     ],
                     |row| row.get::<_, String>(0),
                 )

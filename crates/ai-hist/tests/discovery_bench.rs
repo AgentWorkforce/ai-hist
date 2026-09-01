@@ -43,7 +43,7 @@
 //!    same bytes from a 5x larger archive.
 
 use ai_hist_core::open_db;
-use ai_hist_engine::discover::{HEAD_SCAN_MAX_BYTES, TAIL_SCAN_MAX_BYTES};
+use ai_hist_engine::discover::{EXCERPT_TRIM_WHITESPACE, HEAD_SCAN_MAX_BYTES, TAIL_SCAN_MAX_BYTES};
 use ai_hist_engine::{
     discover_sessions_with_env, list_session_catalog, CatalogListOptions, DiscoverOptions,
     DiscoveryEnv, DiscoverySummary,
@@ -518,9 +518,9 @@ fn opencode_fixed_limit_scaling_report() {
              AND json_extract(m.data, '$.role') = 'user'
              AND json_extract(p.data, '$.type') = 'text'
              AND json_type(p.data, '$.text') = 'text'
-             AND trim(substr(json_extract(p.data, '$.text'), 1, ?)) <> ''
+             AND trim(substr(json_extract(p.data, '$.text'), 1, ?), ?) <> ''
              ORDER BY COALESCE(p.time_created, m.time_created) ASC LIMIT 1",
-            rusqlite::params![4096_i64, "ses_newest_19", 4096_i64],
+            rusqlite::params![4096_i64, "ses_newest_19", 4096_i64, EXCERPT_TRIM_WHITESPACE],
         );
         let model_plan = opencode_plan(
             &planning,

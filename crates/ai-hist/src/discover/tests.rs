@@ -820,6 +820,14 @@ fn a_huge_opencode_part_is_truncated_before_it_reaches_rust() {
 }
 
 #[test]
+fn opencode_sql_uses_the_same_whitespace_set_as_rust_excerpts() {
+    let rust_whitespace: String = ('\0'..=char::MAX)
+        .filter(|character| character.is_whitespace())
+        .collect();
+    assert_eq!(EXCERPT_TRIM_WHITESPACE, rust_whitespace);
+}
+
+#[test]
 fn empty_and_minimal_opencode_schemas_are_tolerated() {
     let conn = catalog();
     let home = tempfile::tempdir().unwrap();
@@ -992,7 +1000,10 @@ fn opencode_selected_session_queries_use_provider_indexes() {
            AND json_extract(m.data, '$.role') = 'user'
            AND json_extract(p.data, '$.type') = 'text'
            AND json_type(p.data, '$.text') = 'text'
-           AND trim(substr(json_extract(p.data, '$.text'), 1, 4096)) <> ''
+           AND trim(substr(json_extract(p.data, '$.text'), 1, 4096),
+                    char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,
+                         8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,
+                         8287,12288)) <> ''
          ORDER BY COALESCE(p.time_created, m.time_created) ASC LIMIT 1",
     );
     assert!(
@@ -1168,6 +1179,8 @@ fn malformed_and_partial_opencode_rows_do_not_hide_an_older_complete_prompt() {
     opencode_db(
         home.path(),
         "INSERT INTO session VALUES ('ses_partial', '/work/oc', 1, 4);
+         INSERT INTO message VALUES ('m_ws', 'ses_partial', -1, '{\"role\":\"user\"}');
+         INSERT INTO part VALUES ('p_ws', 'm_ws', 'ses_partial', -1, '{\"type\":\"text\",\"text\":\"\\t\\n\\r  \"}');
          INSERT INTO message VALUES ('m0', 'ses_partial', 0, '{\"role\":\"user\"}');
          INSERT INTO part VALUES ('p0', 'm0', 'ses_partial', 0, '{\"type\":\"text\"}');
          INSERT INTO message VALUES ('m1', 'ses_partial', 1, '{\"role\":\"user\",\"modelID\":\"ok\"}');
