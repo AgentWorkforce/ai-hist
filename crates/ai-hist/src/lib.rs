@@ -5504,13 +5504,54 @@ struct CodexSessionMeta {
     parent_session_id: Option<String>,
 }
 
+/// Return an explicit parent identity from a Codex rollout's session metadata.
+///
+/// `payload.id` is always the identity of the rollout itself.  The parent
+/// fields are optional and only describe a relationship when they contain a
+/// different, non-empty id.  In particular, a `source.subagent` marker by
+/// itself is not evidence of a parent: standalone guardian rollouts use that
+/// marker while retaining their own identity.
+pub(crate) fn codex_parent_session_id(payload: Option<&Value>, session_id: &str) -> Option<String> {
+    ["session_id", "parent_thread_id"]
+        .into_iter()
+        .filter_map(|key| {
+            payload
+                .and_then(|p| p.get(key))
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty() && *id != session_id)
+                .map(str::to_string)
+        })
+        .next()
+}
+
+/// Codex rollouts marked as subagents are hidden from the root session
+/// catalog.  A `thread_source: subagent` rollout remains a child even when an
+/// older producer omitted its parent fields.  The object form of
+/// `source.subagent` is treated as a child only when an explicit parent is
+/// present, so a standalone guardian remains discoverable under `payload.id`.
+pub(crate) fn codex_is_subagent(payload: Option<&Value>, session_id: &str) -> bool {
+    let thread_source_is_subagent = payload
+        .and_then(|p| p.get("thread_source"))
+        .and_then(Value::as_str)
+        == Some("subagent");
+    let source_marks_subagent = payload
+        .and_then(|p| p.get("source"))
+        .and_then(Value::as_object)
+        .is_some_and(|source| source.contains_key("subagent"));
+
+    thread_source_is_subagent
+        || (source_marks_subagent && codex_parent_session_id(payload, session_id).is_some())
+}
+
 /// Read the `session_meta` line that opens every rollout file.
 ///
 /// Sessions key on `payload.id` — the per-thread id. Newer rollouts also
 /// carry `payload.session_id`, but that names the *parent* conversation for
 /// subagent threads; keying on it would collapse every subagent into its
-/// parent. Subagent threads are detected instead (`thread_source`, or the
-/// object form of `payload.source`) and excluded from session registration.
+/// parent. `thread_source: subagent` remains a child marker. The object form
+/// of `payload.source` is a child marker only when an explicit parent id is
+/// present, because standalone guardian rollouts can carry `source.subagent`
+/// without a parent relationship.
 fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
     let first = fs::read_to_string(path)
         .ok()
@@ -5526,7 +5567,8 @@ fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
     if value.get("type").and_then(Value::as_str) != Some("session_meta") {
         return Ok(None);
     }
-    let payload = value.get("payload").and_then(Value::as_object);
+    let payload_value = value.get("payload");
+    let payload = payload_value.and_then(Value::as_object);
     let Some(session_id) = payload
         .and_then(|p| p.get("id"))
         .and_then(Value::as_str)
@@ -5547,23 +5589,8 @@ fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
         .and_then(|g| g.get("branch"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let is_subagent = payload
-        .and_then(|p| p.get("thread_source"))
-        .and_then(Value::as_str)
-        == Some("subagent")
-        || payload
-            .and_then(|p| p.get("source"))
-            .and_then(Value::as_object)
-            .is_some_and(|s| s.contains_key("subagent"));
-    let parent_session_id = is_subagent
-        .then(|| {
-            payload
-                .and_then(|p| p.get("session_id"))
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty() && *id != session_id)
-                .map(str::to_string)
-        })
-        .flatten();
+    let parent_session_id = codex_parent_session_id(payload_value, session_id);
+    let is_subagent = codex_is_subagent(payload_value, session_id);
     Ok(Some(CodexSessionMeta {
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
