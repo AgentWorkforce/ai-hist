@@ -46,12 +46,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use ai_hist_core::SessionLocation;
+use ai_hist_core::{SessionLocation, SOURCE_CHOICES};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
 
-use crate::discover::{Candidate, DiscoveryEnv, ScanEnv, ShallowSession, ShallowSessionProvider};
+use crate::discover::{
+    excerpt, Candidate, DiscoveryEnv, ScanEnv, ShallowSession, ShallowSessionProvider,
+};
 
 /// Connector name for the claude.ai/code web-session lister.
 pub const CLAUDE_WEB_CONNECTOR: &str = "claude-web";
@@ -173,6 +175,16 @@ pub fn ensure_remote_connectors_configured_for_at(
     home: &Path,
     sources: &[String],
 ) -> Result<()> {
+    // A misspelled source is an invalid argument, not an unsupported remote
+    // request — reject it with the engine's own invalid-source message before
+    // classifying anything.
+    for source in sources {
+        anyhow::ensure!(
+            SOURCE_CHOICES.contains(&source.as_str()),
+            "invalid source '{source}' (choose from {})",
+            SOURCE_CHOICES.join(", ")
+        );
+    }
     let statuses: Vec<RemoteConnectorStatus> = remote_connector_statuses_at(home)
         .into_iter()
         .filter(|status| sources.is_empty() || sources.iter().any(|s| s == status.source))
@@ -314,15 +326,15 @@ fn require_https_or_loopback(base_url: &str) -> Result<()> {
         .strip_prefix("http://")
         .with_context(|| format!("claude.ai base URL must be http(s), got {base_url}"))?;
     let authority = rest.split('/').next().unwrap_or_default();
-    let host = authority
-        .rsplit('@')
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    // A bracketed IPv6 authority keeps its colons inside the brackets, so the
+    // port split must not run inside them: `[::1]:8787` names `[::1]`.
+    let host = match host_port.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
     anyhow::ensure!(
-        matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1"),
+        matches!(host, "localhost" | "127.0.0.1" | "::1"),
         "refusing to send the claude.ai OAuth token over plain http:// to {base_url}; use an https:// endpoint (plain http is accepted only for loopback)"
     );
     Ok(())
@@ -401,7 +413,8 @@ fn map_claude_web_session(value: &Value) -> Option<(Candidate, ShallowSession)> 
         session_id: id.clone(),
         // The listing's title is the only human-readable identifier the
         // endpoint offers; claude.ai derives it from the opening prompt.
-        first_prompt: string_field(value, "title"),
+        // Bounded like every stored excerpt.
+        first_prompt: string_field(value, "title").map(|title| excerpt(&title)),
         first_activity_ms,
         last_activity_ms,
         repo_url,
@@ -618,7 +631,8 @@ fn map_codex_cloud_task(value: &Value) -> Option<(Candidate, ShallowSession)> {
         session_id: id.clone(),
         // The task title is Codex's own rendering of the prompt that created
         // the task — the only human-readable identifier the listing offers.
-        first_prompt: string_field(value, "title"),
+        // Bounded like every stored excerpt.
+        first_prompt: string_field(value, "title").map(|title| excerpt(&title)),
         last_activity_ms,
         raw_path: string_field(value, "url"),
         discovery_state: "shallow".into(),

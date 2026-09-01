@@ -60,8 +60,8 @@ row's `locations`.
 |---|---:|---|---|
 | `listSessionCatalog*` (`local` / `remote` / `all`) | none | one indexed cache query | empty page |
 | `discoverSessions` (`local`, default) | bounded shallow reads | catalog upserts | creates catalog DB |
-| `discoverSessions` (`remote`) | configured remote connectors (error when none) | catalog upserts | creates catalog DB |
-| `discoverSessions` (`all`) | local adapters + configured remote connectors | catalog upserts | creates catalog DB |
+| `discoverSessions` (`remote`) | configured remote connectors (error when none) | catalog upserts + presences | creates catalog DB |
+| `discoverSessions` (`all`) | local adapters + configured remote connectors | catalog upserts + presences | creates catalog DB |
 | `hydrateSession` | one selected provider session and linked evidence | transactional evidence + checkpoint upsert | `SESSION_NOT_FOUND` |
 | `search`, `recent` (`local` / `remote` / `all`) | none | indexed reads | empty result |
 | `stats` (`local` / `remote` / `all`) | none | indexed aggregate reads | empty result |

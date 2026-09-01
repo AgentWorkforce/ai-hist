@@ -234,13 +234,17 @@ fn claude_enumeration_reports_an_expired_token_without_a_request() {
     let provider = ClaudeWebProvider::new(
         write_claude_credentials(home.path(), 1_000),
         "https://api.example.test".to_string(),
-        Box::new(transport),
+        Box::new(Arc::clone(&transport)),
         None,
     );
     let conn = catalog();
     let env = env_at(&conn, home.path());
     let error = provider.enumerate(&env).unwrap_err().to_string();
     assert!(error.contains("expired"), "{error}");
+    assert!(
+        transport.calls.lock().unwrap().is_empty(),
+        "an expired token must be rejected before any request is made"
+    );
 }
 
 #[test]
@@ -248,6 +252,7 @@ fn claude_transport_refuses_plaintext_off_loopback() {
     assert!(require_https_or_loopback("https://api.anthropic.com").is_ok());
     assert!(require_https_or_loopback("http://127.0.0.1:8787").is_ok());
     assert!(require_https_or_loopback("http://localhost:1234").is_ok());
+    assert!(require_https_or_loopback("http://[::1]:8787").is_ok());
     let error = require_https_or_loopback("http://api.evil.test").unwrap_err();
     assert!(error.to_string().contains("plain http"));
     // Userinfo must not smuggle a loopback-looking authority past the check.
@@ -343,6 +348,24 @@ fn codex_mapping_carries_the_task_listing_and_stamps_on_status() {
     assert_eq!(candidate.stamp, "cloud:2026-06-22T09:00:00Z:ready");
     // An id-less entry is not a task.
     assert!(map_codex_cloud_task(&tasks[1]).is_none());
+
+    // A pathological title is bounded like every stored excerpt.
+    let long = serde_json::json!({"id": "task_e_long", "title": "x".repeat(9000)});
+    let (_, session) = map_codex_cloud_task(&long).unwrap();
+    assert_eq!(
+        session.first_prompt.unwrap().chars().count(),
+        crate::discover::EXCERPT_MAX_CHARS
+    );
+    let long_web = {
+        let mut entry = web_session("session_01long", "t", "2026-06-21T10:00:00Z");
+        entry["title"] = serde_json::Value::String("y".repeat(9000));
+        entry
+    };
+    let (_, session) = map_claude_web_session(&long_web).unwrap();
+    assert_eq!(
+        session.first_prompt.unwrap().chars().count(),
+        crate::discover::EXCERPT_MAX_CHARS
+    );
 }
 
 #[test]
@@ -402,6 +425,9 @@ fn codex_provider_follows_the_cursor_across_pages() {
 
 #[test]
 fn statuses_report_missing_credentials_with_the_paths_looked_at() {
+    // A developer's ambient credentials override must not leak into the
+    // isolated home this test asserts against.
+    std::env::remove_var("RELAYHISTORY_CLAUDE_CREDENTIALS");
     let home = tempfile::tempdir().unwrap();
     let statuses = remote_connector_statuses_at(home.path());
     assert_eq!(statuses.len(), 2);
@@ -425,6 +451,7 @@ fn statuses_report_missing_credentials_with_the_paths_looked_at() {
 
 #[test]
 fn a_source_filter_that_excludes_every_configured_connector_is_unsupported() {
+    std::env::remove_var("RELAYHISTORY_CLAUDE_CREDENTIALS");
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join(".codex")).unwrap();
     std::fs::write(home.path().join(".codex/auth.json"), "{}").unwrap();
@@ -457,6 +484,9 @@ fn a_source_filter_that_excludes_every_configured_connector_is_unsupported() {
         error.contains("no matching remote provider connectors exist"),
         "{error}"
     );
+    // A misspelled source is an invalid argument, not an unsupported request.
+    let error = ok(&["bogus"]).unwrap_err().to_string();
+    assert!(error.contains("invalid source 'bogus'"), "{error}");
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +538,79 @@ fn remote_rows_land_with_a_remote_presence_and_skip_on_an_unchanged_stamp() {
     let env = env_at(&conn, home.path());
     let summary = discover_sessions_with_providers(&env, &options, &providers, |_| {}).unwrap();
     assert_eq!(summary.discovered, 1);
+}
+
+/// A minimal local adapter for engine tests: one prebuilt session, emitted
+/// as a candidate with its id known up front.
+struct FakeLocalProvider {
+    session: ShallowSession,
+    stamp: &'static str,
+}
+
+impl ShallowSessionProvider for FakeLocalProvider {
+    fn source(&self) -> &'static str {
+        "codex"
+    }
+
+    fn enumerate(&self, _env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        Ok(vec![Candidate {
+            source: "codex",
+            locator: self.session.raw_path.clone().unwrap_or_default(),
+            session_id: Some(self.session.session_id.clone()),
+            // Newer than the remote candidate, so the local read lands first
+            // in the window and the remote upsert is the later merge.
+            recency_hint_ms: Some(2_000_000_000_000),
+            stamp: self.stamp.to_string(),
+        }])
+    }
+
+    fn read_shallow(
+        &self,
+        _scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
+        _candidate: &Candidate,
+    ) -> Result<Option<ShallowSession>> {
+        Ok(Some(self.session.clone()))
+    }
+}
+
+#[test]
+fn one_window_merging_local_and_remote_emits_the_fully_merged_row() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = catalog();
+    let env = env_at(&conn, home.path());
+    let providers: Vec<Box<dyn ShallowSessionProvider>> = vec![
+        Box::new(FakeLocalProvider {
+            session: ShallowSession {
+                source: "codex".into(),
+                session_id: "task_e_123".into(),
+                cwd: Some("/work/api".into()),
+                raw_path: Some("/home/x/.codex/sessions/rollout.jsonl".into()),
+                ..Default::default()
+            },
+            stamp: "local-stamp",
+        }),
+        remote_codex_provider(CODEX_LISTING, None),
+    ];
+    let options = DiscoverOptions {
+        scope: SessionScope::All,
+        ..Default::default()
+    };
+    let mut rows = Vec::new();
+    let summary = discover_sessions_with_providers(&env, &options, &providers, |session| {
+        rows.push(session.clone())
+    })
+    .unwrap();
+    assert_eq!(summary.locations_run, ["local", "remote"]);
+    // One logical session reached through both adapters in one window: the
+    // emitted row must be the final merged state, not the first upsert.
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0].locations, ["local", "remote"]);
+    assert_eq!(rows[0].cwd.as_deref(), Some("/work/api"));
+    assert_eq!(
+        summary.discovered, 2,
+        "both adapters performed a fresh read"
+    );
 }
 
 #[test]

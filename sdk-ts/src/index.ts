@@ -432,6 +432,14 @@ function catalogSession(value: UnknownRecord): CatalogSession {
   };
 }
 
+export function validateNativeLocation(value: unknown): SessionLocation {
+  if (value === 'local' || value === 'remote') return value;
+  throw new NativeContractMismatchError(
+    `ai-hist-native returned an invalid session location: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
+    'NATIVE_CONTRACT_MISMATCH',
+  );
+}
+
 export function validateNativeScope(value: unknown): SessionScope {
   if (value === 'local' || value === 'remote' || value === 'all') return value;
   throw new NativeContractMismatchError(
@@ -529,7 +537,7 @@ export async function discoverSessions(options: DiscoverSessionsOptions = {}): P
       contractVersion,
       scope: validateNativeScope(result.scope),
       locationsRun: Array.isArray(result.locationsRun)
-        ? (result.locationsRun as unknown[]).filter((location): location is SessionLocation => location === 'local' || location === 'remote')
+        ? (result.locationsRun as unknown[]).map(validateNativeLocation)
         : [],
       sessions: Array.isArray(result.sessions) ? (result.sessions as UnknownRecord[]).map(catalogSession) : [],
       discovered: Number(result.discovered),

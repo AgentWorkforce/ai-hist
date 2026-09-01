@@ -535,7 +535,7 @@ fn read_bounded_jsonl(scan: &ScanEnv<'_>, path: &Path) -> Result<BoundedJsonl> {
     Ok(BoundedJsonl { head, tail })
 }
 
-fn excerpt(text: &str) -> String {
+pub(crate) fn excerpt(text: &str) -> String {
     text.trim().chars().take(EXCERPT_MAX_CHARS).collect()
 }
 
@@ -1951,7 +1951,9 @@ pub struct ProviderSummary {
     pub discovered: usize,
     /// Rows served from the catalog because the stamp was unchanged.
     pub skipped_unchanged: usize,
-    /// `true` when enumeration itself failed.
+    /// `true` when enumeration failed for at least one of this source's
+    /// adapters (under `all` scope a source can have a local adapter and a
+    /// remote connector; each failure also leaves its own diagnostic).
     pub failed: bool,
 }
 
@@ -1994,13 +1996,16 @@ pub struct AllProvidersFailed {
 
 impl std::fmt::Display for AllProvidersFailed {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Adapter-level failures each leave one diagnostic with no locator;
+        // `providers` is keyed by source, which under `all` scope can merge a
+        // local adapter and a remote connector into one entry.
         write!(
             formatter,
             "all {} session provider(s) failed; no provider made progress",
             self.summary
-                .providers
-                .values()
-                .filter(|provider| provider.failed)
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.locator.is_none())
                 .count()
         )
     }
@@ -2321,16 +2326,27 @@ pub fn discover_sessions_with_providers(
             conn.execute_batch("BEGIN IMMEDIATE")?;
         }
         let mut window_error: Option<anyhow::Error> = None;
-        let mut window_rows = Vec::new();
-        let mut window_sessions = BTreeSet::new();
+        let mut window_rows: Vec<ShallowSession> = Vec::new();
+        // Key -> index into `window_rows`. Under `all` scope one window can
+        // reach the same session through a local adapter and a remote
+        // connector; the later upsert returns the fuller merged row (both
+        // presences), which must replace the earlier one rather than be
+        // dropped, so the emitted row matches what the catalog committed.
+        let mut window_sessions: BTreeMap<(String, String), usize> = BTreeMap::new();
         let mut window_discovered = 0usize;
         let mut window_discovered_by_source: BTreeMap<String, usize> = BTreeMap::new();
         'apply: for entry in entries {
             let (candidate, provider, expected, result) = match entry {
                 WindowEntry::Cached(row) => {
                     let key = (row.source.clone(), row.session_id.clone());
-                    if !emitted_sessions.contains(&key) && window_sessions.insert(key) {
-                        window_rows.push(row);
+                    if !emitted_sessions.contains(&key) {
+                        match window_sessions.get(&key) {
+                            Some(&index) => window_rows[index] = row,
+                            None => {
+                                window_sessions.insert(key, window_rows.len());
+                                window_rows.push(row);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -2404,8 +2420,14 @@ pub fn discover_sessions_with_providers(
                 .entry(candidate.source.to_string())
                 .or_default() += 1;
             let key = (row.source.clone(), row.session_id.clone());
-            if !emitted_sessions.contains(&key) && window_sessions.insert(key) {
-                window_rows.push(row);
+            if !emitted_sessions.contains(&key) {
+                match window_sessions.get(&key) {
+                    Some(&index) => window_rows[index] = row,
+                    None => {
+                        window_sessions.insert(key, window_rows.len());
+                        window_rows.push(row);
+                    }
+                }
             }
         }
         if has_writes {

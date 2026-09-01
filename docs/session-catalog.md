@@ -66,7 +66,8 @@ refresh, or on a timer. It is safe to run beside `ai-hist sync`.
 ai-hist sessions discover
 ai-hist sessions discover --local
 
-# Run every configured discovery adapter (currently local adapters).
+# Run every configured discovery adapter: local adapters plus any
+# configured remote connectors (see remote-connectors.md).
 ai-hist sessions discover --all --limit 20
 
 # Read back what the catalog holds — no provider file is opened.
