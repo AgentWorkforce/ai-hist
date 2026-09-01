@@ -59,9 +59,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use ai_hist_core::{upsert_session_presence, SessionLocation, SessionScope, SOURCE_CHOICES};
+use ai_hist_core::{
+    open_db_readonly, upsert_session_presence, SessionLocation, SessionScope, SOURCE_CHOICES,
+};
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -1209,36 +1211,48 @@ impl OpencodeProvider {
     fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<OpencodeReadSnapshot>>> {
         let mut guard = self.live.lock().expect("opencode live snapshot lock");
         if guard.is_none() && scan.opencode_db.exists() {
-            let conn = Connection::open_with_flags(
-                scan.opencode_db,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-            )
-            .with_context(|| format!("opening {}", scan.opencode_db.display()))?;
-            conn.busy_timeout(std::time::Duration::from_millis(250))?;
-            conn.execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED")?;
-            scan.note_open();
-            let session_columns = table_columns(&conn, "session")?;
-            let message_columns = table_columns(&conn, "message")?;
-            let part_columns = table_columns(&conn, "part")?;
-            let message_by_session = has_leading_index(&conn, "message", "session_id")?;
-            let part_by_session = has_leading_index(&conn, "part", "session_id")?;
-            let part_by_message = has_leading_index(&conn, "part", "message_id")?;
-            let schema_version: i64 =
-                conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
-            *guard = Some(OpencodeReadSnapshot {
-                conn,
-                store_identity: opencode_store_identity(scan.opencode_db, schema_version),
-                session_columns,
-                message_columns,
-                part_columns,
-                message_by_session,
-                part_by_session,
-                part_by_message,
-                sessions: BTreeMap::new(),
-            });
+            *guard = Some(open_opencode_snapshot(scan)?);
         }
         Ok(guard)
     }
+}
+
+/// Open a connection whose filesystem generation is known to match the path
+/// we inspected. The before/after check closes the replacement race between
+/// SQLite opening the file and RelayHistory computing the source stamp.
+fn open_opencode_snapshot(scan: &ScanEnv<'_>) -> Result<OpencodeReadSnapshot> {
+    for _ in 0..3 {
+        let generation_before = opencode_store_generation(scan.opencode_db)?;
+        let conn = open_db_readonly(scan.opencode_db)?;
+        scan.note_open();
+        conn.execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED")?;
+        let session_columns = table_columns(&conn, "session")?;
+        let message_columns = table_columns(&conn, "message")?;
+        let part_columns = table_columns(&conn, "part")?;
+        let message_by_session = has_leading_index(&conn, "message", "session_id")?;
+        let part_by_session = has_leading_index(&conn, "part", "session_id")?;
+        let part_by_message = has_leading_index(&conn, "part", "message_id")?;
+        let schema_version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+        let generation_after = opencode_store_generation(scan.opencode_db)?;
+        if generation_before != generation_after {
+            continue;
+        }
+        return Ok(OpencodeReadSnapshot {
+            conn,
+            store_identity: format!("{generation_before}:{schema_version}"),
+            session_columns,
+            message_columns,
+            part_columns,
+            message_by_session,
+            part_by_session,
+            part_by_message,
+            sessions: BTreeMap::new(),
+        });
+    }
+    anyhow::bail!(
+        "OpenCode database {} was repeatedly replaced while discovery opened it",
+        scan.opencode_db.display()
+    )
 }
 
 /// Whether `table` already has an index whose leading column is `column`.
@@ -1253,6 +1267,41 @@ fn has_leading_index(conn: &Connection, table: &str, column: &str) -> Result<boo
         .query_row([column], |_| Ok(()))
         .optional()?
         .is_some())
+}
+
+/// Whether an existing provider index has exactly the ordered prefix needed
+/// to apply a deterministic SQL LIMIT without sorting an unbounded tie group.
+fn has_ordered_index_prefix(
+    conn: &Connection,
+    table: &str,
+    prefix: &[(&str, bool)],
+) -> Result<bool> {
+    let mut indexes = conn.prepare(&format!("SELECT name FROM pragma_index_list('{table}')"))?;
+    let names = indexes
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for name in names {
+        let mut columns = conn.prepare(
+            "SELECT name, desc FROM pragma_index_xinfo(?) \
+             WHERE key = 1 ORDER BY seqno",
+        )?;
+        let ordered = columns
+            .query_map([name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if ordered.len() >= prefix.len()
+            && ordered
+                .iter()
+                .zip(prefix)
+                .all(|((actual_name, actual_desc), (name, desc))| {
+                    actual_name == name && actual_desc == desc
+                })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
@@ -1297,14 +1346,18 @@ impl ShallowSessionProvider for OpencodeProvider {
             "NULL"
         };
         // Current OpenCode releases index the session primary key but do not
-        // all index `time_updated`. Prefer exact update recency where that
-        // index exists. Otherwise the provider's descending, time-encoded
-        // `ses_` ids make PRIMARY KEY ASC a bounded newest-created fallback;
-        // resumed old sessions can be delayed on that schema (documented).
+        // all provide the compound ordering needed to apply both update
+        // recency and the global id tie-break before LIMIT. Otherwise the
+        // provider's descending, time-encoded `ses_` ids make PRIMARY KEY ASC
+        // a bounded newest-created fallback; resumed old sessions can be
+        // delayed on that schema (documented).
         let recency_order = if columns.contains("time_updated")
-            && has_leading_index(&snapshot.conn, "session", "time_updated")?
-        {
-            "time_updated DESC"
+            && has_ordered_index_prefix(
+                &snapshot.conn,
+                "session",
+                &[("time_updated", true), ("id", false)],
+            )? {
+            "time_updated DESC, id ASC"
         } else {
             "id ASC"
         };
@@ -1412,17 +1465,22 @@ impl ShallowSessionProvider for OpencodeProvider {
                  WHERE {keyed_predicate} AND json_valid(m.data) AND json_valid(p.data) \
                  AND json_extract(m.data, '$.role') = 'user' \
                  AND json_extract(p.data, '$.type') = 'text' \
+                 AND json_type(p.data, '$.text') = 'text' \
+                 AND trim(substr(json_extract(p.data, '$.text'), 1, ?)) <> '' \
                  ORDER BY {order} ASC LIMIT 1"
             );
             scan.note_query();
             let prompt = {
                 let mut stmt = conn.prepare_cached(&sql)?;
                 stmt.query_row(
-                    params![EXCERPT_MAX_CHARS as i64, &candidate.locator],
-                    |row| row.get::<_, Option<String>>(0),
+                    params![
+                        EXCERPT_MAX_CHARS as i64,
+                        &candidate.locator,
+                        EXCERPT_MAX_CHARS as i64
+                    ],
+                    |row| row.get::<_, String>(0),
                 )
                 .optional()?
-                .flatten()
             };
             scan.note_records(u64::from(prompt.is_some()));
             prompt
@@ -1468,27 +1526,36 @@ impl ShallowSessionProvider for OpencodeProvider {
     }
 }
 
+fn file_generation_time(metadata: &fs::Metadata) -> u128 {
+    metadata
+        .created()
+        .or_else(|_| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
 #[cfg(unix)]
-fn opencode_store_identity(path: &Path, schema_version: i64) -> String {
+fn opencode_store_generation(path: &Path) -> Result<String> {
     use std::os::unix::fs::MetadataExt;
-    fs::metadata(path)
-        .map(|metadata| format!("{}:{}:{schema_version}", metadata.dev(), metadata.ino()))
-        .unwrap_or_else(|_| format!("unknown:{schema_version}"))
+    let metadata = fs::metadata(path)?;
+    Ok(format!(
+        "{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        file_generation_time(&metadata)
+    ))
 }
 
 #[cfg(not(unix))]
-fn opencode_store_identity(path: &Path, schema_version: i64) -> String {
-    fs::metadata(path)
-        .map(|metadata| {
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default();
-            format!("{}:{modified}:{schema_version}", metadata.len())
-        })
-        .unwrap_or_else(|_| format!("unknown:{schema_version}"))
+fn opencode_store_generation(path: &Path) -> Result<String> {
+    let metadata = fs::metadata(path)?;
+    Ok(format!(
+        "{}:{}",
+        metadata.len(),
+        file_generation_time(&metadata)
+    ))
 }
 
 // ---------------------------------------------------------------------------

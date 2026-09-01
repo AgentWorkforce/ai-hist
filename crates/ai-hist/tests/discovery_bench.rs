@@ -479,10 +479,10 @@ fn create_opencode_scaling_fixture(path: &Path, unrelated_sessions: usize) {
     db.execute_batch("COMMIT").unwrap();
 }
 
-fn opencode_plan(conn: &Connection, sql: &str) -> String {
+fn opencode_plan<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> String {
     conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
         .unwrap()
-        .query_map([], |row| row.get::<_, String>(3))
+        .query_map(params, |row| row.get::<_, String>(3))
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap()
@@ -506,13 +506,30 @@ fn opencode_fixed_limit_scaling_report() {
         let candidate_plan = opencode_plan(
             &planning,
             "SELECT id, directory, time_created, time_updated FROM session
-             WHERE id IS NOT NULL AND id <> '' ORDER BY time_updated DESC LIMIT 20",
+             WHERE id IS NOT NULL AND id <> ''
+             ORDER BY time_updated DESC, id ASC LIMIT ?",
+            rusqlite::params![20_i64],
         );
         let prompt_plan = opencode_plan(
             &planning,
-            "SELECT p.data FROM part p JOIN message m ON m.id = p.message_id
-             WHERE p.session_id = 'ses_newest_19' AND json_valid(m.data) AND json_valid(p.data)
-             ORDER BY COALESCE(p.time_created, m.time_created) LIMIT 1",
+            "SELECT substr(json_extract(p.data, '$.text'), 1, ?)
+             FROM part p JOIN message m ON m.id = p.message_id
+             WHERE p.session_id = ? AND json_valid(m.data) AND json_valid(p.data)
+             AND json_extract(m.data, '$.role') = 'user'
+             AND json_extract(p.data, '$.type') = 'text'
+             AND json_type(p.data, '$.text') = 'text'
+             AND trim(substr(json_extract(p.data, '$.text'), 1, ?)) <> ''
+             ORDER BY COALESCE(p.time_created, m.time_created) ASC LIMIT 1",
+            rusqlite::params![4096_i64, "ses_newest_19", 4096_i64],
+        );
+        let model_plan = opencode_plan(
+            &planning,
+            "SELECT COALESCE(json_extract(data, '$.modelID'),
+                             json_extract(data, '$.model.modelID'))
+             FROM message WHERE session_id = ? AND json_valid(data)
+             AND COALESCE(json_extract(data, '$.modelID'),
+                          json_extract(data, '$.model.modelID')) IS NOT NULL LIMIT 1",
+            rusqlite::params!["ses_newest_19"],
         );
         assert!(
             candidate_plan.contains("session_time_updated_id_idx"),
@@ -524,6 +541,11 @@ fn opencode_fixed_limit_scaling_report() {
         );
         assert!(!prompt_plan.contains("SCAN p"), "{prompt_plan}");
         assert!(!prompt_plan.contains("SCAN m"), "{prompt_plan}");
+        assert!(
+            model_plan.contains("SEARCH message USING INDEX message_session_time_created_id_idx"),
+            "{model_plan}"
+        );
+        assert!(!model_plan.contains("SCAN message"), "{model_plan}");
         drop(planning);
 
         let running = Arc::new(AtomicBool::new(true));

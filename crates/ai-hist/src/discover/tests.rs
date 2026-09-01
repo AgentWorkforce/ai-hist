@@ -947,6 +947,28 @@ fn opencode_fixed_limit_does_not_inspect_unrelated_history() {
     assert_eq!(unchanged.summary.counters.bytes_read, 0);
 }
 
+#[test]
+fn opencode_applies_the_global_id_tiebreak_before_its_limit() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(
+        home.path(),
+        "INSERT INTO session VALUES ('ses_c', '/c', 1, 10);
+         INSERT INTO session VALUES ('ses_a', '/a', 1, 10);
+         INSERT INTO session VALUES ('ses_b', '/b', 1, 10);",
+    );
+    let found = discover(
+        &conn,
+        home.path(),
+        &DiscoverOptions {
+            sources: vec!["opencode".into()],
+            limit: Some(2),
+            ..Default::default()
+        },
+    );
+    assert_eq!(found.ids(), vec!["opencode:ses_a", "opencode:ses_b"]);
+}
+
 fn explain_details(conn: &Connection, sql: &str) -> String {
     conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
         .unwrap()
@@ -969,6 +991,8 @@ fn opencode_selected_session_queries_use_provider_indexes() {
          WHERE p.session_id = 'selected' AND json_valid(m.data) AND json_valid(p.data)
            AND json_extract(m.data, '$.role') = 'user'
            AND json_extract(p.data, '$.type') = 'text'
+           AND json_type(p.data, '$.text') = 'text'
+           AND trim(substr(json_extract(p.data, '$.text'), 1, 4096)) <> ''
          ORDER BY COALESCE(p.time_created, m.time_created) ASC LIMIT 1",
     );
     assert!(
@@ -981,8 +1005,10 @@ fn opencode_selected_session_queries_use_provider_indexes() {
 
     let model = explain_details(
         &db,
-        "SELECT json_extract(data, '$.modelID') FROM message
-         WHERE session_id = 'selected' AND json_valid(data) LIMIT 1",
+        "SELECT COALESCE(json_extract(data, '$.modelID'), json_extract(data, '$.model.modelID'))
+         FROM message WHERE session_id = 'selected' AND json_valid(data)
+         AND COALESCE(json_extract(data, '$.modelID'),
+                      json_extract(data, '$.model.modelID')) IS NOT NULL LIMIT 1",
     );
     assert!(
         model.contains("SEARCH message USING INDEX message_session_time_created_id_idx"),
@@ -1142,6 +1168,8 @@ fn malformed_and_partial_opencode_rows_do_not_hide_an_older_complete_prompt() {
     opencode_db(
         home.path(),
         "INSERT INTO session VALUES ('ses_partial', '/work/oc', 1, 4);
+         INSERT INTO message VALUES ('m0', 'ses_partial', 0, '{\"role\":\"user\"}');
+         INSERT INTO part VALUES ('p0', 'm0', 'ses_partial', 0, '{\"type\":\"text\"}');
          INSERT INTO message VALUES ('m1', 'ses_partial', 1, '{\"role\":\"user\",\"modelID\":\"ok\"}');
          INSERT INTO part VALUES ('p1', 'm1', 'ses_partial', 1, '{\"type\":\"text\",\"text\":\"complete prompt\"}');
          INSERT INTO message VALUES ('m2', 'ses_partial', 2, '{broken');
@@ -1189,7 +1217,7 @@ fn replacing_the_opencode_database_invalidates_same_timestamp_stamps() {
 }
 
 #[test]
-fn busy_opencode_database_reports_a_bounded_failure() {
+fn opencode_waits_for_a_transient_busy_writer() {
     let conn = catalog();
     let home = tempfile::tempdir().unwrap();
     opencode_db(home.path(), "");
@@ -1198,18 +1226,21 @@ fn busy_opencode_database_reports_a_bounded_failure() {
         .pragma_update(None, "journal_mode", "DELETE")
         .unwrap();
     blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        blocker.execute_batch("COMMIT").unwrap();
+    });
     let env = env_at(&conn, home.path());
+    let provider = OpencodeProvider::default();
     let started = std::time::Instant::now();
-    let error = discover_sessions_with_env(&env, &only(&["opencode"]), |_| {}).unwrap_err();
-    assert!(started.elapsed() < std::time::Duration::from_secs(2));
-    let failure = error
-        .downcast_ref::<AllProvidersFailed>()
-        .expect("the single provider failure carries diagnostics");
+    assert!(provider.enumerate(&env, Some(1)).is_ok());
+    let elapsed = started.elapsed();
+    release.join().unwrap();
     assert!(
-        failure.summary.diagnostics[0].error.contains("locked"),
-        "{:?}",
-        failure.summary.diagnostics
+        elapsed >= std::time::Duration::from_millis(250),
+        "{elapsed:?}"
     );
+    assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
 }
 
 // ---------------------------------------------------------------------------

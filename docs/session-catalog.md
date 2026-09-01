@@ -346,8 +346,9 @@ How each adapter works:
   SQLite read-only and `query_only` enforcement, then holds one deferred read
   transaction for the run. Candidate enumeration and every selected-session
   query therefore share one committed SQLite snapshot. In WAL mode OpenCode's
-  writer continues normally; a busy or rollback-journal lock is waited for at
-  most 250 ms and then reported as a provider diagnostic. RelayHistory never
+  writer continues normally. Cross-process `SQLITE_BUSY` uses the repository's
+  bounded, jittered retry policy (roughly 30 seconds); non-retryable
+  `SQLITE_LOCKED` conflicts remain distinct diagnostics. RelayHistory never
   backs up the database or WAL, creates a temporary database, issues provider
   DDL, adds indexes, or runs provider migrations.
 
@@ -358,14 +359,15 @@ How each adapter works:
   discovery still returns session metadata but omits the affected prompt/model
   field rather than scanning a historical table.
 
-  Exact newest-*updated* enumeration uses an existing index led by
-  `session.time_updated`. Some supported OpenCode schemas do not ship that
-  index. On those schemas the bounded safe fallback reads `session` through
-  its primary key in ascending order, which matches OpenCode's descending,
+  Exact newest-*updated* enumeration uses an existing index ordered by
+  `session.time_updated DESC, id ASC`, so the global deterministic tie-break is
+  applied before `LIMIT`. Some supported OpenCode schemas do not ship that
+  index. On those schemas the bounded safe fallback reads `session` through its
+  primary key in ascending order, which matches OpenCode's descending,
   time-encoded generated session IDs and therefore finds newest-created
   sessions. The limitation is that a much older session resumed recently can
-  be delayed until OpenCode provides a recency index; RelayHistory will not
-  mutate the provider database to repair that gap.
+  be delayed until OpenCode provides the compound recency index; RelayHistory
+  will not mutate the provider database to repair that gap.
 - **relay** — a **network** source with no local transcript, and discovery must
   work offline. The adapter therefore derives rows only from `history` rows a
   previous `ai-hist sync` already stored locally; it opens no socket. If nothing
