@@ -21,7 +21,7 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 3 and catalog contract version 2, normalizes nullable fields, maps
+version 4, catalog contract version 2, and hydration contract version 1, normalizes nullable fields, maps
 native errors, and supplies pagination helpers.
 
 The CLI and MCP server import only the SDK's public functions. They do not
@@ -62,6 +62,7 @@ row's `locations`.
 | `discoverSessions` (`local`, default) | bounded shallow reads | catalog upserts | creates catalog DB |
 | `discoverSessions` (`remote`) | configured remote connectors (error when none) | catalog upserts | creates catalog DB |
 | `discoverSessions` (`all`) | local adapters + configured remote connectors | catalog upserts | creates catalog DB |
+| `hydrateSession` | one selected provider session and linked evidence | transactional evidence + checkpoint upsert | `SESSION_NOT_FOUND` |
 | `search`, `recent` (`local` / `remote` / `all`) | none | indexed reads | empty result |
 | `stats` (`local` / `remote` / `all`) | none | indexed aggregate reads | empty result |
 | `getSession` | none | indexed identity read | empty result |
@@ -75,7 +76,15 @@ No read operation invokes discovery or sync. A common cold start is:
 ```ts
 await discoverSessions({ limit: 100, scope: 'local' });
 const sessions = await listSessionCatalog({ limit: 100, scope: 'all' });
+await hydrateSession({ source: sessions[0].source, sessionId: sessions[0].sessionId });
 ```
+
+Global sync owns enumeration while targeted hydration resolves one persisted
+catalog presence. Both call the same Rust provider normalization helpers.
+TypeScript never parses a provider source or opens SQLite. Per-session
+checkpoints make unchanged calls constant-work after source resolution, and
+`session_relationships` preserves Codex child identities without flattening
+their events into the selected root.
 
 Events use `(ts_ms, id)` keyset pagination. Catalog ordering is
 `(last_activity_ms DESC, source ASC, session_id ASC)`, with null timestamps at

@@ -36,6 +36,40 @@ npm run benchmark -- --output=foo.md --db=/path/to/ai-history.db
 AI_HIST_DB=/path/to/ai-history.db npm run benchmark -- --output=foo.md
 ```
 
+## Targeted hydration benchmark
+
+Select five recent local catalog sessions and measure the first hydration plus
+five unchanged checkpoint hits for each:
+
+```bash
+npm run benchmark:hydration -- --pretty
+```
+
+The selector prefers shallow sessions, rotates across providers, and never
+prints transcript content or provider paths. It reads only the cached catalog
+while selecting. Hydration itself updates the configured RelayHistory database,
+so use `--db` to choose the intended catalog. Provider source files and stores
+are opened read-only.
+
+Useful controls:
+
+```bash
+npm run benchmark:hydration -- --count=10 --iterations=20 --source=claude --source=codex
+npm run benchmark:hydration -- --output=hydration.md --include-related
+```
+
+`--count` sets the number of selected sessions, `--iterations` sets the number
+of unchanged calls after each first call, repeated `--source` values constrain
+selection, and `--include-related` includes linked child evidence. Without that
+flag, related-session work is disabled so provider comparisons stay bounded.
+The JSON and Markdown reports record each session's prior discovery state,
+first-call status and latency, unchanged p50/p95 latency, evidence counts, and
+provider diagnostic work counters. Only repeat calls that actually return
+`unchanged` contribute to unchanged percentiles, so a live provider update
+during the run cannot be mislabeled as a checkpoint hit. A first call can
+report `unchanged` when no shallow session remains for that provider; the
+report preserves that status rather than describing it as cold.
+
 ## Benchmark definitions
 
 Discovery benchmarks use a generated home directory containing 1,000 valid,

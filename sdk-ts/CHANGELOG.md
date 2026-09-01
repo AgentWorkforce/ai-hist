@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   actually executed — the CLI's human discovery summary prints it, and the
   MCP `discover_sessions`/`sync` tools are now declared open-world. This
   advances the native-addon contract to 4.
+- Add typed `hydrateSession()` with stable acquisition errors, evidence counts,
+  indexed-through state, related session IDs, and performance diagnostics.
+- Add SDK-only `sessions hydrate` CLI and `hydrate_session` MCP adapters. The
+  native contract advances to 4 and hydration uses contract version 1.
+
 - Add the shared `SessionScope` (`local`, `remote`, or `all`) to session
   discovery, listing, search, recent history, statistics, and sync. The SDK and CLI default
   to local scope; the CLI exposes mutually exclusive `--local`, `--remote`, and

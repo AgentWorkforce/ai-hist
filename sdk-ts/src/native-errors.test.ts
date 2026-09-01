@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
-  DatabaseOpenError, NativeContractMismatchError, UnsupportedOperationError, discoverSessions,
-  listSessionCatalogPage, recent, stats, sync, validateNativeContract, validateNativeScope,
+  DatabaseOpenError, NativeContractMismatchError, SessionNotFoundError, UnsupportedOperationError,
+  discoverSessions, hydrateSession, listSessionCatalogPage, recent, stats, sync,
+  validateNativeContract, validateNativeScope,
 } from './index.js';
 
 test('missing database reads are explicit empty cache operations', async () => {
@@ -19,6 +20,20 @@ test('missing database reads are explicit empty cache operations', async () => {
     assert.deepEqual(await stats({ dbPath }), {
       scope: 'local', total: 0, bySource: {}, byProject: [], firstTimestampMs: null, lastTimestampMs: null,
     });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('targeted hydration requires an existing catalog row', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-hydrate-missing-'));
+  try {
+    await assert.rejects(
+      hydrateSession({ source: 'claude', sessionId: 'missing', dbPath: join(root, 'history.db') }),
+      (error: unknown) => error instanceof SessionNotFoundError
+        && error.code === 'SESSION_NOT_FOUND'
+        && /discoverSessions/.test(error.message),
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -28,6 +28,7 @@ npm install ai-hist
 npm install --global ai-hist
 ai-hist sessions discover --limit 100
 ai-hist sessions list --limit 100
+ai-hist sessions hydrate codex 01a04f0c-... --json
 ```
 
 Session-set commands share one mutually exclusive location scope:
@@ -73,6 +74,7 @@ ai-hist --version --no-warning
 ```ts
 import {
   discoverSessions,
+  hydrateSession,
   listSessionCatalog,
   getSessionEventsPage,
   search,
@@ -81,6 +83,9 @@ import {
 
 await discoverSessions({ limit: 100, scope: 'local' });
 const sessions = await listSessionCatalog({ limit: 100, scope: 'all' });
+if (sessions[0]) {
+  await hydrateSession({ source: sessions[0].source, sessionId: sessions[0].sessionId });
+}
 const firstEvents = sessions[0]
   ? await getSessionEventsPage(sessions[0].sessionId, {
       source: sessions[0].source,
@@ -92,9 +97,12 @@ await sync({ scope: 'local' }); // explicit full ingestion; local is the default
 ```
 
 `listSessionCatalog` is cache-only. `discoverSessions` performs bounded shallow
-provider discovery and updates the shared ledger. `sync` performs full
-ingestion. Reads never silently turn into either discovery or sync. Direct
-session and event lookup is identity-based and therefore has no location scope.
+provider discovery and updates the shared ledger. `hydrateSession` fully
+indexes one existing catalog identity and returns evidence counts rather than
+the transcript; repeating it is safe as a live session grows. `sync` performs
+full global ingestion. Reads never silently turn into discovery, hydration, or
+sync. Hydration includes linked subagent evidence by default; CLI callers can
+pass `--no-related`.
 
 ## MCP
 
@@ -103,7 +111,7 @@ npx -y ai-hist-mcp
 ```
 
 MCP exposes thin adapters for search, recent history, catalog listing,
-discovery, sessions, paged events, statistics, and explicit sync.
+discovery, targeted hydration, sessions, paged events, statistics, and sync.
 
 ## Supported production matrix
 
