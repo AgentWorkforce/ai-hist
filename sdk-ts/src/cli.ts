@@ -230,11 +230,18 @@ function catalogCursorFlag(args: Parsed): CatalogCursor | undefined {
 function evidenceCursorFlag(args: Parsed): EvidenceCursor | undefined {
   const raw = cursorFlag<{ tsMs?: unknown; ts_ms?: unknown; id?: unknown }>(args);
   if (raw === undefined) return undefined;
-  if (!raw || typeof raw !== 'object' || typeof raw.id !== 'number') {
-    throw new Error('--after must be a JSON cursor with a numeric id');
+  if (!raw || typeof raw !== 'object' || !Number.isInteger(raw.id)) {
+    throw new Error('--after must be a JSON cursor with an integer id');
   }
-  const tsMs = raw.tsMs ?? raw.ts_ms;
-  return { tsMs: typeof tsMs === 'number' ? tsMs : null, id: raw.id };
+  // An undated cursor spells its timestamp `null` or leaves it out. Any other
+  // non-integer timestamp is a malformed cursor: reading it as null instead
+  // would place the page inside the undated tail and silently drop every dated
+  // record after it.
+  const tsMs = raw.tsMs ?? raw.ts_ms ?? null;
+  if (tsMs !== null && !Number.isInteger(tsMs)) {
+    throw new Error('--after cursor ts_ms must be an integer or null');
+  }
+  return { tsMs: tsMs as number | null, id: raw.id as number };
 }
 
 function outputDiscovery(value: Awaited<ReturnType<typeof discoverSessions>>, json: boolean): void {

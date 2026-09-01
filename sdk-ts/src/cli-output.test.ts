@@ -220,6 +220,31 @@ test('sessions tools and edits page versioned JSON and continue from a cursor', 
       assert.match(tailEdits.stdout, /No file edits\./);
     }
 
+    // A cursor field that is present but not an integer is malformed, not
+    // undated: coercing it to null would move the page into the undated tail
+    // and silently omit every dated record instead of reporting the bad flag.
+    for (const [after, message] of [
+      ['{"ts_ms":"1720000000000","id":1}', '--after cursor ts_ms must be an integer or null'],
+      ['{"tsMs":"1720000000000","id":1}', '--after cursor ts_ms must be an integer or null'],
+      ['{"tsMs":1.5,"id":1}', '--after cursor ts_ms must be an integer or null'],
+      ['{"id":"1"}', '--after must be a JSON cursor with an integer id'],
+      ['{"tsMs":null}', '--after must be a JSON cursor with an integer id'],
+      ['{"tsMs":null,"id":1.5}', '--after must be a JSON cursor with an integer id'],
+    ] as const) {
+      for (const subcommand of ['tools', 'edits']) {
+        await assert.rejects(
+          run(process.execPath, [
+            cli, 'sessions', subcommand, 'claude', 'claude-evidence', '--after', after,
+            '--db', db, '--json', '--no-warning',
+          ], { env }),
+          (error: unknown) => typeof error === 'object' && error !== null
+            && 'code' in error && error.code === 1
+            && 'stderr' in error && String(error.stderr).includes(message),
+          `sessions ${subcommand} --after ${after}`,
+        );
+      }
+    }
+
     for (const args of [
       ['sessions', 'tools', 'claude'],
       ['sessions', 'edits', 'claude'],
