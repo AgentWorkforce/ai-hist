@@ -3,8 +3,9 @@
 import { readFile } from 'node:fs/promises';
 
 import {
-  discoverSessions, getSession, getSessionEventsPage, hydrateSession, listSessionCatalogPage,
-  recent, search, stats, sync, type CatalogCursor, type SessionScope,
+  discoverSessions, getSession, getSessionEventsPage, getSessionRelationships, getSessionTree,
+  hydrateSession, listSessionCatalogPage, recent, search, stats, sync,
+  type CatalogCursor, type SessionRelationship, type SessionScope,
 } from './index.js';
 
 type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
@@ -14,7 +15,7 @@ type PackageMetadata = { version?: string };
 const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-related', 'no-warning', 'remote', 'version']);
 const VALUE_FLAGS = new Set([
   'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
-  'project', 'source', 'tag',
+  'max-depth', 'max-nodes', 'project', 'source', 'tag',
 ]);
 const KNOWN_FLAGS = new Set([...BOOLEAN_FLAGS, ...VALUE_FLAGS]);
 
@@ -190,6 +191,8 @@ function usage(message?: string): never {
   ai-hist sessions list [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
   ai-hist sessions discover [--local | --remote | --all] [--source SOURCE] [--limit N] [--json]
   ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--no-related] [--db PATH] [--json]
+  ai-hist sessions relationships SOURCE SESSION_ID [--db PATH] [--json]
+  ai-hist sessions tree SOURCE SESSION_ID [--max-depth N] [--max-nodes N] [--db PATH] [--json]
   ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--limit N] [--json]
   ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--json]
   ai-hist session SESSION_ID [--source SOURCE] [--json]
@@ -250,6 +253,57 @@ function outputHydration(value: Awaited<ReturnType<typeof hydrateSession>>, json
   }
 }
 
+function relationshipLine(direction: 'child' | 'parent', row: SessionRelationship): string {
+  const identity = direction === 'child' ? row.childSessionId ?? '(unlinked)' : row.parentSessionId;
+  return [
+    direction, identity, row.relationship, row.childAgentType ?? '-', row.spawnedAtMs ?? '-',
+    `events=${row.childHasEvents ? 'yes' : 'no'}`, `identity=${row.identityStatus}`,
+    row.evidenceLocator ?? row.evidenceKind,
+  ].join('  ');
+}
+
+function outputRelationships(value: Awaited<ReturnType<typeof getSessionRelationships>>, json: boolean): void {
+  if (json) {
+    output(value, true);
+    return;
+  }
+  const total = value.asParent.length + value.asChild.length;
+  process.stdout.write(total === 0
+    ? `${value.source}/${value.sessionId}: no delegation relationships.\n`
+    : `${value.source}/${value.sessionId}: ${value.asParent.length} child relationship(s), ` +
+      `${value.asChild.length} parent relationship(s)\n`);
+  for (const row of value.asParent) process.stdout.write(`${relationshipLine('child', row)}\n`);
+  for (const row of value.asChild) process.stdout.write(`${relationshipLine('parent', row)}\n`);
+  process.stdout.write(`capability: stable child identity = ${value.capabilities.stableChildIdentity}\n`);
+  for (const diagnostic of value.diagnostics) {
+    process.stdout.write(`${diagnostic.code}: ${diagnostic.message}\n`);
+  }
+}
+
+function outputTree(value: Awaited<ReturnType<typeof getSessionTree>>, json: boolean): void {
+  if (json) {
+    output(value, true);
+    return;
+  }
+  if (value.nodes.length === 0) {
+    process.stdout.write(`${value.source}/${value.rootSessionId}: no indexed delegation tree.\n`);
+  }
+  for (const node of value.nodes) {
+    const edge = node.relationship
+      ? `  [${[node.relationship.relationship, node.relationship.childAgentType].filter(Boolean).join(' ')}]` +
+        `  events=${node.hasEvents ? 'yes' : 'no'}`
+      : '';
+    process.stdout.write(`${'  '.repeat(node.depth)}${node.sessionId}${edge}${node.truncated ? '  …' : ''}\n`);
+  }
+  process.stdout.write(
+    `${Math.max(value.nodes.length - 1, 0)} descendant(s), max depth ${value.maxDepthReached}\n`,
+  );
+  for (const row of value.unlinked) {
+    process.stdout.write(`unlinked evidence: ${row.evidenceKind} ${row.evidenceLocator ?? ''}`.trimEnd() + '\n');
+  }
+  if (value.truncated) process.stdout.write('truncated: node/depth budget reached\n');
+}
+
 async function main(): Promise<void> {
   const rawArgs = process.argv.slice(2);
   const versionArgs = rawArgs.filter((arg) => arg !== '--no-warning');
@@ -298,6 +352,29 @@ async function main(): Promise<void> {
       scope: scopeFlag(args),
       dbPath: textFlag(args, 'db'),
       includeRelated: !args.flags.has('no-related'),
+    }), json);
+    return;
+  }
+  if (command === 'sessions' && subcommand === 'relationships') {
+    validateFlags(args, 'sessions relationships', ['all', 'db', 'json', 'local', 'remote']);
+    const [source, sessionId, ...surplus] = rest;
+    if (!source || !sessionId) usage('sessions relationships requires SOURCE and SESSION_ID');
+    rejectSurplusPositionals(surplus, 'sessions relationships');
+    rejectScopeFlag(args, 'sessions relationships');
+    outputRelationships(await getSessionRelationships({
+      source: source as never, sessionId, dbPath: textFlag(args, 'db'),
+    }), json);
+    return;
+  }
+  if (command === 'sessions' && subcommand === 'tree') {
+    validateFlags(args, 'sessions tree', ['all', 'db', 'json', 'local', 'max-depth', 'max-nodes', 'remote']);
+    const [source, sessionId, ...surplus] = rest;
+    if (!source || !sessionId) usage('sessions tree requires SOURCE and SESSION_ID');
+    rejectSurplusPositionals(surplus, 'sessions tree');
+    rejectScopeFlag(args, 'sessions tree');
+    outputTree(await getSessionTree({
+      source: source as never, sessionId, dbPath: textFlag(args, 'db'),
+      maxDepth: numberFlag(args, 'max-depth'), maxNodes: numberFlag(args, 'max-nodes'),
     }), json);
     return;
   }

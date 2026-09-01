@@ -51,3 +51,15 @@ test('MCP session operations expose scope and acquisition is declared open-world
     assert.match(mcp.slice(start, end === -1 ? undefined : end), /LOCAL_WRITE/, 'hydrate_session indexes local provider evidence, closed-world');
   }
 });
+
+test('identity-addressed MCP tools are read-only and take no scope', async () => {
+  const mcp = await readFile(join(sourceDir, 'mcp-server.ts'), 'utf8');
+  for (const tool of ['get_session', 'get_session_events', 'get_session_relationships', 'get_session_tree']) {
+    const start = mcp.indexOf(`server.tool('${tool}'`);
+    assert.notEqual(start, -1, `${tool} is registered`);
+    const end = mcp.indexOf("server.tool('", start + 13);
+    const registration = mcp.slice(start, end === -1 ? undefined : end);
+    assert.match(registration, /READ/, `${tool} is a read-only tool`);
+    assert.doesNotMatch(registration, /SESSION_SCOPE/, `${tool} addresses a session by identity`);
+  }
+});

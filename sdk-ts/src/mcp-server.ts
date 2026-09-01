@@ -6,8 +6,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import {
-  discoverSessions, getSession, getSessionEventsPage, hydrateSession, listSessionCatalogPage,
-  recent, search, stats, sync,
+  discoverSessions, getSession, getSessionEventsPage, getSessionRelationships, getSessionTree,
+  hydrateSession, listSessionCatalogPage, recent, search, stats, sync,
 } from './index.js';
 
 const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
@@ -86,7 +86,23 @@ server.tool('get_session_events', 'Get one bounded page of normalized events.', 
   after: z.object({ tsMs: z.number().int(), id: z.number().int() }).optional(),
 }, READ, ({ session_id, source, limit, after }) => call(() => getSessionEventsPage(session_id, { source, limit, after })));
 
-server.tool('history_stats', 'Statistics for already-indexed RelayHistory data.', {
+server.tool('get_session_relationships',
+  'Direct delegation relationships for one session, in both directions (as parent and as child).', {
+  source: CATALOG_SOURCE,
+  session_id: z.string().min(1),
+}, READ, ({ source, session_id }) => call(() => getSessionRelationships({ source, sessionId: session_id })));
+
+server.tool('get_session_tree',
+  'Complete descendant delegation tree for one session, with cycle protection and deterministic ordering. Child events are not flattened into the parent.', {
+  source: CATALOG_SOURCE,
+  session_id: z.string().min(1),
+  max_depth: z.number().int().min(1).max(64).optional().default(32),
+  max_nodes: z.number().int().min(1).max(10000).optional().default(1000),
+}, READ, ({ source, session_id, max_depth, max_nodes }) => call(() => getSessionTree({
+  source, sessionId: session_id, maxDepth: max_depth, maxNodes: max_nodes,
+})));
+
+server.tool('history_stats','Statistics for already-indexed RelayHistory data.', {
   scope: SESSION_SCOPE.optional().default('local'),
   tag: z.string().optional(),
 }, READ, ({ scope, tag }) => call(() => stats({ scope, tag })));
