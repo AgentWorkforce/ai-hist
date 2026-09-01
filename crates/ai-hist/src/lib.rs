@@ -30,6 +30,8 @@ mod codex;
 pub mod discover;
 mod hydrate;
 mod learn;
+/// Recording the delegation evidence each provider leaves behind.
+mod relationships;
 /// Remote session connectors (claude.ai/code web sessions, Codex cloud tasks)
 /// and their availability reporting.
 pub mod remote;
@@ -48,6 +50,8 @@ pub use hydrate::{
     HydrationDiagnostic, HydrationEvidence, HydrationIndexedThrough,
     SESSION_HYDRATION_CONTRACT_VERSION,
 };
+pub(crate) use relationships::now_ms;
+pub use relationships::{record_relationship, ObservedRelationship};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
@@ -5258,31 +5262,35 @@ fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) ->
 /// (session cwds, session branches, prompts inserted).
 type CodexRolloutWalk = (HashMap<String, String>, HashMap<String, String>, usize);
 
-/// Reconcile the catalog registration for a locally observed Codex subagent.
+/// Reconcile the catalog registration for a locally observed subagent.
 ///
 /// A local-only subagent stays out of the catalog. If the same canonical
 /// session was separately discovered remotely, its retained local events are
 /// also local evidence, so both presences and the canonical row must survive.
-fn cleanup_codex_subagent_registration(conn: &Connection, session_id: &str) -> Result<()> {
+fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM session_presences \
-         WHERE source = 'codex' AND session_id = ? AND location = 'local' \
+         WHERE source = ? AND session_id = ? AND location = 'local' \
            AND NOT EXISTS (\
              SELECT 1 FROM session_presences \
-             WHERE source = 'codex' AND session_id = ? AND location = 'remote'\
+             WHERE source = ? AND session_id = ? AND location = 'remote'\
            )",
-        params![session_id, session_id],
+        params![source, session_id, source, session_id],
     )?;
     conn.execute(
         "DELETE FROM sessions \
-         WHERE source = 'codex' AND session_id = ? \
+         WHERE source = ? AND session_id = ? \
            AND NOT EXISTS (\
              SELECT 1 FROM session_presences \
-             WHERE source = 'codex' AND session_id = ?\
+             WHERE source = ? AND session_id = ?\
            )",
-        params![session_id, session_id],
+        params![source, session_id, source, session_id],
     )?;
     Ok(())
+}
+
+fn cleanup_codex_subagent_registration(conn: &Connection, session_id: &str) -> Result<()> {
+    cleanup_subagent_registration(conn, "codex", session_id)
 }
 
 fn codex_session_has_remote_presence(conn: &Connection, session_id: &str) -> Result<bool> {
@@ -5418,6 +5426,14 @@ fn sync_codex_rollouts(
             };
             inserted += outcome.prompts;
             events += outcome.events;
+            // Topology is recorded by the full sync too, so delegation is
+            // queryable after a plain `sync` and not only after targeted
+            // hydration of the parent.
+            if meta.is_subagent {
+                if let Some(parent) = meta.parent_session_id.as_deref() {
+                    record_codex_delegation(conn, parent, &meta, &rollout)?;
+                }
+            }
             // Subagent threads (guardian/reviewer spawns) keep their events
             // under their own thread id but stay out of the session list.
             if !meta.is_subagent {
@@ -5487,13 +5503,49 @@ fn load_state_string_map(state: &Map<String, Value>, key: &str) -> HashMap<Strin
         .unwrap_or_default()
 }
 
-fn codex_session_events_exist(conn: &Connection, session_id: &str) -> Result<bool> {
+/// Record one Codex subagent rollout as a delegation of its parent thread.
+///
+/// The rollout's own `session_meta` is the evidence: the file locates it, the
+/// thread id is the child's real identity, and the meta line's timestamp is
+/// when the provider recorded the thread starting.
+fn record_codex_delegation(
+    conn: &Connection,
+    parent_session_id: &str,
+    meta: &CodexSessionMeta,
+    rollout: &Path,
+) -> Result<()> {
+    let locator = rollout.to_string_lossy();
+    record_relationship(
+        conn,
+        &ObservedRelationship {
+            source: "codex",
+            parent_session_id,
+            child_session_id: Some(&meta.session_id),
+            relationship: "delegated",
+            child_agent_type: meta.subagent_label.as_deref(),
+            child_agent_name: None,
+            child_model: None,
+            spawn_depth: None,
+            evidence_kind: "codex_session_meta",
+            evidence_locator: Some(&locator),
+            evidence_ref: meta.parent_thread_id.as_deref(),
+            child_has_events: codex_session_events_exist(conn, &meta.session_id)?,
+            spawned_at_ms: meta.meta_ts_ms,
+        },
+    )
+}
+
+fn session_events_exist(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
     let exists: i64 = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_events WHERE source = 'codex' AND session_id = ? LIMIT 1)",
-        [session_id],
+        "SELECT EXISTS(SELECT 1 FROM session_events WHERE source = ? AND session_id = ? LIMIT 1)",
+        params![source, session_id],
         |row| row.get(0),
     )?;
     Ok(exists != 0)
+}
+
+fn codex_session_events_exist(conn: &Connection, session_id: &str) -> Result<bool> {
+    session_events_exist(conn, "codex", session_id)
 }
 
 struct CodexSessionMeta {
@@ -5501,7 +5553,17 @@ struct CodexSessionMeta {
     cwd: String,
     git_branch: Option<String>,
     is_subagent: bool,
+    /// The parent this thread was delegated by, from whichever field the
+    /// provider recorded it in.
     parent_session_id: Option<String>,
+    /// `payload.parent_thread_id`, kept as the provider-native reference even
+    /// when `payload.session_id` is what named the parent.
+    parent_thread_id: Option<String>,
+    /// The label under `payload.source.subagent`, when the rollout carries one.
+    subagent_label: Option<String>,
+    /// The `session_meta` line's own timestamp: when the provider recorded
+    /// this thread starting.
+    meta_ts_ms: Option<i64>,
 }
 
 /// Read the `session_meta` line that opens every rollout file.
@@ -5547,29 +5609,53 @@ fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
         .and_then(|g| g.get("branch"))
         .and_then(Value::as_str)
         .map(str::to_string);
+    let subagent = payload
+        .and_then(|p| p.get("source"))
+        .and_then(Value::as_object)
+        .and_then(|s| s.get("subagent"));
     let is_subagent = payload
         .and_then(|p| p.get("thread_source"))
         .and_then(Value::as_str)
         == Some("subagent")
-        || payload
-            .and_then(|p| p.get("source"))
-            .and_then(Value::as_object)
-            .is_some_and(|s| s.contains_key("subagent"));
-    let parent_session_id = is_subagent
-        .then(|| {
-            payload
-                .and_then(|p| p.get("session_id"))
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty() && *id != session_id)
-                .map(str::to_string)
-        })
+        || subagent.is_some();
+    let named_parent = |key: &str| {
+        payload
+            .and_then(|p| p.get(key))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && *id != session_id)
+            .map(str::to_string)
+    };
+    let parent_thread_id = is_subagent
+        .then(|| named_parent("parent_thread_id"))
         .flatten();
+    let parent_session_id = is_subagent
+        .then(|| named_parent("session_id").or_else(|| parent_thread_id.clone()))
+        .flatten();
+    // The label is an object in the observed rollouts (`{"other":"guardian"}`);
+    // its value names the agent, and its key is the only thing left when the
+    // value is not a string.
+    let subagent_label = subagent.and_then(|value| match value {
+        Value::String(label) => Some(label.clone()),
+        Value::Object(map) => map
+            .values()
+            .find_map(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| map.keys().next().cloned()),
+        _ => None,
+    });
+    let meta_ts_ms = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(parse_iso_ms);
     Ok(Some(CodexSessionMeta {
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
         git_branch,
         is_subagent,
         parent_session_id,
+        parent_thread_id,
+        subagent_label,
+        meta_ts_ms,
     }))
 }
 
@@ -6385,6 +6471,37 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
 }
 
 fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
+    ingest_claude_transcript_as(conn, path, None)
+}
+
+/// Remove every event a single transcript record produced under one session
+/// id. The uid prefix is the record's uuid, so this reaches the row and all of
+/// its per-block siblings.
+fn delete_claude_events_for_record(
+    conn: &Connection,
+    session_id: &str,
+    uuid: Option<&str>,
+) -> Result<()> {
+    let Some(uuid) = uuid else {
+        return Ok(());
+    };
+    conn.execute(
+        "DELETE FROM session_events WHERE source = 'claude' AND session_id = ? \
+         AND (event_uid = ? || ':0' OR event_uid LIKE ? || ':%')",
+        params![session_id, uuid, uuid],
+    )?;
+    Ok(())
+}
+
+/// `attributed_session_id` overrides the record's own `sessionId`. Claude
+/// subagent transcripts carry the PARENT's sessionId plus a per-child
+/// `agentId`; when the provider records that agentId we store the child's
+/// events under it so the child is independently addressable.
+fn ingest_claude_transcript_as(
+    conn: &Connection,
+    path: &Path,
+    attributed_session_id: Option<&str>,
+) -> Result<()> {
     let text = fs::read_to_string(path).unwrap_or_default();
     for (line_index, line) in text.lines().enumerate() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -6393,10 +6510,11 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
         let Some(obj) = value.as_object() else {
             continue;
         };
-        let session_id = match obj.get("sessionId").and_then(Value::as_str) {
+        let record_session_id = match obj.get("sessionId").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => s,
             _ => continue,
         };
+        let session_id = attributed_session_id.unwrap_or(record_session_id);
         // Subagent sidecar transcripts share the parent's sessionId with
         // isSidechain rows. The subagent's assistant output is real session
         // activity (text and token spend), but its user-role rows are the
@@ -6406,22 +6524,23 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
             .get("isSidechain")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if sidechain
+        let skipped_sidechain = sidechain
             && obj
                 .get("message")
                 .and_then(|m| m.get("role"))
                 .and_then(Value::as_str)
-                != Some("assistant")
-        {
-            // Heal databases that ingested these rows before this guard:
-            // the uid prefix is this row's uuid, so stale events (and any
-            // per-block siblings) can be removed as the file is re-read.
-            if let Some(uuid) = obj.get("uuid").and_then(Value::as_str) {
-                conn.execute(
-                    "DELETE FROM session_events WHERE source = 'claude' AND session_id = ? AND (event_uid = ? || ':0' OR event_uid LIKE ? || ':%')",
-                    params![session_id, uuid, uuid],
-                )?;
-            }
+                != Some("assistant");
+        let uuid = obj.get("uuid").and_then(Value::as_str);
+        // Heal what an earlier parser version wrote for this record: it
+        // attributed every sidechain row to the parent, and stored the rows
+        // this guard now skips. Re-reading the file removes the stale event
+        // under the identity it was written with, so a re-parse moves the
+        // row onto the child instead of duplicating it across both.
+        if session_id != record_session_id {
+            delete_claude_events_for_record(conn, record_session_id, uuid)?;
+        }
+        if skipped_sidechain {
+            delete_claude_events_for_record(conn, session_id, uuid)?;
             continue;
         }
         let cwd = obj.get("cwd").and_then(Value::as_str);
@@ -6440,9 +6559,7 @@ fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
                 .unwrap_or("session"),
             line_index
         );
-        let message_uuid = obj
-            .get("uuid")
-            .and_then(Value::as_str)
+        let message_uuid = uuid
             .or_else(|| message.and_then(|m| m.get("id")).and_then(Value::as_str))
             .unwrap_or(&fallback_uid);
         let message_role = message
