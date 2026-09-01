@@ -107,14 +107,22 @@ provider versions that emit a per-child `agentId` name the child — and `never`
 for the remaining sources.
 
 `getSessionTree` returns pre-order `nodes` (the root first), the `unlinked`
-evidence found at any depth, and `diagnostics`. Children are ordered by
+evidence found at any depth, and `diagnostics`. `nodes[0]` is always the root,
+so a session with no children — and a database that does not exist yet — comes
+back as a one-node tree rather than an empty one. Children are ordered by
 `(spawnedAtMs, relationshipUid)` with null spawn times last, so repeated calls
-against the same database return identical results. Traversal visits each
-session once, at its shallowest depth; a repeat emits a `RELATIONSHIP_CYCLE`
-diagnostic instead of looping. `maxDepth` (default 32, maximum 64) and
-`maxNodes` (default 1000, maximum 10000) bound the work and set `truncated`
-with a `RELATIONSHIP_TREE_DEPTH_LIMIT` or `RELATIONSHIP_TREE_TRUNCATED`
-diagnostic rather than returning a silently short tree.
+against the same database return identical results.
+
+Traversal visits each session once, at the position pre-order first reaches it.
+An edge back into the current branch's ancestry is a cycle and emits a
+`RELATIONSHIP_CYCLE` diagnostic instead of looping; an edge to a session already
+emitted on another branch is a diamond and is quietly not expanded twice.
+`maxDepth` (default 32, maximum 64) and `maxNodes` (default 1000, maximum
+10000) bound the work and set `truncated` with a
+`RELATIONSHIP_TREE_DEPTH_LIMIT` or `RELATIONSHIP_TREE_TRUNCATED` diagnostic
+rather than returning a silently short tree. Tree-level `truncated` means a
+budget cut the walk short — a cycle or diamond never sets it — while a node's
+own `truncated` marks children it did not expand.
 
 For large topologies, `getSessionChildrenPage` is the keyset primitive and
 `sessionDescendants` is the async iterator over it, walking descendants

@@ -43,10 +43,16 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `ai-hist sessions relationships` and `ai-hist sessions tree` commands, or the
   `get_session_relationships` and `get_session_tree` MCP tools. Traversal is
   pre-order, deterministically ordered by `(spawned_at_ms, relationship_uid)`,
-  cycle-safe, and bounded by `max_depth` / `max_nodes`. Global `sync` now
-  records Codex delegation too, so topology is queryable without targeted
+  cycle-safe, and bounded by `max_depth` / `max_nodes`; a tree always contains
+  its root, and a repeated session reached along a second path is reported as a
+  cycle only when the edge points back into its own ancestry. Global `sync` now
+  records Codex delegation too — including a backfill for rollouts an earlier
+  version already ingested — so topology is queryable without targeted
   hydration, and existing databases migrate automatically through the
-  `session_relationships_v2` marker.
+  `session_relationships_v2` marker. A full `sync` also treats a Claude
+  subagent sidecar as delegated evidence rather than a session: it keeps the
+  child's output under the child, and leaves the parent's own provider locator
+  alone.
 - Add remote provider connectors behind the existing `--remote` / `--all`
   acquisition scopes: `claude-web` lists claude.ai/code web sessions with the
   OAuth sign-in the Claude Code CLI stored (`~/.claude/.credentials.json`,

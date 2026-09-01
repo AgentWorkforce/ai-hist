@@ -67,8 +67,17 @@ test('missing databases answer relationship queries with provider capabilities',
       },
       diagnostics: [],
     });
+    // A tree always contains its root, so a missing database answers with the
+    // same shape a real childless session has.
     assert.deepEqual(await getSessionTree({ source: 'claude', sessionId: 'root', dbPath }), {
-      contractVersion: 1, source: 'claude', rootSessionId: 'root', nodes: [], unlinked: [],
+      contractVersion: 1,
+      source: 'claude',
+      rootSessionId: 'root',
+      nodes: [{
+        source: 'claude', sessionId: 'root', depth: 0, parentSessionId: null,
+        relationship: null, childCount: 0, hasEvents: false, truncated: false,
+      }],
+      unlinked: [],
       capabilities: {
         source: 'claude', stableChildIdentity: 'sometimes', recordsAgentType: true,
         recordsSpawnTime: true, recordsEvidenceLocator: true,
@@ -186,7 +195,10 @@ test('tree traversal is deterministic, depth-bounded, and cycle-safe', async () 
 
     const cycle = await getSessionTree({ source: 'codex', sessionId: 'loop-a', dbPath });
     assert.deepEqual(cycle.nodes.map((node) => node.sessionId), ['loop-a', 'loop-b']);
-    assert.equal(cycle.truncated, true);
+    // Both sessions are in the tree, so nothing was truncated; only the node
+    // whose child was not expanded again is marked.
+    assert.equal(cycle.truncated, false);
+    assert.equal(cycle.nodes[1].truncated, true);
     assert.deepEqual(cycle.diagnostics.map((item) => item.code), ['RELATIONSHIP_CYCLE']);
 
     // A different source never sees these edges.

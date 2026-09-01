@@ -37,7 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SessionDescendantsOptions`, `DescendantEventsOptions`, and the
   `SESSION_RELATIONSHIP_CONTRACT_VERSION` constant. Results report
   `identityStatus` and `capabilities.stableChildIdentity` instead of
-  synthesizing a child identity the provider never recorded.
+  synthesizing a child identity the provider never recorded. `getSessionTree()`
+  always returns the root as `nodes[0]`, including for a session with no
+  recorded delegation and for a database that does not exist yet.
 - Add the SDK-only `sessions relationships` and `sessions tree` CLI commands
   and the read-only `get_session_relationships` and `get_session_tree` MCP
   tools. Both address a session by identity and take no scope.

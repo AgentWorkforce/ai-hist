@@ -1168,11 +1168,22 @@ pub async fn get_session_tree(options: SessionTreeOptions) -> napi::Result<Nativ
     let path = db_path(options.db_path);
     let source = options.source;
     let session_id = options.session_id;
+    // A tree always contains its root, so the missing-database answer is the
+    // same shape a real empty tree has: one node, no descendants.
     let empty = NativeSessionTree {
         contract_version: SESSION_RELATIONSHIP_CONTRACT_VERSION,
         source: source.clone(),
         root_session_id: session_id.clone(),
-        nodes: Vec::new(),
+        nodes: vec![NativeSessionTreeNode {
+            source: source.clone(),
+            session_id: session_id.clone(),
+            depth: 0,
+            parent_session_id: None,
+            relationship: None,
+            child_count: 0,
+            has_events: false,
+            truncated: false,
+        }],
         unlinked: Vec::new(),
         capabilities: relationship_capabilities(&source).into(),
         diagnostics: Vec::new(),

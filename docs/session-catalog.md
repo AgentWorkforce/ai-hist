@@ -567,7 +567,8 @@ discoverable".
   `getSessionTree(options)` returns the pre-order descendant tree bounded by
   `maxDepth` / `maxNodes`; `getSessionChildrenPage(options)` returns one keyset
   page of direct children. All three are cache-only, and a missing database is
-  an empty result rather than an error.
+  an empty result rather than an error — for the tree, the root-only result a
+  session with no recorded delegation also returns.
 - **TypeScript SDK** — `listSessionCatalog()` / `discoverSessions()` wrap the
   same contract for Node consumers, as do `getSessionRelationships()`,
   `getSessionTree()`, `getSessionChildrenPage()`, and the `sessionDescendants()`

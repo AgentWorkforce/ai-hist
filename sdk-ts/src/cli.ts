@@ -285,9 +285,6 @@ function outputTree(value: Awaited<ReturnType<typeof getSessionTree>>, json: boo
     output(value, true);
     return;
   }
-  if (value.nodes.length === 0) {
-    process.stdout.write(`${value.source}/${value.rootSessionId}: no indexed delegation tree.\n`);
-  }
   for (const node of value.nodes) {
     const edge = node.relationship
       ? `  [${[node.relationship.relationship, node.relationship.childAgentType].filter(Boolean).join(' ')}]` +

@@ -189,6 +189,13 @@ test('sessions relationships and sessions tree render topology in both modes', a
     ], { env });
     assert.match(treeHuman.stdout, /^topology-root\n {2}topology-child {2}\[delegated guardian] {2}events=yes\n1 descendant\(s\), max depth 1\n$/);
 
+    // A tree always contains its root, so a session with no recorded
+    // delegation renders as itself rather than as nothing at all.
+    const lone = await run(process.execPath, [
+      cli, 'sessions', 'tree', 'codex', 'topology-child', '--db', db, '--no-warning',
+    ], { env });
+    assert.match(lone.stdout, /^topology-child\n0 descendant\(s\), max depth 0\n$/);
+
     await assert.rejects(
       run(process.execPath, [
         cli, 'sessions', 'tree', 'codex', 'topology-root', '--max-depth', '0', '--db', db, '--no-warning',

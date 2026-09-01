@@ -69,7 +69,7 @@ row's `locations`.
 | `getSession` | none | indexed identity read | empty result |
 | `getSessionEventsPage` | none | bounded keyset page | empty page |
 | `getSessionRelationships` | none | indexed relationship reads | empty result |
-| `getSessionTree` | none | indexed relationship reads, one child query per emitted node | empty result |
+| `getSessionTree` | none | indexed relationship reads, one child query per emitted node | root-only tree |
 | `getSessionChildrenPage` | none | bounded keyset page | empty page |
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
 | `sync` (`remote`) | configured remote connectors (error when none) | catalog upserts + presences | creates DB |
@@ -124,14 +124,26 @@ Children are ordered by `(spawned_at_ms, relationship_uid)` with null spawn
 times at the tail; `relationship_uid` is unique per parent, so that is a total
 order shared by `getSessionChildrenPage`, `getSessionTree`, and the SDK's
 `sessionDescendants` walker. Traversal is pre-order over an explicit stack,
-never recursion. A session appears exactly once, at its shallowest reachable
-depth; a repeated session stops expansion and emits a `RELATIONSHIP_CYCLE`
-diagnostic. `maxDepth` (default 32, maximum 64) and `maxNodes` (default 1000,
-maximum 10000) bound the work to one indexed child query per emitted node and
-surface `RELATIONSHIP_TREE_DEPTH_LIMIT` and `RELATIONSHIP_TREE_TRUNCATED`
-diagnostics instead of silently short results. Unlinked rows are reported in
-`unlinked` with a `RELATIONSHIP_UNLINKED_CHILD` diagnostic rather than
-traversed.
+never recursion, and `nodes[0]` is always the root — including for a session
+with no recorded delegation and for a database that does not exist yet.
+
+A session appears exactly once, at the position pre-order first reaches it. An
+edge back into the current branch's own ancestry is a cycle: it is not expanded
+again and emits a `RELATIONSHIP_CYCLE` diagnostic. An edge to a session already
+emitted on another branch is a diamond, not a loop; it is simply not expanded a
+second time, and is neither diagnosed nor counted as truncation.
+
+`maxDepth` (default 32, maximum 64) and `maxNodes` (default 1000, maximum
+10000) bound the work to one indexed child query per emitted node and surface
+`RELATIONSHIP_TREE_DEPTH_LIMIT` and `RELATIONSHIP_TREE_TRUNCATED` diagnostics
+instead of silently short results. Tree-level `truncated` means a budget
+stopped the walk short of the recorded evidence, so a cycle or diamond never
+sets it; node-level `truncated` marks every node whose children were left
+unexpanded, including all parents still pending when the node budget ran out.
+Unlinked rows are reported in `unlinked` with a `RELATIONSHIP_UNLINKED_CHILD`
+diagnostic rather than traversed — at every depth, the boundary included, so a
+node whose only children are unlinked evidence is complete rather than
+truncated.
 
 Events use `(ts_ms, id)` keyset pagination. Catalog ordering is
 `(last_activity_ms DESC, source ASC, session_id ASC)`, with null timestamps at
