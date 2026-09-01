@@ -143,7 +143,10 @@ unexpanded, including all parents still pending when the node budget ran out.
 Unlinked rows are reported in `unlinked` with a `RELATIONSHIP_UNLINKED_CHILD`
 diagnostic rather than traversed — at every depth, the boundary included, so a
 node whose only children are unlinked evidence is complete rather than
-truncated.
+truncated. Only a session the tree has not already emitted is charged against
+`maxNodes`, so a diamond is never reported as a budget truncation. The SDK's
+`sessionDescendants` walker applies the same `childCount` and `truncated`
+rules to the nodes it yields.
 
 Events use `(ts_ms, id)` keyset pagination. Catalog ordering is
 `(last_activity_ms DESC, source ASC, session_id ASC)`, with null timestamps at

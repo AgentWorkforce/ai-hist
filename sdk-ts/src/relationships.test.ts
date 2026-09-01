@@ -10,6 +10,13 @@ import {
   type SessionRelationship, type SessionTreeNode,
 } from './index.js';
 
+/**
+ * Store locations that a configured environment moves out from under HOME.
+ * A full `sync()` walks every provider, so leaving any of these set would let
+ * the machine running the tests contribute sessions to a fixture database.
+ */
+const STORE_OVERRIDES = ['OPENCODE_DB', 'TRAJECTORY_ROOT', 'RELAYHISTORY_HOME', 'AI_HIST_DB'];
+
 /** Runs one case against a private HOME so provider scans see only its fixtures. */
 async function withHome(
   prefix: string,
@@ -18,14 +25,18 @@ async function withHome(
   const root = await mkdtemp(join(tmpdir(), prefix));
   const home = join(root, 'home');
   await mkdir(home, { recursive: true });
-  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  const saved = new Map<string, string | undefined>(
+    ['HOME', 'USERPROFILE', ...STORE_OVERRIDES].map((key) => [key, process.env[key]]),
+  );
   process.env.HOME = home;
   process.env.USERPROFILE = home;
+  for (const key of STORE_OVERRIDES) delete process.env[key];
   try {
     await body(home, join(root, 'history.db'));
   } finally {
-    if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
-    if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.USERPROFILE;
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -200,6 +211,12 @@ test('tree traversal is deterministic, depth-bounded, and cycle-safe', async () 
     assert.equal(cycle.truncated, false);
     assert.equal(cycle.nodes[1].truncated, true);
     assert.deepEqual(cycle.diagnostics.map((item) => item.code), ['RELATIONSHIP_CYCLE']);
+    // The lazy walker reads the same loop the same way.
+    const walked: SessionTreeNode[] = [];
+    for await (const node of sessionDescendants({ source: 'codex', sessionId: 'loop-a', dbPath })) {
+      walked.push(node);
+    }
+    assert.deepEqual(walked, cycle.nodes.slice(1));
 
     // A different source never sees these edges.
     assert.deepEqual((await getSessionTree({ source: 'claude', sessionId: 'root', dbPath })).nodes.map((node) => node.sessionId), ['root']);
@@ -223,11 +240,19 @@ test('sessionDescendants walks the same descendants as the materialized tree', a
     const byId = (nodes: SessionTreeNode[]) => [...nodes].sort((left, right) => left.sessionId.localeCompare(right.sessionId));
     assert.deepEqual(byId(walked), byId(tree.nodes.slice(1)));
 
-    const bounded: string[] = [];
+    // The walker and the materialized tree must also agree at a depth
+    // boundary: a node there still reports the linked children it did not
+    // expand, and is truncated only because one was left unexplored.
+    const bounded: SessionTreeNode[] = [];
     for await (const node of sessionDescendants({ source: 'codex', sessionId: 'root', dbPath, maxDepth: 1 })) {
-      bounded.push(node.sessionId);
+      bounded.push(node);
     }
-    assert.deepEqual(bounded.sort(), ['child-a', 'child-b']);
+    const shallow = await getSessionTree({ source: 'codex', sessionId: 'root', dbPath, maxDepth: 1 });
+    assert.deepEqual(byId(bounded), byId(shallow.nodes.slice(1)));
+    assert.deepEqual(
+      bounded.map((node) => [node.sessionId, node.childCount, node.truncated]).sort(),
+      [['child-a', 1, true], ['child-b', 0, false]],
+    );
   });
 });
 

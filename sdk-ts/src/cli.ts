@@ -298,6 +298,9 @@ function outputTree(value: Awaited<ReturnType<typeof getSessionTree>>, json: boo
   for (const row of value.unlinked) {
     process.stdout.write(`unlinked evidence: ${row.evidenceKind} ${row.evidenceLocator ?? ''}`.trimEnd() + '\n');
   }
+  for (const diagnostic of value.diagnostics) {
+    process.stdout.write(`${diagnostic.code}: ${diagnostic.message}\n`);
+  }
   if (value.truncated) process.stdout.write('truncated: node/depth budget reached\n');
 }
 

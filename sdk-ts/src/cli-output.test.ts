@@ -196,6 +196,16 @@ test('sessions relationships and sessions tree render topology in both modes', a
     ], { env });
     assert.match(lone.stdout, /^topology-child\n0 descendant\(s\), max depth 0\n$/);
 
+    // A budget that stops the walk is worth saying out loud: the readable
+    // tree prints the same diagnostics the JSON form carries.
+    const bounded = await run(process.execPath, [
+      cli, 'sessions', 'tree', 'codex', 'topology-root', '--max-nodes', '1', '--db', db, '--no-warning',
+    ], { env });
+    assert.match(
+      bounded.stdout,
+      /^topology-root {2}…\n0 descendant\(s\), max depth 0\nRELATIONSHIP_TREE_TRUNCATED: tree exceeded max_nodes=1\ntruncated: node\/depth budget reached\n$/,
+    );
+
     await assert.rejects(
       run(process.execPath, [
         cli, 'sessions', 'tree', 'codex', 'topology-root', '--max-depth', '0', '--db', db, '--no-warning',

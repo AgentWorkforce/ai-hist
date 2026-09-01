@@ -34,8 +34,12 @@
   last. The uid is unique per parent, so that is a total order shared by the
   paged children query and the tree walk.
 - Walk pre-order over an explicit stack. A session is emitted once, at its
-  shallowest reachable depth; a repeat marks its parent truncated and emits a
-  cycle diagnostic instead of looping.
+  shallowest reachable depth. A repeat is a cycle only when the edge points
+  back into the current branch's own ancestry: that marks its parent truncated
+  and emits a cycle diagnostic instead of looping. A repeat that reaches a
+  session already emitted on another branch is a diamond — nothing is missing,
+  so it is simply not expanded again, and nothing is diagnosed, truncated, or
+  charged against the node budget.
 - Bound the work with `max_depth` and `max_nodes`, one indexed child query per
   emitted node, and report depth-limit, truncation, and unlinked-child
   diagnostics rather than returning a silently short tree.

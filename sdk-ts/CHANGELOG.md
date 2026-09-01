@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-hist` Node CLI from this package.
 - Advance the required `ai-hist-native` contract to 5. Claude subagent
   transcripts whose records carry an `agentId` are indexed under that child id,
-  so their events move off the parent on the next `hydrateSession`.
+  so their events — and the tool calls and file edits derived from them — move
+  off the parent on the next `hydrateSession`.
 
 ### Added
 

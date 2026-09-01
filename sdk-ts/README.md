@@ -126,7 +126,10 @@ own `truncated` marks children it did not expand.
 
 For large topologies, `getSessionChildrenPage` is the keyset primitive and
 `sessionDescendants` is the async iterator over it, walking descendants
-breadth-first without materializing a tree.
+breadth-first without materializing a tree. It yields the same nodes
+`getSessionTree` emits, with the same `childCount` (linked children only, at
+the depth boundary included) and the same `truncated` rule, so the two can be
+swapped without changing what a consumer reads.
 
 Native loading failures distinguish unsupported platforms, missing optional
 platform packages, addon load failures, SDK/native contract mismatches, and

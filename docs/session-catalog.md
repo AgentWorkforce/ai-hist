@@ -48,8 +48,12 @@ session id rather than flattened into the parent, and delegated task prompts
 are not stored as human prompt history. Claude evidence from a provider
 version that does not name the child is recorded as an unlinked relationship —
 never as a synthesized identity — and its output stays attributed to the
-parent. Set `includeRelated: false` or use CLI `--no-related` to acquire only
-the selected thread.
+parent. The hydration stamp covers every file that evidence came from — the
+selected transcript, each subagent transcript, and the
+`agent-<agentId>.meta.json` describing it — so a metadata sidecar that arrives
+or changes on its own still re-hydrates the session. Set
+`includeRelated: false` or use CLI `--no-related` to acquire only the selected
+thread.
 
 | | `ai-hist sessions list` | `ai-hist sessions discover` |
 |---|---|---|

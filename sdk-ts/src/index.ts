@@ -392,6 +392,7 @@ interface NativeBinding {
 }
 
 const CATALOG_SOURCES: readonly string[] = ['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode'];
+const RELATIONSHIP_TYPES: readonly string[] = ['delegated'];
 const DEFAULT_TREE_MAX_DEPTH = 32;
 const MAX_TREE_MAX_DEPTH = 64;
 
@@ -621,6 +622,22 @@ function assertRelationshipContract(value: number): void {
   }
 }
 
+function catalogSource(value: unknown): CatalogSource {
+  if (typeof value === 'string' && CATALOG_SOURCES.includes(value)) return value as CatalogSource;
+  throw new NativeContractMismatchError(
+    `ai-hist-native returned an invalid catalog source: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
+    'NATIVE_CONTRACT_MISMATCH',
+  );
+}
+
+function relationshipType(value: unknown): RelationshipType {
+  if (typeof value === 'string' && RELATIONSHIP_TYPES.includes(value)) return value as RelationshipType;
+  throw new NativeContractMismatchError(
+    `ai-hist-native returned an invalid relationship type: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
+    'NATIVE_CONTRACT_MISMATCH',
+  );
+}
+
 function identityStatus(value: unknown): IdentityStatus {
   if (value === 'observed' || value === 'unlinked') return value;
   throw new NativeContractMismatchError(
@@ -639,10 +656,10 @@ function stableChildIdentity(value: unknown): StableChildIdentity {
 
 function relationship(value: UnknownRecord): SessionRelationship {
   return {
-    source: String(value.source) as CatalogSource,
+    source: catalogSource(value.source),
     parentSessionId: String(value.parentSessionId),
     childSessionId: nullableString(value.childSessionId),
-    relationship: String(value.relationship) as RelationshipType,
+    relationship: relationshipType(value.relationship),
     identityStatus: identityStatus(value.identityStatus),
     childAgentType: nullableString(value.childAgentType),
     childAgentName: nullableString(value.childAgentName),
@@ -665,7 +682,7 @@ function relationships(value: unknown): SessionRelationship[] {
 function relationshipCapabilities(value: unknown): RelationshipCapabilities {
   const row = (value ?? {}) as UnknownRecord;
   return {
-    source: String(row.source) as CatalogSource,
+    source: catalogSource(row.source),
     stableChildIdentity: stableChildIdentity(row.stableChildIdentity),
     recordsAgentType: row.recordsAgentType === true,
     recordsSpawnTime: row.recordsSpawnTime === true,
@@ -683,7 +700,7 @@ function relationshipDiagnostics(value: unknown): RelationshipDiagnostic[] {
 
 function treeNode(value: UnknownRecord): SessionTreeNode {
   return {
-    source: String(value.source) as CatalogSource,
+    source: catalogSource(value.source),
     sessionId: String(value.sessionId),
     depth: Number(value.depth),
     parentSessionId: nullableString(value.parentSessionId),
@@ -967,6 +984,19 @@ export async function* sessionDescendants(options: SessionDescendantsOptions): A
   const maxDepth = Math.min(Math.max(Math.trunc(options.maxDepth ?? DEFAULT_TREE_MAX_DEPTH), 1), MAX_TREE_MAX_DEPTH);
   const request = { source: options.source, dbPath: options.dbPath };
   const visited = new Set<string>([options.sessionId]);
+  // Each walked session's parent, so a repeated edge can be told apart: back
+  // into this branch's own ancestry it is a cycle, anywhere else it is a
+  // diamond, which leaves nothing unexplored. `getSessionTree` draws the same
+  // line, and the two must not disagree about what `truncated` means.
+  const parentOf = new Map<string, string | null>([[options.sessionId, null]]);
+  const isAncestor = (from: string, candidate: string): boolean => {
+    let current: string | null | undefined = from;
+    while (current !== null && current !== undefined) {
+      if (current === candidate) return true;
+      current = parentOf.get(current) ?? null;
+    }
+    return false;
+  };
   let frontier: SessionTreeNode[] = [{
     source: options.source, sessionId: options.sessionId, depth: 0, parentSessionId: null,
     relationship: null, childCount: 0, hasEvents: false, truncated: false,
@@ -979,24 +1009,25 @@ export async function* sessionDescendants(options: SessionDescendantsOptions): A
       let after: RelationshipCursor | undefined;
       do {
         const page = await getSessionChildrenPage({
-          ...request, sessionId: node.sessionId, limit: expand ? options.pageLimit : 1, after,
+          ...request, sessionId: node.sessionId, limit: options.pageLimit, after,
         });
         children.push(...page.children);
-        after = expand ? page.nextCursor ?? undefined : undefined;
+        after = page.nextCursor ?? undefined;
       } while (after);
+      // Unlinked evidence has no traversable identity, so it is never a child
+      // this walk owes the caller — at the depth boundary included.
       const linked = children.filter((edge): edge is SessionRelationship & { childSessionId: string } =>
         edge.identityStatus === 'observed' && edge.childSessionId !== null);
-      if (expand) {
-        node.childCount = linked.length;
-        node.truncated = linked.some((edge) => visited.has(edge.childSessionId));
-      } else {
-        node.truncated = children.length > 0;
-      }
+      node.childCount = linked.length;
+      node.truncated = expand
+        ? linked.some((edge) => isAncestor(node.sessionId, edge.childSessionId))
+        : linked.length > 0;
       if (node.depth > 0) yield node;
       if (!expand) continue;
       for (const edge of linked) {
         if (visited.has(edge.childSessionId)) continue;
         visited.add(edge.childSessionId);
+        parentOf.set(edge.childSessionId, node.sessionId);
         next.push({
           source: edge.source, sessionId: edge.childSessionId, depth: node.depth + 1,
           parentSessionId: node.sessionId, relationship: edge, childCount: 0,

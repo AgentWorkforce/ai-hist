@@ -25,10 +25,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - The native-addon contract advances to 5, and Claude subagent transcripts
   whose records carry an `agentId` are now indexed under that child id instead
   of the parent's. Hydration parser version 2 re-parses and heals existing
-  databases in place on the next `sessions hydrate`, moving those events from
-  the parent to the child rather than duplicating them. The
-  `session_relationships_v2` schema marker is required, so the first read of an
-  existing database is routed through a writable open that migrates it.
+  databases in place on the next `sessions hydrate`, moving those events —
+  along with the tool calls and file edits derived from them — from the parent
+  to the child rather than duplicating them, so a parent stops reporting a
+  delegated thread's actions as its own. The `session_relationships_v2` schema
+  marker is required, so the first read of an existing database is routed
+  through a writable open that migrates it.
 
 ### Added
 
