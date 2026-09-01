@@ -140,6 +140,9 @@ pub struct SessionTree {
     pub unlinked: Vec<SessionRelationship>,
     pub capabilities: RelationshipCapabilities,
     pub diagnostics: Vec<RelationshipDiagnostic>,
+    /// A budget stopped the walk short of the recorded evidence. Skipping a
+    /// session already present in the tree is not truncation: nothing is
+    /// missing from the result.
     pub truncated: bool,
     pub max_depth_reached: u32,
 }
@@ -328,15 +331,6 @@ pub fn session_parents(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn has_children(conn: &Connection, source: &str, parent_session_id: &str) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_relationships \
-         WHERE source = ? AND parent_session_id = ? LIMIT 1)",
-        params![source, parent_session_id],
-        |row| row.get(0),
-    )?)
-}
-
 fn has_events(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_events \
@@ -354,12 +348,34 @@ struct Pending {
     relationship: Option<SessionRelationship>,
 }
 
+/// Whether `session_id` is already on the path from the root to `from`.
+///
+/// Only an edge back into the current branch's own ancestry is a cycle. An
+/// edge into a node emitted on a different branch is a diamond in an acyclic
+/// graph, which must not be reported as one.
+fn is_ancestor(
+    nodes: &[SessionTreeNode],
+    parents: &[Option<usize>],
+    from: Option<usize>,
+    session_id: &str,
+) -> bool {
+    let mut index = from;
+    while let Some(current) = index {
+        if nodes[current].session_id == session_id {
+            return true;
+        }
+        index = parents[current];
+    }
+    false
+}
+
 /// The complete descendant tree of one session, pre-order and bounded.
 ///
 /// Traversal is an explicit stack with a visited set, so a cycle in the
 /// recorded evidence costs one diagnostic rather than an unbounded walk, and
 /// each emitted node costs exactly one indexed child query. A session appears
-/// once, at its shallowest reachable depth.
+/// exactly once, at the position pre-order first reaches it; later arrivals by
+/// another path are not expanded again.
 pub fn session_tree(
     conn: &Connection,
     source: &str,
@@ -369,6 +385,8 @@ pub fn session_tree(
     let max_depth = options.max_depth.clamp(1, MAX_TREE_MAX_DEPTH);
     let max_nodes = options.max_nodes.clamp(1, MAX_TREE_MAX_NODES) as usize;
     let mut nodes: Vec<SessionTreeNode> = Vec::new();
+    // Each emitted node's parent index, which `nodes` itself does not carry.
+    let mut parents: Vec<Option<usize>> = Vec::new();
     let mut unlinked: Vec<SessionRelationship> = Vec::new();
     let mut diagnostics: Vec<RelationshipDiagnostic> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -385,8 +403,14 @@ pub fn session_tree(
     while let Some(pending) = stack.pop() {
         if nodes.len() >= max_nodes {
             truncated = true;
-            if let Some(index) = pending.parent_index {
-                nodes[index].truncated = true;
+            // Every parent still waiting on the stack keeps children it will
+            // never get, so all of them are marked, not just the one the
+            // budget happened to stop at.
+            for parent_index in std::iter::once(&pending)
+                .chain(stack.iter())
+                .filter_map(|remaining| remaining.parent_index)
+            {
+                nodes[parent_index].truncated = true;
             }
             diagnostics.push(RelationshipDiagnostic {
                 code: "RELATIONSHIP_TREE_TRUNCATED".to_string(),
@@ -396,21 +420,26 @@ pub fn session_tree(
             break;
         }
         if !visited.insert(pending.session_id.clone()) {
-            if let Some(index) = pending.parent_index {
-                nodes[index].truncated = true;
+            // A repeat is only a cycle when the edge points back into this
+            // branch's own ancestry. Reaching a node already emitted on
+            // another branch is a diamond: nothing is missing from the tree,
+            // so it is neither a cycle nor truncation.
+            if is_ancestor(&nodes, &parents, pending.parent_index, &pending.session_id) {
+                if let Some(index) = pending.parent_index {
+                    nodes[index].truncated = true;
+                }
+                diagnostics.push(RelationshipDiagnostic {
+                    code: "RELATIONSHIP_CYCLE".to_string(),
+                    message: format!(
+                        "{} already appears in this branch; not expanded again",
+                        pending.session_id
+                    ),
+                    relationship_uid: pending
+                        .relationship
+                        .as_ref()
+                        .map(|relationship| relationship.relationship_uid.clone()),
+                });
             }
-            truncated = true;
-            diagnostics.push(RelationshipDiagnostic {
-                code: "RELATIONSHIP_CYCLE".to_string(),
-                message: format!(
-                    "{} already appears in this tree; not expanded again",
-                    pending.session_id
-                ),
-                relationship_uid: pending
-                    .relationship
-                    .as_ref()
-                    .map(|relationship| relationship.relationship_uid.clone()),
-            });
             continue;
         }
         // A child's addressability was recorded when the edge was observed;
@@ -421,6 +450,7 @@ pub fn session_tree(
         };
         let index = nodes.len();
         max_depth_reached = max_depth_reached.max(pending.depth);
+        parents.push(pending.parent_index);
         nodes.push(SessionTreeNode {
             source: source.to_string(),
             session_id: pending.session_id.clone(),
@@ -431,8 +461,24 @@ pub fn session_tree(
             has_events: node_has_events,
             truncated: false,
         });
+        // The children of a node at the depth boundary are still read:
+        // unlinked evidence is reported wherever it hangs, and the boundary
+        // node's own child count is part of the answer either way.
+        let mut linked = Vec::new();
+        for relationship in session_children(conn, source, &pending.session_id)? {
+            if relationship.is_unlinked() {
+                diagnostics.push(unlinked_diagnostic(&relationship));
+                unlinked.push(relationship);
+            } else {
+                linked.push(relationship);
+            }
+        }
+        nodes[index].child_count = linked.len() as u32;
         if pending.depth >= max_depth {
-            if has_children(conn, source, &pending.session_id)? {
+            // Only a traversable child is left unexplored by the budget. A
+            // node whose children are all unlinked evidence is complete: the
+            // evidence is already in `unlinked`.
+            if !linked.is_empty() {
                 nodes[index].truncated = true;
                 truncated = true;
                 diagnostics.push(RelationshipDiagnostic {
@@ -449,16 +495,6 @@ pub fn session_tree(
             }
             continue;
         }
-        let mut linked = Vec::new();
-        for relationship in session_children(conn, source, &pending.session_id)? {
-            if relationship.is_unlinked() {
-                diagnostics.push(unlinked_diagnostic(&relationship));
-                unlinked.push(relationship);
-            } else {
-                linked.push(relationship);
-            }
-        }
-        nodes[index].child_count = linked.len() as u32;
         // Pushed in reverse so the stack pops them in the total order above.
         for relationship in linked.into_iter().rev() {
             let child_session_id = relationship
@@ -661,6 +697,9 @@ mod tests {
         let tree = session_tree(&conn, "codex", "a", &SessionTreeOptions::default()).unwrap();
         assert_eq!(ids(&tree), vec!["a", "b"]);
         assert!(tree.nodes[1].truncated);
+        // The tree holds every session the evidence names, so a loop is not a
+        // budget truncation.
+        assert!(!tree.truncated);
         assert!(tree
             .diagnostics
             .iter()
@@ -674,10 +713,26 @@ mod tests {
         let tree = session_tree(&conn, "codex", "a", &SessionTreeOptions::default()).unwrap();
         assert_eq!(ids(&tree), vec!["a"]);
         assert!(tree.nodes[0].truncated);
+        assert!(!tree.truncated);
         assert!(tree
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "RELATIONSHIP_CYCLE"));
+    }
+
+    #[test]
+    fn a_diamond_is_not_reported_as_a_cycle() {
+        let (_dir, conn) = database();
+        insert_edge(&conn, &Edge::new("root", "b"));
+        insert_edge(&conn, &Edge::new("root", "c"));
+        insert_edge(&conn, &Edge::new("b", "c"));
+        let tree = session_tree(&conn, "codex", "root", &SessionTreeOptions::default()).unwrap();
+        // `c` is reachable twice but is one session, so it is emitted once.
+        assert_eq!(ids(&tree), vec!["root", "b", "c"]);
+        assert!(tree.diagnostics.is_empty());
+        assert!(!tree.truncated);
+        assert!(tree.nodes.iter().all(|node| !node.truncated));
+        assert_eq!(tree.nodes[0].child_count, 2);
     }
 
     #[test]
@@ -835,6 +890,117 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "RELATIONSHIP_TREE_DEPTH_LIMIT"));
+    }
+
+    #[test]
+    fn unlinked_evidence_at_the_depth_boundary_is_still_reported() {
+        let (_dir, conn) = database();
+        insert_edge(&conn, &Edge::new("root", "child"));
+        insert_edge(
+            &conn,
+            &Edge {
+                child: None,
+                uid: "evidence:test:/tmp/agent-boundary.jsonl",
+                has_events: false,
+                ..Edge::new("child", "unused")
+            },
+        );
+        let tree = session_tree(
+            &conn,
+            "codex",
+            "root",
+            &SessionTreeOptions {
+                max_depth: 1,
+                max_nodes: DEFAULT_TREE_MAX_NODES,
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&tree), vec!["root", "child"]);
+        assert_eq!(tree.unlinked.len(), 1);
+        assert_eq!(
+            tree.diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["RELATIONSHIP_UNLINKED_CHILD"]
+        );
+        // Evidence with no traversable identity is not a subtree the budget
+        // refused to walk.
+        assert!(!tree.nodes[1].truncated);
+        assert!(!tree.truncated);
+        assert_eq!(tree.nodes[1].child_count, 0);
+    }
+
+    #[test]
+    fn depth_boundary_counts_children_it_does_not_expand() {
+        let (_dir, conn) = database();
+        insert_edge(&conn, &Edge::new("root", "child"));
+        insert_edge(&conn, &Edge::new("child", "grandchild"));
+        insert_edge(
+            &conn,
+            &Edge {
+                child: None,
+                uid: "evidence:test:/tmp/agent-boundary.jsonl",
+                has_events: false,
+                ..Edge::new("child", "unused")
+            },
+        );
+        let tree = session_tree(
+            &conn,
+            "codex",
+            "root",
+            &SessionTreeOptions {
+                max_depth: 1,
+                max_nodes: DEFAULT_TREE_MAX_NODES,
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&tree), vec!["root", "child"]);
+        assert_eq!(tree.nodes[1].child_count, 1);
+        assert!(tree.nodes[1].truncated);
+        assert!(tree.truncated);
+        assert_eq!(tree.unlinked.len(), 1);
+        let codes = tree
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<Vec<_>>();
+        assert!(codes.contains(&"RELATIONSHIP_UNLINKED_CHILD"));
+        assert!(codes.contains(&"RELATIONSHIP_TREE_DEPTH_LIMIT"));
+    }
+
+    #[test]
+    fn node_budget_marks_every_parent_left_unexpanded() {
+        let (_dir, conn) = database();
+        for (parent, child) in [
+            ("root", "a"),
+            ("root", "b"),
+            ("a", "a1"),
+            ("a", "a2"),
+            ("b", "b1"),
+        ] {
+            insert_edge(&conn, &Edge::new(parent, child));
+        }
+        let tree = session_tree(
+            &conn,
+            "codex",
+            "root",
+            &SessionTreeOptions {
+                max_depth: DEFAULT_TREE_MAX_DEPTH,
+                max_nodes: 3,
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&tree), vec!["root", "a", "a1"]);
+        assert!(tree.truncated);
+        // `root` still owes `b` and `a` still owes `a2`; `a1` owes nothing.
+        assert_eq!(
+            tree.nodes
+                .iter()
+                .map(|node| node.truncated)
+                .collect::<Vec<_>>(),
+            vec![true, true, false]
+        );
     }
 
     #[test]

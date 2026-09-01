@@ -997,8 +997,11 @@ DROP TABLE session_relationships_v1;
             )?;
             Ok(())
         })();
-        conn.pragma_update(None, "legacy_alter_table", false)?;
+        // The rebuild's error is the one that explains a failed migration, so
+        // it is propagated first and restoring the pragma cannot mask it.
+        let restored = conn.pragma_update(None, "legacy_alter_table", false);
         rebuild?;
+        restored?;
     }
     conn.execute_batch(
         "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_relationships_v2');",
