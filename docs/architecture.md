@@ -21,7 +21,7 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 7, catalog contract version 3, hydration contract version 1,
+version 7, catalog contract version 3, hydration contract version 2,
 session-relationship contract version 1, and session evidence contract version
 1, normalizes nullable fields, maps native errors, and supplies pagination
 helpers.
@@ -88,7 +88,10 @@ await hydrateSession({ source: sessions[0].source, sessionId: sessions[0].sessio
 Global sync owns enumeration while targeted hydration resolves one persisted
 catalog presence. Both call the same Rust provider normalization helpers.
 TypeScript never parses a provider source or opens SQLite. Per-session
-checkpoints make unchanged calls constant-work after source resolution.
+checkpoints make unchanged calls constant-work after source resolution. Remote
+hydration stays provider-bounded: Claude uses the CLI's private
+teleport-evidence contract, while Codex indexes the supported cloud diff and
+reports partial capability because no transcript export exists.
 
 ## Delegation topology
 
@@ -146,7 +149,10 @@ Unlinked rows are reported in `unlinked` with a `RELATIONSHIP_UNLINKED_CHILD`
 diagnostic rather than traversed — at every depth, the boundary included, so a
 node whose only children are unlinked evidence is complete rather than
 truncated. Only a session the tree has not already emitted is charged against
-`maxNodes`, so a diamond is never reported as a budget truncation. The SDK's
+`maxNodes`, so a diamond is never reported as a budget truncation. Deterministic
+Claude remote-to-local materialization is also recorded as a
+`materialized_local` relationship; title or prompt similarity is never used to
+infer one. The SDK's
 `sessionDescendants` walker applies the same `childCount` and `truncated`
 rules to the nodes it yields.
 

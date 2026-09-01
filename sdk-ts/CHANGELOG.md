@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Expose hydration contract v2 with `capability`, shallow/partial outcomes,
+  file-edit evidence counts, and stable remote connector error classes.
+
 ### Breaking
 
 - Advance the native-addon contract to 7 and the session-catalog contract to

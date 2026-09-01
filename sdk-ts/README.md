@@ -44,8 +44,13 @@ if (first) {
 All APIs are async. `listSessionCatalog` and `listSessionCatalogPage` are
 cache-only. `discoverSessions` is shallow discovery. `hydrateSession` is
 targeted evidence acquisition for one existing catalog row. It returns
-`hydrated`, `updated`, or `unchanged`, an indexed source stamp, evidence counts,
-related native session IDs, and bounded-work metrics. `sync` is full ingestion.
+`hydrated`, `updated`, `unchanged`, or `capability_limited`, an indexed source
+stamp, evidence counts, related native session IDs, and bounded-work metrics.
+Targeted remote hydration uses `scope: 'remote'`: Claude web sessions can
+return `capability: 'full'` after complete teleport evidence is acquired;
+Codex cloud tasks return `partial` when their supported unified diff is indexed
+or `shallow_only` when no richer evidence is exposed. Partial results retain
+`discoveryState: 'shallow'`. `sync` is full ingestion.
 Missing databases return empty read results; they do not trigger provider I/O.
 
 Session discovery, listing, search, recent history, statistics, and sync accept
@@ -165,7 +170,9 @@ has to account for that. `sessionEventsIncludingDescendants` applies its
 Native loading failures distinguish unsupported platforms, missing optional
 platform packages, addon load failures, SDK/native contract mismatches, and
 database open failures through stable `RelayHistoryError` subclasses. Provider
-capability failures use `UnsupportedOperationError`.
+capability failures use `UnsupportedOperationError`. Targeted remote hydration
+also distinguishes connector configuration, expired authentication, partial
+evidence, and connector/parser failures with dedicated error subclasses.
 
 The old synchronous `AiHist` class and `openAiHist()` API were removed in 1.0.
 See [the migration guide](https://github.com/AgentWorkforce/relayhistory/blob/main/docs/native-sdk-migration.md).

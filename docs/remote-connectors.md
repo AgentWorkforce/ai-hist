@@ -8,8 +8,8 @@ two connectors:
 
 | Connector | Source | Lists | Interface |
 |---|---|---|---|
-| `claude-web` | `claude` | Claude Code sessions on claude.ai/code | `GET {base}/v1/code/sessions` with the CLI's stored OAuth token |
-| `codex-cloud` | `codex` | Codex cloud tasks | `codex cloud list --json` (the Codex CLI's scripting contract) |
+| `claude-web` | `claude` | Claude Code sessions on claude.ai/code | listing plus the CLI's private teleport-evidence interface, with its stored OAuth token |
+| `codex-cloud` | `codex` | Codex cloud tasks | `codex cloud list --json` and `codex cloud diff TASK_ID` |
 
 Local and remote stay presences of one session ledger: a session observed
 both by a local file adapter and by a connector is one catalog row whose
@@ -51,7 +51,41 @@ exhausted. Both connectors bound one enumeration to 100 pages (10,000 claude
 sessions, 2,000 codex tasks) — bounded work is part of the discovery
 contract; a later run continues from fresher listings.
 
-## What remote rows carry
+## Targeted remote hydration
+
+`hydrateSession({ source, sessionId, scope: "remote" })` addresses exactly one
+cataloged remote session. It never runs discovery or enumerates other tasks.
+Results report `capability` as `full`, `partial`, or `shallow_only`; a provider
+limitation is a successful `capability_limited` result rather than a fabricated
+empty transcript. Authentication, missing-session, bounded-partial, and parser
+failures use the stable codes `AUTHENTICATION_EXPIRED`, `SESSION_NOT_FOUND`,
+`EVIDENCE_PARTIAL`, and `CONNECTOR_FAILURE`.
+
+Claude Code currently fetches a teleported session from
+`GET /v1/code/sessions/{id}/teleport-events`, after resolving the signed-in
+organization through `GET /api/oauth/profile`. RelayHistory uses the same
+provider-owned OAuth credential and normalizes those records through the same
+Rust ingestion path as a local Claude transcript. This can include messages,
+assistant output, tool calls/results, file edits, model/token fields, and
+sidechain markers when Claude supplies them. The endpoint is an observed Claude
+Code implementation contract, **not a documented public Anthropic API**. It may
+change without notice; malformed or incomplete responses fail explicitly and
+never upgrade the remote presence to `full`.
+
+Codex's supported cloud CLI exposes a unified diff, but no task transcript,
+tool-result, token/model, or parent/child export. Remote hydration therefore
+runs bounded `codex cloud diff TASK_ID`, stores per-file patches in
+`file_edits`, and returns `capability: "partial"` with
+`discoveryState: "shallow"`. A task without an available diff returns
+`capability_limited`. RelayHistory does not call private Codex service APIs.
+
+Both paths cap responses at 16 MiB and execution at 30 seconds where a child
+process is involved. Claude pagination is capped at 100 pages of 1,000 records.
+HTTP redirects are not followed, preventing authorization headers from moving
+to another host. Work is checkpointed by remote presence and repeated
+hydration is idempotent.
+
+## What remote rows carry before hydration
 
 Remote listings carry less than a local transcript, and nothing is invented
 to fill the gap:
@@ -69,11 +103,19 @@ to fill the gap:
   service records one.
 - Timestamps — `created_at`/`last_event_at` (claude), `updated_at` (codex).
 
-Remote rows stay `discovery_state: "shallow"`. Neither provider serves full
-transcripts through a supported listing interface, so per-message events,
-tool calls, and full-text search over remote-only sessions require the
-session's evidence to reach a local provider first (for example teleporting a
-claude.ai session into a terminal, which writes a normal local transcript).
+Discovery rows stay `discovery_state: "shallow"`. Claude can be upgraded by
+targeted hydration through teleport evidence. Codex stays shallow even after
+its available diff is indexed because no transcript export exists.
+
+## Remote/local identity correlation
+
+Remote and local sessions remain separate rows. A Claude transcript containing
+the provider-recorded `remoteSessionId` creates a `materialized_local`
+relationship from the remote ID to the local session ID, but only when that
+exact remote presence already exists. Titles, repositories, prompts, and
+timestamps never create canonical relationships. Current Codex CLI apply/diff
+output does not record a local rollout ID, so RelayHistory does not guess a
+Codex remote-to-local relationship.
 
 Claude Remote Control **bridge** sessions (`environment_kind: "bridge"`) are
 views of sessions running in a local terminal; their evidence is local, so
@@ -90,9 +132,8 @@ served from the catalog with zero fresh work beyond the listing itself.
 
 ## Contract stability
 
-`codex-cloud` speaks the Codex CLI's documented scripting interface, which is
-as stable as Codex chooses to keep it. `claude-web` speaks the same
-session-list endpoint the Claude Code CLI's `--teleport` picker uses; that
-endpoint is **not a documented public API** and can change with any Claude
-Code release. A change surfaces as a connector diagnostic (or a failed
-remote-only run) — never as silently missing data mixed into local results.
+`codex-cloud` speaks supported Codex CLI commands, which are as stable as Codex
+chooses to keep them. Claude listing and teleport evidence are observed private
+Claude Code interfaces. A change surfaces as a connector diagnostic (or a
+failed remote-only run), never as silently missing data mixed into local
+results.

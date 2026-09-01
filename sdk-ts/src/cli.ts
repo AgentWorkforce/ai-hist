@@ -315,7 +315,7 @@ function outputHydration(value: Awaited<ReturnType<typeof hydrateSession>>, json
   process.stdout.write(`${value.source}/${value.sessionId}: ${value.status}\n`);
   process.stdout.write(
     `evidence: ${value.evidence.prompts} prompt(s), ${value.evidence.events} event(s), ` +
-    `${value.evidence.toolCalls} tool call(s)\n`,
+    `${value.evidence.toolCalls} tool call(s), ${value.evidence.fileEdits} file edit(s)\n`,
   );
   if (value.relatedSessionIds.length) {
     process.stdout.write(`related sessions: ${value.relatedSessionIds.join(', ')}\n`);

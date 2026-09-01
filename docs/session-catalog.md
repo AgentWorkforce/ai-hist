@@ -26,8 +26,8 @@ argument; provider `--source` filters remain orthogonal to location scope.
 
 ## The two operations
 
-After those two catalog operations, targeted hydration acquires full evidence
-for one selected identity:
+After those two catalog operations, targeted hydration acquires the richest
+available evidence for one selected identity:
 
 ```ts
 const sessions = await listSessionCatalog({ limit: 100 });
@@ -35,11 +35,12 @@ await hydrateSession({ source: sessions[0].source, sessionId: sessions[0].sessio
 ```
 
 Hydration requires the catalog row, never invokes discovery or global sync,
-and upgrades `discoveryState` to `full` transactionally. Here `full` means
-indexed through the returned source stamp, not that a live coding session has
-ended. File providers validate the saved locator against the expected provider
-root; OpenCode uses session-keyed queries against its live read-only database.
-Relay reports `HYDRATION_UNSUPPORTED` until a full-evidence connector exists.
+and upgrades `discoveryState` to `full` only when the connector returned all
+available evidence. Here `full` means indexed through the returned source
+stamp, not that a live coding session has ended. Partial remote connectors
+remain `shallow` and report their capability explicitly. File providers
+validate the saved locator against the expected provider root; OpenCode uses
+session-keyed queries against its live read-only database.
 
 Codex child rollouts, and Claude subagent transcripts whose records carry a
 per-child `agentId`, retain their provider-native IDs and are linked through
@@ -270,9 +271,10 @@ These require a full `ai-hist sync` through an available provider connector:
 `discovery_state` tells you which you have: `"full"` means a full ingest has
 run for that session, `"shallow"` means catalog metadata only. Full ingest
 always wins — a shallow rescan refreshes a `full` row's metadata and stamp but
-never downgrades its state. Local connectors provide full sync today; remote
-rows stay shallow because neither provider serves full transcripts through a
-supported listing interface (see [Remote connectors](remote-connectors.md)).
+never downgrades its state. Local connectors provide full sync today. Claude
+remote rows can become full through targeted teleport-evidence hydration;
+Codex remote rows remain shallow after their available diff is indexed because
+the CLI exposes no transcript export (see [Remote connectors](remote-connectors.md)).
 
 ### Product boundary
 

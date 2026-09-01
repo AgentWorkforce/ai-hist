@@ -290,6 +290,193 @@ fn claude_transport_refuses_plaintext_off_loopback() {
     assert!(require_https_or_loopback("http://127.0.0.1@evil.test").is_err());
 }
 
+#[test]
+fn claude_targeted_evidence_hydrates_one_session_across_pages() {
+    let home = tempfile::tempdir().unwrap();
+    write_claude_credentials(home.path(), FAR_FUTURE_MS);
+    let transport = Arc::new(ScriptedTransport::new(vec![
+        (
+            200,
+            serde_json::json!({
+                "account": {"uuid": "account-test", "email": "test@example.test"},
+                "organization": {"uuid": "org-test"}
+            })
+            .to_string(),
+        ),
+        (
+            200,
+            serde_json::json!({
+                "data": [{"payload": {"sessionId": "session_01abc", "uuid": "u1", "type": "user", "timestamp": 1, "message": {"role": "user", "content": "hello"}}}],
+                "next_cursor": "next page"
+            })
+            .to_string(),
+        ),
+        (
+            200,
+            serde_json::json!({
+                "data": [{"payload": {"sessionId": "session_01abc", "uuid": "a1", "type": "assistant", "timestamp": 2, "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}}}],
+                "next_cursor": null
+            })
+            .to_string(),
+        ),
+    ]));
+    let acquired = acquire_claude_remote_session_at(
+        home.path(),
+        "session_01abc",
+        "https://api.example.test",
+        &transport,
+    )
+    .unwrap();
+    let RemoteSessionEvidence::ClaudeFull {
+        records,
+        source_bytes,
+        ..
+    } = acquired
+    else {
+        panic!("expected full Claude evidence")
+    };
+    assert_eq!(records.len(), 2);
+    assert!(source_bytes > 0);
+    let calls = transport.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert!(calls[0].0.ends_with("/api/oauth/profile"));
+    assert!(calls[1]
+        .0
+        .contains("session_01abc/teleport-events?limit=1000"));
+    assert!(calls[2].0.contains("cursor=next%20page"));
+    assert!(calls.iter().all(|(_, token)| token == "sk-ant-oat01-test"));
+}
+
+#[test]
+fn claude_targeted_evidence_distinguishes_auth_missing_and_malformed_records() {
+    let home = tempfile::tempdir().unwrap();
+    let unconfigured = acquire_claude_remote_session_at(
+        home.path(),
+        "session_01abc",
+        "https://api.example.test",
+        &Arc::new(ScriptedTransport::new(vec![])),
+    )
+    .unwrap();
+    assert!(matches!(
+        unconfigured,
+        RemoteSessionEvidence::CapabilityLimited {
+            code: "CONNECTOR_NOT_CONFIGURED",
+            ..
+        }
+    ));
+
+    write_claude_credentials(home.path(), FAR_FUTURE_MS);
+    let expired = Arc::new(ScriptedTransport::new(vec![(
+        401,
+        "token-secret-must-not-escape".into(),
+    )]));
+    let error = acquire_claude_remote_session_at(
+        home.path(),
+        "session_01abc",
+        "https://api.example.test",
+        &expired,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("AUTHENTICATION_EXPIRED:"), "{error}");
+    assert!(!error.contains("token-secret"), "{error}");
+
+    let malformed = Arc::new(ScriptedTransport::new(vec![
+        (200, r#"{"organization":{"uuid":"org-test"}}"#.into()),
+        (
+            200,
+            r#"{"data":[{"payload":"not-an-object"}],"next_cursor":null}"#.into(),
+        ),
+    ]));
+    let error = acquire_claude_remote_session_at(
+        home.path(),
+        "session_01abc",
+        "https://api.example.test",
+        &malformed,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("malformed record"), "{error}");
+}
+
+#[test]
+fn claude_targeted_evidence_rejects_redirects_and_is_page_bounded() {
+    let home = tempfile::tempdir().unwrap();
+    write_claude_credentials(home.path(), FAR_FUTURE_MS);
+    let redirect = Arc::new(ScriptedTransport::new(vec![(
+        302,
+        "https://evil.test".into(),
+    )]));
+    let error = acquire_claude_remote_session_at(
+        home.path(),
+        "session_01abc",
+        "https://api.example.test",
+        &redirect,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("OAuth profile failed (HTTP 302)"), "{error}");
+
+    let mut pages = vec![(200, r#"{"organization":{"uuid":"org-test"}}"#.into())];
+    pages.extend(
+        (0..MAX_LIST_PAGES).map(|_| (200, r#"{"data":[],"next_cursor":"again"}"#.to_string())),
+    );
+    let bounded = Arc::new(ScriptedTransport::new(pages));
+    let error = acquire_claude_remote_session_at(
+        home.path(),
+        "session_01abc",
+        "https://api.example.test",
+        &bounded,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("EVIDENCE_PARTIAL:"), "{error}");
+    assert_eq!(bounded.calls.lock().unwrap().len(), MAX_LIST_PAGES + 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_targeted_evidence_uses_the_cli_diff_and_reports_an_empty_diff_honestly() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let command = dir.path().join("codex-fixture");
+    std::fs::write(
+        &command,
+        "#!/bin/sh\n\
+         test \"$1\" = cloud && test \"$2\" = diff && test \"$3\" = task_fixture || exit 2\n\
+         printf 'diff --git a/src/lib.rs b/src/lib.rs\\n--- a/src/lib.rs\\n+++ b/src/lib.rs\\n@@ -1 +1,2 @@\\n old\\n+new\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let evidence =
+        acquire_codex_remote_session_with_command("task_fixture", command.as_os_str()).unwrap();
+    let RemoteSessionEvidence::CodexDiff {
+        diff, source_bytes, ..
+    } = evidence
+    else {
+        panic!("expected the supported task diff")
+    };
+    assert!(diff.contains("diff --git a/src/lib.rs b/src/lib.rs"));
+    assert_eq!(source_bytes, diff.len() as i64);
+
+    std::fs::write(
+        &command,
+        "#!/bin/sh\ntest \"$1\" = cloud && test \"$2\" = diff && test \"$3\" = task_fixture\n",
+    )
+    .unwrap();
+    let evidence =
+        acquire_codex_remote_session_with_command("task_fixture", command.as_os_str()).unwrap();
+    assert!(matches!(
+        evidence,
+        RemoteSessionEvidence::CapabilityLimited {
+            code: "PROVIDER_CAPABILITY_LIMITED",
+            ..
+        }
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // codex-cloud
 // ---------------------------------------------------------------------------

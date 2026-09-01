@@ -103,11 +103,12 @@ test('sessions hydrate uses the SDK contract and is idempotent', async () => {
       cli, 'sessions', 'hydrate', 'claude', 'claude-hydrate', '--db', db, '--json', '--no-warning',
     ], { env });
     const hydrated = JSON.parse(first.stdout) as Record<string, unknown>;
-    assert.equal(hydrated.contract_version, 1);
+    assert.equal(hydrated.contract_version, 2);
     assert.equal(hydrated.status, 'hydrated');
+    assert.equal(hydrated.capability, 'full');
     assert.equal(hydrated.discovery_state, 'full');
     assert.deepEqual(hydrated.evidence, {
-      prompts: 1, events: 1, tool_calls: 0, related_sessions: 0,
+      prompts: 1, events: 1, tool_calls: 0, file_edits: 0, related_sessions: 0,
     });
 
     const second = await run(process.execPath, [

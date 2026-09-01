@@ -1011,6 +1011,7 @@ pub struct HydrationEvidence {
     pub prompts: i64,
     pub events: i64,
     pub tool_calls: i64,
+    pub file_edits: i64,
     pub related_sessions: i64,
 }
 
@@ -1029,6 +1030,7 @@ pub struct HydrateSessionResult {
     pub source: String,
     pub session_id: String,
     pub status: String,
+    pub capability: String,
     pub discovery_state: String,
     pub presence: String,
     pub indexed_through: HydrationIndexedThrough,
@@ -1044,6 +1046,10 @@ fn hydration_error(error: anyhow::Error) -> napi::Error {
         "SESSION_SOURCE_UNAVAILABLE",
         "SESSION_SOURCE_MISMATCH",
         "HYDRATION_UNSUPPORTED",
+        "CONNECTOR_NOT_CONFIGURED",
+        "AUTHENTICATION_EXPIRED",
+        "EVIDENCE_PARTIAL",
+        "CONNECTOR_FAILURE",
         "INVALID_ARGUMENT",
     ] {
         if let Some(detail) = message.strip_prefix(&format!("{code}: ")) {
@@ -1075,6 +1081,7 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
         source: result.source,
         session_id: result.session_id,
         status: result.status,
+        capability: result.capability,
         discovery_state: result.discovery_state,
         presence: result.presence,
         indexed_through: HydrationIndexedThrough {
@@ -1085,6 +1092,7 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
             prompts: result.evidence.prompts as i64,
             events: result.evidence.events as i64,
             tool_calls: result.evidence.tool_calls as i64,
+            file_edits: result.evidence.file_edits as i64,
             related_sessions: result.evidence.related_sessions as i64,
         },
         related_session_ids: result.related_session_ids,

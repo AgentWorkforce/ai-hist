@@ -6428,6 +6428,7 @@ fn sync_claude_session_metadata(
                 Some(&path.to_string_lossy()),
             )?;
             ingest_claude_transcript(conn, &path)?;
+            record_claude_remote_relationship(conn, &meta)?;
             upserted += 1;
         }
     }
@@ -6505,6 +6506,7 @@ fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool
 
 struct ClaudeSessionMeta {
     session_id: String,
+    remote_session_id: Option<String>,
     cwd: Option<String>,
     git_branch: Option<String>,
     first_ts: i64,
@@ -6522,6 +6524,7 @@ struct ClaudeSessionMeta {
 fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
     let text = fs::read_to_string(path).unwrap_or_default();
     let mut session_id = None;
+    let mut remote_session_id = None;
     let mut cwd = None;
     let mut git_branch = None;
     let mut first_ts = None;
@@ -6555,6 +6558,15 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
             session_id = value
                 .get("sessionId")
                 .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        if remote_session_id.is_none() {
+            remote_session_id = value
+                .get("remoteSessionId")
+                .or_else(|| value.get("remote_session_id"))
+                .or_else(|| value.pointer("/teleportedSessionInfo/sessionId"))
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
                 .map(str::to_string);
         }
         if cwd.is_none() {
@@ -6595,6 +6607,7 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
     let first = first_ts.unwrap_or(0);
     Ok(Some(ClaudeSessionMeta {
         session_id,
+        remote_session_id,
         cwd,
         git_branch,
         first_ts: first,
@@ -6603,6 +6616,42 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
         subagent: identified_records > 0 && sidechain_records == identified_records,
         agent_id,
     }))
+}
+
+fn record_claude_remote_relationship(conn: &Connection, meta: &ClaudeSessionMeta) -> Result<()> {
+    let Some(remote_id) = meta.remote_session_id.as_deref() else {
+        return Ok(());
+    };
+    if remote_id == meta.session_id {
+        return Ok(());
+    }
+    let remote_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_presences \
+         WHERE source = 'claude' AND session_id = ? AND location = 'remote')",
+        [remote_id],
+        |row| row.get(0),
+    )?;
+    if remote_exists {
+        record_relationship(
+            conn,
+            &ObservedRelationship {
+                source: "claude",
+                parent_session_id: remote_id,
+                child_session_id: Some(&meta.session_id),
+                relationship: "materialized_local",
+                child_agent_type: None,
+                child_agent_name: None,
+                child_model: None,
+                spawn_depth: None,
+                evidence_kind: "claude_remote_session_id",
+                evidence_locator: None,
+                evidence_ref: Some(remote_id),
+                child_has_events: session_events_exist(conn, "claude", &meta.session_id)?,
+                spawned_at_ms: None,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
