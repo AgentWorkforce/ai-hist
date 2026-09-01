@@ -437,21 +437,27 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
 const REQUIRED_SESSION_PRESENCE_COLUMNS: &[&str] =
     &["raw_locator", "source_stamp", "discovery_state"];
 
-/// Indexes the session catalog's fast paths depend on.
+/// Every index a fast path depends on, across all of them.
 ///
 /// The pre-existing guard checks tables and columns only. These are listed
-/// because each one carries a promise the catalog makes: the two recency
-/// indexes make a listing an indexed, sort-free read, and `idx_sessions_raw_path`
+/// because each one carries a promise some read makes: the two recency indexes
+/// make a catalog listing an indexed, sort-free read, `idx_sessions_raw_path`
 /// makes discovery's "has this transcript changed?" lookup a search rather than
-/// a scan of every session on every candidate. A database that somehow has the
+/// a scan of every session on every candidate, and the event and evidence page
+/// indexes carry their pagination's ordering. A database that somehow has the
 /// columns but not an index would otherwise be served with silently degraded
 /// plans. Missing means "not current", which routes the caller through the
 /// writable open that recreates them.
 ///
+/// This is the *writable* bar: [`init_db`]'s lock-free fast path skips the
+/// migration only when every one is present. Read paths are each gated on
+/// their own scoped subset below, so a database missing one index keeps its
+/// read-only handle for every read that does not need it.
+///
 /// The older `idx_sessions_cwd` / `idx_sessions_branch` / `idx_sessions_last` /
 /// `idx_sessions_source_last` are deliberately absent: nothing in the catalog
 /// path depends on them any more.
-const REQUIRED_SESSIONS_INDEXES: &[&str] = &[
+const REQUIRED_INDEXES: &[&str] = &[
     "idx_sessions_recency",
     "idx_sessions_source_recency",
     "idx_sessions_raw_path",
@@ -511,7 +517,7 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &["session_presences_local_backfill_
 /// first search instead of a silent migration. Callers fall back to a writable
 /// open (which migrates) when this returns false.
 pub fn schema_is_current(conn: &Connection) -> Result<bool> {
-    schema_has_required_indexes(conn, REQUIRED_SESSIONS_INDEXES)
+    schema_has_required_indexes(conn, REQUIRED_INDEXES)
 }
 
 /// Whether read-only APIs can safely and efficiently query this database.
@@ -1596,11 +1602,20 @@ fn row_to_file_edit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionFileEdit
 }
 
 /// One page's SQL and bound parameters, in the canonical
-/// `ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC` order.
+/// `ts_ms IS NULL, ts_ms ASC, id ASC` order.
 ///
 /// A dated cursor must still admit the whole undated tail, and an undated one
 /// must never walk back into the dated head, so the two continuation cases are
 /// different predicates rather than one comparison over a coalesced timestamp.
+///
+/// The undated continuation is also a different *shape*. Its rows are exactly
+/// the ones the page index stores under `(ts_ms IS NULL) = 1`, so it names that
+/// indexed expression itself -- SQLite does not infer it from the bare
+/// `ts_ms IS NULL` term -- and, since the first two order keys are then
+/// constant, orders on `id` alone. Written the obvious way instead, SQLite
+/// cannot reach `id` in the index and re-sorts the whole remaining tail in a
+/// temp b-tree on every page. Both spellings return the same rows in the same
+/// order.
 ///
 /// Both page readers and the query-plan test build their SQL here, so a plan
 /// assertion cannot pass against a restated copy while the real query drifts.
@@ -1621,14 +1636,18 @@ fn evidence_page_query(
             params.push(ts_ms.into());
             params.push(ts_ms.into());
             params.push(id.into());
+            sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
         }
         Some((None, id)) => {
-            sql.push_str(" AND (ts_ms IS NULL AND id > ?)");
+            sql.push_str(" AND ((ts_ms IS NULL) = 1 AND ts_ms IS NULL AND id > ?)");
             params.push(id.into());
+            sql.push_str(" ORDER BY id ASC");
         }
-        None => {}
+        None => {
+            sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
+        }
     }
-    sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC LIMIT ?");
+    sql.push_str(" LIMIT ?");
     params.push((limit + 1).into());
     (sql, params)
 }
@@ -3032,9 +3051,15 @@ mod tests {
             .unwrap();
         assert!(!schema_is_evidence_read_current(&conn).unwrap());
         assert!(!schema_is_current(&conn).unwrap());
-        // Unrelated read paths keep working while that migration is pending.
+        // Every unrelated read path keeps its read-only handle while that
+        // migration is pending: each is gated on its own scoped guard, so
+        // only the evidence pages and the next writable open see the gap.
         assert!(schema_is_event_read_current(&conn).unwrap());
+        assert!(schema_is_catalog_read_current(&conn).unwrap());
+        assert!(schema_is_read_current(&conn).unwrap());
 
+        // One writable open migrates it, exactly as the session-events page
+        // indexes did when they joined the required list.
         init_db(&conn).unwrap();
         assert!(schema_is_evidence_read_current(&conn).unwrap());
         assert!(schema_is_current(&conn).unwrap());
@@ -3084,62 +3109,66 @@ mod tests {
         }
     }
 
-    /// The evidence page promises an indexed, sort-free read. The plan is
-    /// taken from the same builder the readers run, so it cannot pass against
-    /// a restated copy of the query.
+    /// The evidence page promises an indexed, sort-free read on all three
+    /// query shapes: the first page, a dated continuation, and a continuation
+    /// already inside the undated tail. The last one is the shape that walks
+    /// the longest, so a temp b-tree there would re-sort the remaining tail on
+    /// every page. The plan is taken from the same builder the readers run, so
+    /// it cannot pass against a restated copy of the query.
+    ///
+    /// Each shape is checked with and without `sqlite_stat1`: the repository
+    /// never runs `ANALYZE`, but a user's database may carry stats, and the
+    /// planner picks differently once it has them.
     #[test]
     fn evidence_pages_are_served_by_an_index_without_sorting() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        seed_evidence(&conn);
+        for analyze in [false, true] {
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            seed_evidence(&conn);
+            if analyze {
+                conn.execute_batch("ANALYZE").unwrap();
+            }
 
-        let plan = |table: &str, columns: &str, after: Option<&SessionEvidenceCursor>| -> String {
-            let (sql, params) = evidence_page_query(columns, table, "claude", "s1", 10, after);
-            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            stmt.query_map(rusqlite::params_from_iter(params), |row| {
-                row.get::<_, String>(3)
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap()
-            .join(" | ")
-        };
+            let plan = |table: &str, columns: &str, after: Option<&SessionEvidenceCursor>| {
+                let (sql, params) = evidence_page_query(columns, table, "claude", "s1", 10, after);
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                stmt.query_map(rusqlite::params_from_iter(params), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join(" | ")
+            };
 
-        for (table, columns, index) in [
-            ("tool_calls", TOOL_CALL_COLUMNS, "idx_tool_calls_page_v2"),
-            ("file_edits", FILE_EDIT_COLUMNS, "idx_file_edits_page_v2"),
-        ] {
-            let first = plan(table, columns, None);
-            assert!(
-                first.contains(index) && !first.contains("TEMP B-TREE"),
-                "the first {table} page must be index-ordered: {first}"
-            );
-            // The dated continuation is the plan that runs on every page after
-            // the first; its extra predicate must not cost the ordering.
-            let dated = plan(
-                table,
-                columns,
-                Some(&SessionEvidenceCursor {
-                    ts_ms: Some(100),
-                    id: 1,
-                }),
-            );
-            assert!(
-                dated.contains(index) && !dated.contains("TEMP B-TREE"),
-                "a dated {table} continuation must stay index-ordered: {dated}"
-            );
-            // A cursor already inside the undated tail pins `ts_ms IS NULL`,
-            // so SQLite orders that one narrow slice by id itself; the lookup
-            // is still a search on the same index rather than a table scan.
-            let undated = plan(
-                table,
-                columns,
-                Some(&SessionEvidenceCursor { ts_ms: None, id: 1 }),
-            );
-            assert!(
-                undated.contains(index) && !undated.contains("SCAN"),
-                "an undated {table} continuation must still be a search: {undated}"
-            );
+            for (table, columns, index) in [
+                ("tool_calls", TOOL_CALL_COLUMNS, "idx_tool_calls_page_v2"),
+                ("file_edits", FILE_EDIT_COLUMNS, "idx_file_edits_page_v2"),
+            ] {
+                for (shape, after) in [
+                    ("the first page", None),
+                    (
+                        "a dated continuation",
+                        Some(SessionEvidenceCursor {
+                            ts_ms: Some(100),
+                            id: 1,
+                        }),
+                    ),
+                    (
+                        "an undated continuation",
+                        Some(SessionEvidenceCursor { ts_ms: None, id: 1 }),
+                    ),
+                ] {
+                    let plan = plan(table, columns, after.as_ref());
+                    assert!(
+                        plan.contains(index)
+                            && !plan.contains("TEMP B-TREE")
+                            && !plan.contains("SCAN"),
+                        "{shape} of {table} must be an index-ordered search \
+                         (analyze={analyze}): {plan}"
+                    );
+                }
+            }
         }
     }
 
@@ -3417,11 +3446,11 @@ mod tests {
             "idx_sessions_raw_path",
         ] {
             assert!(
-                REQUIRED_SESSIONS_INDEXES.contains(&needed),
+                REQUIRED_INDEXES.contains(&needed),
                 "{needed} is load-bearing and must stay in the guard"
             );
         }
-        for index in REQUIRED_SESSIONS_INDEXES {
+        for index in REQUIRED_INDEXES {
             conn.execute_batch(&format!("DROP INDEX {index}")).unwrap();
             assert!(
                 !schema_is_current(&conn).unwrap(),
