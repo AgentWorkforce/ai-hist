@@ -23,6 +23,11 @@ Use these public operations:
   the SDK-only `getSessionChildrenPage()`, `sessionDescendants()`, and
   `sessionEventsIncludingDescendants()` for walking large trees. Every event
   keeps the session id of the session that produced it.
+- `getSessionToolCallsPage()` / MCP `get_session_tool_calls` and
+  `getSessionFileEditsPage()` / MCP `get_session_file_edits` for bounded,
+  structured reads of one hydrated session's recorded tool calls and file
+  edits. Both name a session by `source` **and** `sessionId`; provider session
+  ids collide, and these pages never merge two providers' records.
 - `sync()` / MCP `sync` for explicit full local ingestion.
 
 Pass `scope` to collection operations when the default local view is not
@@ -45,8 +50,9 @@ reports which connector locations executed; use session `locations` for
 observed presences.
 
 The CLI equivalents are `sessions list`, `sessions discover`,
-`sessions hydrate`, `sessions relationships`, `sessions tree`, `search`,
-`recent`, `session`, `events`, `stats`, and `sync`. See
+`sessions hydrate`, `sessions relationships`, `sessions tree`,
+`sessions tools`, `sessions edits`, `search`, `recent`,
+`session`, `events`, `stats`, and `sync`. See
 [Session catalog](session-catalog.md) for discovery and pagination contracts
 and [Architecture](architecture.md) for the process boundary.
 

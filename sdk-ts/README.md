@@ -16,6 +16,10 @@ import {
   getSession,
   getSessionEventsPage,
   sessionEvents,
+  getSessionToolCallsPage,
+  sessionToolCalls,
+  getSessionFileEditsPage,
+  sessionFileEdits,
   search,
   recent,
   stats,
@@ -30,6 +34,10 @@ if (first) {
   const prompts = await getSession(first.sessionId);
   const events = await getSessionEventsPage(first.sessionId, { limit: 200 });
   for await (const event of sessionEvents(first.sessionId)) consume(event);
+  const tools = await getSessionToolCallsPage(first.source, first.sessionId, { limit: 200 });
+  const edits = await getSessionFileEditsPage(first.source, first.sessionId, { limit: 200 });
+  for await (const call of sessionToolCalls(first.source, first.sessionId)) consume(call);
+  for await (const edit of sessionFileEdits(first.source, first.sessionId)) consume(edit);
 }
 ```
 
@@ -67,6 +75,24 @@ local behavior for rows written before provenance tracking.
 The event primitive is page-based and uses `{ tsMs, id }` as a deterministic
 cursor. The `sessionEvents` async iterator walks pages without accumulating a
 large transcript. `getSessionEvents` is an explicit collecting convenience.
+
+Tool calls and file edits follow the same page / iterator / collect trio
+(`getSessionToolCallsPage`, `sessionToolCalls`, `getSessionToolCalls`, and the
+`...FileEdit...` equivalents), and take both a source and a session ID because
+provider session IDs are not unique across providers. The source is half of
+that identity, so one outside the `Source` set raises `InvalidArgumentError`
+instead of reading as an empty session. Their cursor is
+`{ tsMs: number | null, id: number }`: a record may be indexed without a
+timestamp, and undated records are ordered last. Feeding a cursor back in
+accepts either spelling of that tail — `tsMs: null` as emitted, or no `tsMs` at
+all after a transport that drops nulls — so a printed or JSON-serialized cursor
+returns unedited. Stored provider JSON is parsed
+into `args` and `structuredPatch`; a value that is absent or unparseable
+becomes `null` while the raw string stays available as `argsJson` and
+`structuredPatchJson`, so an unreadable payload never fails a page.
+`parseStoredJson(raw)` is that same parse, exported for callers that hold a raw
+stored string of their own: it returns the parsed value, or `null` for anything
+that is not a parseable string.
 
 ## Delegation topology
 

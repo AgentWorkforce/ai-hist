@@ -6,8 +6,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import {
-  discoverSessions, getSession, getSessionEventsPage, getSessionRelationships, getSessionTree,
-  hydrateSession, listSessionCatalogPage, recent, search, stats, sync,
+  discoverSessions, getSession, getSessionEventsPage, getSessionFileEditsPage,
+  getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
+  listSessionCatalogPage, recent, search, stats, sync,
 } from './index.js';
 
 const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
@@ -102,7 +103,25 @@ server.tool('get_session_tree',
   source, sessionId: session_id, maxDepth: max_depth, maxNodes: max_nodes,
 })));
 
-server.tool('history_stats','Statistics for already-indexed RelayHistory data.', {
+// Tool calls and file edits are keyed by (source, session_id): a session id
+// alone can name two sessions from two providers. A cursor's `tsMs` may be
+// null or absent -- both mean "already inside the undated tail" -- and reaches
+// the SDK exactly as the client sent it.
+const EVIDENCE_CURSOR = z.object({ tsMs: z.number().int().nullable().optional(), id: z.number().int() });
+
+server.tool('get_session_tool_calls', 'Get one bounded page of recorded tool calls for one session.', {
+  source: SOURCE, session_id: z.string().min(1),
+  limit: z.number().int().min(1).max(1000).optional().default(200),
+  after: EVIDENCE_CURSOR.optional(),
+}, READ, ({ source, session_id, limit, after }) => call(() => getSessionToolCallsPage(source, session_id, { limit, after })));
+
+server.tool('get_session_file_edits', 'Get one bounded page of recorded file edits for one session.', {
+  source: SOURCE, session_id: z.string().min(1),
+  limit: z.number().int().min(1).max(1000).optional().default(200),
+  after: EVIDENCE_CURSOR.optional(),
+}, READ, ({ source, session_id, limit, after }) => call(() => getSessionFileEditsPage(source, session_id, { limit, after })));
+
+server.tool('history_stats', 'Statistics for already-indexed RelayHistory data.', {
   scope: SESSION_SCOPE.optional().default('local'),
   tag: z.string().optional(),
 }, READ, ({ scope, tag }) => call(() => stats({ scope, tag })));

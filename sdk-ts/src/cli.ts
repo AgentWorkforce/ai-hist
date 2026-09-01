@@ -3,9 +3,11 @@
 import { readFile } from 'node:fs/promises';
 
 import {
-  discoverSessions, getSession, getSessionEventsPage, getSessionRelationships, getSessionTree,
-  hydrateSession, listSessionCatalogPage, recent, search, stats, sync,
-  type CatalogCursor, type SessionRelationship, type SessionScope,
+  discoverSessions, getSession, getSessionEventsPage, getSessionFileEditsPage,
+  getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
+  listSessionCatalogPage, recent, search, stats, sync,
+  type CatalogCursor, type EvidenceCursor, type SessionFileEditsPage, type SessionRelationship,
+  type SessionScope, type SessionToolCallsPage,
 } from './index.js';
 
 type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
@@ -152,10 +154,15 @@ function snakeCase(key: string): string {
   return key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
 }
 
+// Parsed provider payloads are data, not RelayHistory field names: their own
+// keys must reach stdout exactly as the provider wrote them.
+const OPAQUE_JSON_KEYS = new Set(['args', 'structuredPatch']);
+
 function wireValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(wireValue);
   if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value).map(([key, item]) => [snakeCase(key), wireValue(item)]));
+  return Object.fromEntries(Object.entries(value)
+    .map(([key, item]) => [snakeCase(key), OPAQUE_JSON_KEYS.has(key) ? item : wireValue(item)]));
 }
 
 function humanLine(value: unknown): string {
@@ -193,6 +200,8 @@ function usage(message?: string): never {
   ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--no-related] [--db PATH] [--json]
   ai-hist sessions relationships SOURCE SESSION_ID [--db PATH] [--json]
   ai-hist sessions tree SOURCE SESSION_ID [--max-depth N] [--max-nodes N] [--db PATH] [--json]
+  ai-hist sessions tools SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
+  ai-hist sessions edits SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
   ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--limit N] [--json]
   ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--json]
   ai-hist session SESSION_ID [--source SOURCE] [--json]
@@ -218,6 +227,26 @@ function catalogCursorFlag(args: Parsed): CatalogCursor | undefined {
   return { lastActivityMs: numberFlag(args, 'after-ms') ?? null, source, sessionId };
 }
 
+// Human output prints the SDK cursor and --json prints its snake_case wire
+// form, so --after accepts either spelling and a printed cursor can be fed
+// back unedited.
+function evidenceCursorFlag(args: Parsed): EvidenceCursor | undefined {
+  const raw = cursorFlag<{ tsMs?: unknown; ts_ms?: unknown; id?: unknown }>(args);
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || !Number.isInteger(raw.id)) {
+    throw new Error('--after must be a JSON cursor with an integer id');
+  }
+  // An undated cursor spells its timestamp `null` or leaves it out. Any other
+  // non-integer timestamp is a malformed cursor: reading it as null instead
+  // would place the page inside the undated tail and silently drop every dated
+  // record after it.
+  const tsMs = raw.tsMs ?? raw.ts_ms ?? null;
+  if (tsMs !== null && !Number.isInteger(tsMs)) {
+    throw new Error('--after cursor ts_ms must be an integer or null');
+  }
+  return { tsMs: tsMs as number | null, id: raw.id as number };
+}
+
 function outputDiscovery(value: Awaited<ReturnType<typeof discoverSessions>>, json: boolean): void {
   if (!json) {
     for (const session of value.sessions) process.stdout.write(`${humanLine(session)}\n`);
@@ -233,6 +262,49 @@ function outputDiscovery(value: Awaited<ReturnType<typeof discoverSessions>>, js
   const { sessions: _sessions, diagnostics: _diagnostics, ...summary } = value;
   const providers = Object.fromEntries(summary.providers.map(({ source, ...provider }) => [source, provider]));
   output({ type: 'summary', ...summary, providers }, true);
+}
+
+function continuationNotice(cursor: EvidenceCursor | null): void {
+  if (cursor) process.stdout.write(`more available: --after '${JSON.stringify(cursor)}'\n`);
+}
+
+// Human rows are positional, so every column is always printed: an absent
+// value is `-` rather than a dropped field that would shift the columns after
+// it, and an uncounted line delta is `?` rather than a fabricated 0.
+function outputToolCalls(page: SessionToolCallsPage, json: boolean): void {
+  if (json) {
+    output(page, true);
+    return;
+  }
+  if (page.toolCalls.length === 0) {
+    process.stdout.write('No tool calls.\n');
+    return;
+  }
+  for (const call of page.toolCalls) {
+    process.stdout.write([
+      call.tsMs ?? '-', call.source, call.toolUseId, call.name,
+      call.target ?? '-', call.isError === true ? '(error)' : '-',
+    ].join('  ').concat('\n'));
+  }
+  continuationNotice(page.nextCursor);
+}
+
+function outputFileEdits(page: SessionFileEditsPage, json: boolean): void {
+  if (json) {
+    output(page, true);
+    return;
+  }
+  if (page.fileEdits.length === 0) {
+    process.stdout.write('No file edits.\n');
+    return;
+  }
+  for (const edit of page.fileEdits) {
+    process.stdout.write([
+      edit.tsMs ?? '-', edit.source, edit.toolUseId, edit.toolName ?? '-', edit.filePath,
+      `+${edit.linesAdded ?? '?'}/-${edit.linesRemoved ?? '?'}`,
+    ].join('  ').concat('\n'));
+  }
+  continuationNotice(page.nextCursor);
 }
 
 function outputHydration(value: Awaited<ReturnType<typeof hydrateSession>>, json: boolean): void {
@@ -376,6 +448,24 @@ async function main(): Promise<void> {
       source: source as never, sessionId, dbPath: textFlag(args, 'db'),
       maxDepth: numberFlag(args, 'max-depth'), maxNodes: numberFlag(args, 'max-nodes'),
     }), json);
+    return;
+  }
+  if (command === 'sessions' && (subcommand === 'tools' || subcommand === 'edits')) {
+    const name = `sessions ${subcommand}`;
+    validateFlags(args, name, ['after', 'db', 'json', 'limit']);
+    const [source, sessionId, ...surplus] = rest;
+    if (!source || !sessionId) usage(`${name} requires SOURCE and SESSION_ID`);
+    rejectSurplusPositionals(surplus, name);
+    const options = {
+      dbPath: textFlag(args, 'db'),
+      limit: numberFlag(args, 'limit'),
+      after: evidenceCursorFlag(args),
+    };
+    if (subcommand === 'tools') {
+      outputToolCalls(await getSessionToolCallsPage(source as never, sessionId, options), json);
+    } else {
+      outputFileEdits(await getSessionFileEditsPage(source as never, sessionId, options), json);
+    }
     return;
   }
   if (command === 'search') {

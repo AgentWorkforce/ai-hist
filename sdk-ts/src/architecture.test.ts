@@ -76,3 +76,17 @@ test('native topology enums are validated rather than cast', async () => {
   assert.match(body, /identityStatus: identityStatus\(value\.identityStatus\)/);
   assert.doesNotMatch(body, /as CatalogSource|as RelationshipType|as IdentityStatus/);
 });
+
+test('MCP evidence tools require both halves of a session identity', async () => {
+  const mcp = await readFile(join(sourceDir, 'mcp-server.ts'), 'utf8');
+  for (const tool of ['get_session_tool_calls', 'get_session_file_edits']) {
+    const start = mcp.indexOf(`server.tool('${tool}'`);
+    assert.notEqual(start, -1, `${tool} is registered`);
+    const end = mcp.indexOf("server.tool('", start + 13);
+    const registration = mcp.slice(start, end === -1 ? undefined : end);
+    assert.match(registration, /source: SOURCE,/, `${tool} requires a source`);
+    assert.match(registration, /session_id: z\.string\(\)\.min\(1\)/, `${tool} requires a session id`);
+    assert.match(registration, /after: EVIDENCE_CURSOR\.optional\(\)/, `${tool} paginates`);
+    assert.match(registration, /READ/, `${tool} is a cache-only read`);
+  }
+});
