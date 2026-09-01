@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- Advance the native-addon contract to 5 and the session-catalog contract to
+  3. Discovery counters add `providerQueries` and `recordsInspected`; OpenCode
+  no longer reports its database file size as `bytesRead`.
 - Replace the synchronous `openAiHist()`/`AiHist` snapshot API with top-level
   async native-backed functions.
 - Remove `sql.js`, JSONL/trajectory fallback scanners, CLI subprocess bridges,
@@ -20,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Surface bounded OpenCode query and record counters through the typed SDK,
+  CLI JSON, and MCP discovery result.
 - Support remote acquisition through the engine's provider connectors:
   `discoverSessions`/`sync` with `scope: 'remote'` (and the remote half of
   `'all'`) run the claude.ai/code and Codex cloud connectors when the provider

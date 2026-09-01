@@ -6,6 +6,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Breaking
 
+- Add truthful OpenCode SQL work counters to discovery summaries. The catalog
+  contract is now 3 and the native-addon contract is now 5; `bytes_read` no
+  longer substitutes the OpenCode database file size, and summaries add
+  `provider_queries` plus `records_inspected`.
 - Retire standalone Rust CLI release assets and the curl/source installer.
   npm now distributes the public TypeScript SDK, Node CLI, MCP server, and
   mandatory Node-API engine.
@@ -104,18 +108,22 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Changed
 
+- Replace OpenCode shallow discovery's full-database SQLite backup with a
+  coherent transaction on the live read-only database. A limited request
+  fetches at most that many candidate sessions and uses only provider-supplied
+  session/message/part indexes for selected-session metadata. Missing optional
+  schema elements or indexes now omit affected shallow fields instead of
+  scanning or mutating provider tables. WAL appends, busy stores, malformed and
+  partial rows, database replacement, and query-plan/scaling regressions have
+  dedicated coverage.
 - Recognize current Codex Desktop `response_item/message` user turns in both
   bounded session discovery and full ingestion. Existing Codex rollout indexes
   are repaired automatically, while adjacent legacy/current mirror records are
   collapsed without removing intentionally repeated prompts.
 - Replace Python-based installer and end-to-end verification with shell,
   SQLite, Node.js, and the public Rust CLI interfaces.
-- The opencode adapter holds its snapshot open on one connection for the whole
-  run and indexes the private copy by `session_id` when the live store isn't,
-  so the per-session excerpt and model queries seek instead of scanning
-  `message` and `part` once per candidate. Cold shallow discovery of 1,000
-  opencode sessions into a fresh database runs in ~43 ms in the native
-  benchmark (was ~290 ms).
+- The earlier OpenCode private-snapshot optimization reduced repeated scans,
+  but has now been superseded by the bounded live read-only path above.
 - Shallow discovery's per-candidate catalog statements (candidate
   classification, skip markers, the discovery upsert) execute through the
   prepared-statement cache, and the upsert hands back the merged catalog row

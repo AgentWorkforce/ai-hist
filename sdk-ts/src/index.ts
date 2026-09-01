@@ -9,8 +9,8 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const NATIVE_CONTRACT_VERSION = 4;
-export const SESSION_CATALOG_CONTRACT_VERSION = 2;
+export const NATIVE_CONTRACT_VERSION = 5;
+export const SESSION_CATALOG_CONTRACT_VERSION = 3;
 export const SESSION_HYDRATION_CONTRACT_VERSION = 1;
 
 export type Source = 'claude' | 'codex' | 'cursor' | 'grok' | 'relay' | 'trajectory' | 'opencode';
@@ -132,6 +132,8 @@ export interface DiscoveryCounters {
   skippedUnchanged: number;
   filesOpened: number;
   bytesRead: number;
+  providerQueries: number;
+  recordsInspected: number;
 }
 
 export interface SourceExemption { source: string; reason: string }

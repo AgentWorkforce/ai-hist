@@ -49,7 +49,7 @@ test('sessions discover preserves repeated sources and emits JSONL', async () =>
     assert.deepEqual(sessions.map((line) => line.source).sort(), ['claude', 'codex']);
     assert.ok(sessions.every((line) => JSON.stringify(line.locations) === '["local"]'));
     assert.equal(lines.at(-1)?.type, 'summary');
-    assert.equal(lines.at(-1)?.contract_version, 2);
+    assert.equal(lines.at(-1)?.contract_version, 3);
     assert.equal(lines.at(-1)?.scope, 'local');
     assert.equal('sessions' in (lines.at(-1) ?? {}), false);
 
@@ -78,7 +78,7 @@ test('sessions list keeps human and JSON output contracts distinct', async () =>
     const human = await run(process.execPath, [cli, 'sessions', 'list', '--db', db, '--no-warning']);
     assert.match(human.stdout, /No sessions in the catalog/);
     const json = await run(process.execPath, [cli, 'sessions', 'list', '--db', db, '--json', '--no-warning']);
-    assert.deepEqual(JSON.parse(json.stdout), { contract_version: 2, scope: 'local', sessions: [], next_cursor: null });
+    assert.deepEqual(JSON.parse(json.stdout), { contract_version: 3, scope: 'local', sessions: [], next_cursor: null });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

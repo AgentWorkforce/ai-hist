@@ -214,7 +214,7 @@ fn claude_enumeration_pages_until_the_cursor_ends() {
     let provider = claude_provider(home.path(), &transport, None);
     let conn = catalog();
     let env = env_at(&conn, home.path());
-    let candidates = provider.enumerate(&env).unwrap();
+    let candidates = provider.enumerate(&env, None).unwrap();
     assert_eq!(candidates.len(), 2);
     let calls = transport.calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
@@ -239,7 +239,7 @@ fn claude_enumeration_respects_the_row_limit() {
     let provider = claude_provider(home.path(), &transport, Some(2));
     let conn = catalog();
     let env = env_at(&conn, home.path());
-    let candidates = provider.enumerate(&env).unwrap();
+    let candidates = provider.enumerate(&env, None).unwrap();
     // The limit is satisfied by the first page, so the cursor is not followed.
     assert_eq!(candidates.len(), 2);
     let calls = transport.calls.lock().unwrap();
@@ -254,7 +254,7 @@ fn claude_enumeration_reports_a_rejected_token() {
     let provider = claude_provider(home.path(), &transport, None);
     let conn = catalog();
     let env = env_at(&conn, home.path());
-    let error = provider.enumerate(&env).unwrap_err().to_string();
+    let error = provider.enumerate(&env, None).unwrap_err().to_string();
     assert!(error.contains("rejected the stored OAuth token"), "{error}");
 }
 
@@ -270,7 +270,7 @@ fn claude_enumeration_reports_an_expired_token_without_a_request() {
     );
     let conn = catalog();
     let env = env_at(&conn, home.path());
-    let error = provider.enumerate(&env).unwrap_err().to_string();
+    let error = provider.enumerate(&env, None).unwrap_err().to_string();
     assert!(error.contains("expired"), "{error}");
     assert!(
         transport.calls.lock().unwrap().is_empty(),
@@ -406,7 +406,7 @@ fn codex_provider_forwards_a_bounded_page_limit_to_the_cli() {
     let home = tempfile::tempdir().unwrap();
     let conn = catalog();
     let env = env_at(&conn, home.path());
-    let candidates = provider.enumerate(&env).unwrap();
+    let candidates = provider.enumerate(&env, None).unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(*lister.calls.lock().unwrap(), vec![(7, None)]);
 
@@ -415,7 +415,7 @@ fn codex_provider_forwards_a_bounded_page_limit_to_the_cli() {
     let lister = Arc::new(ScriptedLister::new(vec![CODEX_LISTING.to_string()]));
     let provider = CodexCloudProvider::new(Box::new(Arc::clone(&lister)), Some(500));
     let env = env_at(&conn, home.path());
-    provider.enumerate(&env).unwrap();
+    provider.enumerate(&env, None).unwrap();
     assert_eq!(*lister.calls.lock().unwrap(), vec![(20, None)]);
 }
 
@@ -431,7 +431,7 @@ fn codex_provider_follows_the_cursor_across_pages() {
     let home = tempfile::tempdir().unwrap();
     let conn = catalog();
     let env = env_at(&conn, home.path());
-    let candidates = provider.enumerate(&env).unwrap();
+    let candidates = provider.enumerate(&env, None).unwrap();
     assert_eq!(candidates.len(), 2);
     assert_eq!(
         *lister.calls.lock().unwrap(),
@@ -445,7 +445,7 @@ fn codex_provider_follows_the_cursor_across_pages() {
     ]));
     let provider = CodexCloudProvider::new(Box::new(Arc::clone(&lister)), Some(1));
     let env = env_at(&conn, home.path());
-    let candidates = provider.enumerate(&env).unwrap();
+    let candidates = provider.enumerate(&env, None).unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(*lister.calls.lock().unwrap(), vec![(1, None)]);
 }
@@ -583,7 +583,11 @@ impl ShallowSessionProvider for FakeLocalProvider {
         "codex"
     }
 
-    fn enumerate(&self, _env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+    fn enumerate(
+        &self,
+        _env: &DiscoveryEnv<'_>,
+        _requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
         Ok(vec![Candidate {
             source: "codex",
             locator: self.session.raw_path.clone().unwrap_or_default(),

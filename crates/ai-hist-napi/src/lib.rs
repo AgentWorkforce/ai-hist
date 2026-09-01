@@ -17,7 +17,7 @@ use ai_hist_core::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 4;
+pub const NATIVE_CONTRACT_VERSION: u32 = 5;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -649,6 +649,8 @@ pub struct DiscoveryCounters {
     pub skipped_unchanged: i64,
     pub files_opened: i64,
     pub bytes_read: i64,
+    pub provider_queries: i64,
+    pub records_inspected: i64,
 }
 
 #[napi(object)]
@@ -736,6 +738,8 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
             skipped_unchanged: summary.counters.skipped_unchanged as i64,
             files_opened: summary.counters.files_opened as i64,
             bytes_read: summary.counters.bytes_read as i64,
+            provider_queries: summary.counters.provider_queries as i64,
+            records_inspected: summary.counters.records_inspected as i64,
         },
     })
 }
