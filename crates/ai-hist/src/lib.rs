@@ -737,9 +737,10 @@ enum SessionsAction {
     /// Enumerates every provider, orders candidates globally by recency, reads
     /// only what the catalog needs, and upserts rows as it goes. Sources whose
     /// bytes have not changed since the last run are served from the catalog.
-    /// The summary `scope` echoes the request; it is not a list of connector
-    /// locations that ran. Remote connectors are not configured yet, so
-    /// `--remote` is unsupported and `--all` currently runs local adapters.
+    /// The summary `scope` echoes the request; `locations_run` reports the
+    /// connector locations that executed. `--remote` requires at least one
+    /// configured remote connector (see docs/remote-connectors.md); `--all`
+    /// runs local adapters plus every configured connector.
     Discover {
         #[command(flatten)]
         scope: SessionScopeArgs,

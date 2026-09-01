@@ -60,11 +60,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   filter one cached session ledger; `all`
   deduplicates sessions that have both local and remote presences. Direct
   session/event lookup remains scope-independent. Remote discovery and sync
-  are reserved and report unsupported until provider connectors ship; `all`
-  acquisition runs all configured adapters, which currently means local.
-  Discovery summary `scope` is the requested acquisition scope, while each
-  history/catalog row's `locations` contains observed presences; it is not a claim that a
-  connector ran at every requested location.
+  run through the provider connectors introduced above and fail explicitly on
+  a machine where none is configured; `all` acquisition runs local adapters
+  plus every configured connector. Discovery summary `scope` is the requested
+  acquisition scope and `locations_run` names the connector locations that
+  executed, while each history/catalog row's `locations` contains observed
+  presences.
 - Add native search, recent, session, paged events, statistics, discovery,
   catalog listing, and explicit sync operations. The native-addon contract is
   now version 4.

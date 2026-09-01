@@ -262,7 +262,13 @@ struct UreqClaudeTransport;
 
 impl ClaudeSessionsTransport for UreqClaudeTransport {
     fn get(&self, url: &str, bearer_token: &str) -> Result<ClaudeHttpResponse> {
-        let request = ureq::get(url)
+        // Redirects are never followed: ureq would re-send the Authorization
+        // header to the redirect target, so a redirecting endpoint could move
+        // the stored OAuth token to a host the https-or-loopback guard never
+        // saw. A 3xx therefore surfaces as a failed listing, not a hop.
+        let agent = ureq::AgentBuilder::new().redirects(0).build();
+        let request = agent
+            .get(url)
             .timeout(std::time::Duration::from_secs(30))
             .set("Authorization", &format!("Bearer {bearer_token}"))
             .set("Content-Type", "application/json")

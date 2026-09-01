@@ -30,7 +30,9 @@ Remote discovery and remote sync run through provider connectors
 (claude.ai/code web sessions and Codex cloud tasks — see
 [Remote connectors](remote-connectors.md)); with no connector configured on
 the machine they fail explicitly, and integrations must surface that error
-rather than retrying locally. `all` runs local adapters plus every configured
+rather than retrying locally. Local sync performs full ingestion; remote sync
+refreshes shallow connector rows and `remote` presences, because the remote
+listings carry no transcripts. `all` runs local adapters plus every configured
 connector. Acquisition result `scope` echoes the request and `locationsRun`
 reports which connector locations executed; use session `locations` for
 observed presences.

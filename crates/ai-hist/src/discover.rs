@@ -1962,9 +1962,11 @@ pub struct DiscoverySummary {
     pub contract_version: u32,
     /// Scope selected for this discovery run.
     pub scope: SessionScope,
-    /// Connector locations that actually executed (`"local"`, `"remote"`).
-    /// The requested `scope` records the ask; this records what ran — an
-    /// `all` request executes remote connectors only where one is configured.
+    /// Connector locations that executed (`"local"`, `"remote"`). The
+    /// requested `scope` records the ask; this records what ran — an `all`
+    /// request executes remote connectors only where one is configured. A
+    /// location whose adapters all failed still executed; the failures are in
+    /// `diagnostics`, and per-provider `failed` flags say which.
     pub locations_run: Vec<String>,
     /// Rows freshly read and upserted.
     pub discovered: usize,

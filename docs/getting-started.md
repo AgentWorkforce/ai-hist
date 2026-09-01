@@ -22,7 +22,9 @@ These are intentionally different:
 - `sessions list` is cache-only and never reads provider files.
 - `sessions discover` performs bounded shallow reads and refreshes catalog
   metadata.
-- `sync` performs full ingestion for search and event history.
+- `sync` performs full ingestion for search and event history from local
+  provider files; at remote scope it refreshes shallow connector rows and
+  `remote` presences instead (remote listings carry no transcripts).
 
 They use one session ledger. Local and remote describe where a session was
 observed (its presence), not separate kinds of session or separate databases.

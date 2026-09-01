@@ -47,7 +47,9 @@ CLI once refreshes it.
 `codex-cloud` pages through the CLI's listing window: `codex cloud list`
 accepts `--limit` values of 1–20, so the connector requests bounded pages and
 follows the returned `cursor` until the listing (or a requested row cap) is
-exhausted.
+exhausted. Both connectors bound one enumeration to 100 pages (10,000 claude
+sessions, 2,000 codex tasks) — bounded work is part of the discovery
+contract; a later run continues from fresher listings.
 
 ## What remote rows carry
 
