@@ -22,8 +22,31 @@ Notable changes to the native `ai-hist` CLI are documented here.
   prints a local command; JSON reports it as unavailable and readable mode
   exits with an explanation.
 
+- The native-addon contract advances to 5, and Claude subagent transcripts
+  whose records carry an `agentId` are now indexed under that child id instead
+  of the parent's. Hydration parser version 2 re-parses and heals existing
+  databases in place on the next `sessions hydrate`, moving those events from
+  the parent to the child rather than duplicating them. The
+  `session_relationships_v2` schema marker is required, so the first read of an
+  existing database is routed through a writable open that migrates it.
+
 ### Added
 
+- Add first-class delegation topology. `session_relationships` gains an
+  identity status (`observed` or `unlinked`), child agent type, name, model and
+  spawn depth, the provider evidence that established the link (kind, file
+  locator, and native reference such as a Claude `toolUseId` or a Codex
+  `parent_thread_id`), the provider's spawn time, and whether the child's
+  events are independently addressable. Read it with the new
+  `getSessionRelationships`, `getSessionTree`, and `getSessionChildrenPage`
+  operations (session-relationship contract version 1), the
+  `ai-hist sessions relationships` and `ai-hist sessions tree` commands, or the
+  `get_session_relationships` and `get_session_tree` MCP tools. Traversal is
+  pre-order, deterministically ordered by `(spawned_at_ms, relationship_uid)`,
+  cycle-safe, and bounded by `max_depth` / `max_nodes`. Global `sync` now
+  records Codex delegation too, so topology is queryable without targeted
+  hydration, and existing databases migrate automatically through the
+  `session_relationships_v2` marker.
 - Add remote provider connectors behind the existing `--remote` / `--all`
   acquisition scopes: `claude-web` lists claude.ai/code web sessions with the
   OAuth sign-in the Claude Code CLI stored (`~/.claude/.credentials.json`,

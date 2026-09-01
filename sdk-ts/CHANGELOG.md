@@ -17,8 +17,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   either operation.
 - Make session-event pagination the primitive API and ship the public
   `ai-hist` Node CLI from this package.
+- Advance the required `ai-hist-native` contract to 5. Claude subagent
+  transcripts whose records carry an `agentId` are indexed under that child id,
+  so their events move off the parent on the next `hydrateSession`.
 
 ### Added
+
+- Add delegation topology APIs: `getSessionRelationships()`,
+  `getSessionTree()`, and `getSessionChildrenPage()`, plus the
+  `sessionDescendants()` and `sessionEventsIncludingDescendants()` async
+  iterators. Every event `sessionEventsIncludingDescendants()` yields keeps the
+  `sessionId` of the session that produced it; a child's event is never
+  rewritten as the parent's. New exported types: `SessionRelationship`,
+  `RelationshipCapabilities`, `RelationshipDiagnostic`, `SessionRelationships`,
+  `SessionTree`, `SessionTreeNode`, `SessionChildrenPage`,
+  `RelationshipCursor`, `RelationshipType`, `IdentityStatus`,
+  `StableChildIdentity`, `GetSessionRelationshipsOptions`,
+  `GetSessionTreeOptions`, `GetSessionChildrenPageOptions`,
+  `SessionDescendantsOptions`, `DescendantEventsOptions`, and the
+  `SESSION_RELATIONSHIP_CONTRACT_VERSION` constant. Results report
+  `identityStatus` and `capabilities.stableChildIdentity` instead of
+  synthesizing a child identity the provider never recorded.
+- Add the SDK-only `sessions relationships` and `sessions tree` CLI commands
+  and the read-only `get_session_relationships` and `get_session_tree` MCP
+  tools. Both address a session by identity and take no scope.
 
 - Support remote acquisition through the engine's provider connectors:
   `discoverSessions`/`sync` with `scope: 'remote'` (and the remote half of

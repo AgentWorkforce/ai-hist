@@ -41,9 +41,14 @@ ended. File providers validate the saved locator against the expected provider
 root; OpenCode uses session-keyed queries against its live read-only database.
 Relay reports `HYDRATION_UNSUPPORTED` until a full-evidence connector exists.
 
-Codex child rollouts retain provider-native IDs and are linked through
-`session_relationships`; delegated task prompts are not stored as human prompt
-history. Set `includeRelated: false` or use CLI `--no-related` to acquire only
+Codex child rollouts, and Claude subagent transcripts whose records carry a
+per-child `agentId`, retain their provider-native IDs and are linked through
+`session_relationships`: their events are indexed under the child's own
+session id rather than flattened into the parent, and delegated task prompts
+are not stored as human prompt history. Claude evidence from a provider
+version that does not name the child is recorded as an unlinked relationship —
+never as a synthesized identity — and its output stays attributed to the
+parent. Set `includeRelated: false` or use CLI `--no-related` to acquire only
 the selected thread.
 
 | | `ai-hist sessions list` | `ai-hist sessions discover` |
@@ -309,6 +314,22 @@ read.
 | **opencode** | ✓ | ✓ (directory) | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
 
+Delegation is a separate capability, reported on every relationship result as
+`capabilities.stableChildIdentity`:
+
+| Source | Stable child identity | Agent type | Spawn time | Evidence locator |
+|---|---|---|---|---|
+| **codex** | always | ✓ | ✓ | ✓ |
+| **claude** | sometimes | ✓ | ✓ | ✓ |
+| **cursor**, **grok**, **opencode**, **relay** | never | – | – | – |
+
+Claude is `sometimes` because a subagent transcript carries the *parent's*
+`sessionId` on every record; the child's own identity is the per-child
+`agentId`, which only newer provider versions emit. When it is present the
+child is indexed under it; when it is absent the delegation is recorded as
+unlinked evidence and the child id is left null — it is never taken from the
+`agent-<id>.jsonl` file name.
+
 How each adapter works:
 
 - **claude** — `~/.claude/projects/**/*.jsonl`. Head for identity, `cwd`,
@@ -489,6 +510,24 @@ are backfilled with a local presence during migration. Scope queries use this
 table to select sessions and aggregate their `locations`; they do not duplicate
 the session or its events.
 
+`session_relationships` is the delegation table, keyed by
+`(source, parent_session_id, relationship_uid)`. `relationship_uid` is
+`child:<child_session_id>` for an observed child and
+`evidence:<evidence_kind>:<evidence_locator>` for unlinked evidence, which
+makes repeated ingestion idempotent and gives each unlinked sidecar its own
+row. Beside the identity columns (`child_session_id`, nullable, and
+`identity_status`) it stores `relationship`, `child_agent_type`,
+`child_agent_name`, `child_model`, `spawn_depth`, `evidence_kind`,
+`evidence_locator`, `evidence_ref`, `child_has_events`, `spawned_at_ms`,
+`created_ms`, and `updated_ms`; re-ingestion refreshes mutable fields and
+preserves first-observation time. It is read through
+`idx_session_relationships_parent` and `idx_session_relationships_child`.
+Databases written before this shape are rebuilt in place by the
+`session_relationships_v2` marker migration, which copies every existing edge
+forward as an observed `legacy_hydration` row; the marker is required, so an
+unmigrated database is routed through the writable open instead of being read
+as current.
+
 ---
 
 ## Adding a provider
@@ -523,12 +562,22 @@ discoverable".
   result as JSONL when line-oriented records are more convenient. Both run on
   a blocking worker thread and accept `scope` / `sources` / `limit`, with `beforeMs` and
   `after` (the previous page's `nextCursor`) on the listing.
+- **Native (napi), delegation** — `getSessionRelationships(options)` returns one
+  session's edges in both directions plus the provider's capabilities;
+  `getSessionTree(options)` returns the pre-order descendant tree bounded by
+  `maxDepth` / `maxNodes`; `getSessionChildrenPage(options)` returns one keyset
+  page of direct children. All three are cache-only, and a missing database is
+  an empty result rather than an error.
 - **TypeScript SDK** — `listSessionCatalog()` / `discoverSessions()` wrap the
-  same contract for Node consumers; see the SDK's own documentation for the
-  exact signatures.
+  same contract for Node consumers, as do `getSessionRelationships()`,
+  `getSessionTree()`, `getSessionChildrenPage()`, and the `sessionDescendants()`
+  / `sessionEventsIncludingDescendants()` iterators; see the SDK's own
+  documentation for the exact signatures.
 - **MCP** — the stdio server exposes the cache-only listing as a `list_sessions`
   tool, so an agent can enumerate recent sessions without triggering any
-  provider I/O. See the MCP package's documentation for its arguments.
+  provider I/O, and delegation topology as the read-only
+  `get_session_relationships` and `get_session_tree` tools. See the MCP
+  package's documentation for their arguments.
 
 Whatever the surface, `contract_version` means the same thing: check it, and
 fail loudly on a version you do not know.

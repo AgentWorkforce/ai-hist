@@ -21,7 +21,8 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 4, catalog contract version 2, and hydration contract version 1, normalizes nullable fields, maps
+version 5, catalog contract version 2, hydration contract version 1, and
+session-relationship contract version 1, normalizes nullable fields, maps
 native errors, and supplies pagination helpers.
 
 The CLI and MCP server import only the SDK's public functions. They do not
@@ -67,6 +68,9 @@ row's `locations`.
 | `stats` (`local` / `remote` / `all`) | none | indexed aggregate reads | empty result |
 | `getSession` | none | indexed identity read | empty result |
 | `getSessionEventsPage` | none | bounded keyset page | empty page |
+| `getSessionRelationships` | none | indexed relationship reads | empty result |
+| `getSessionTree` | none | indexed relationship reads, one child query per emitted node | empty result |
+| `getSessionChildrenPage` | none | bounded keyset page | empty page |
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
 | `sync` (`remote`) | configured remote connectors (error when none) | catalog upserts + presences | creates DB |
 | `sync` (`all`) | full local scan + configured remote connectors | migrations + ingestion | creates DB |
@@ -82,14 +86,58 @@ await hydrateSession({ source: sessions[0].source, sessionId: sessions[0].sessio
 Global sync owns enumeration while targeted hydration resolves one persisted
 catalog presence. Both call the same Rust provider normalization helpers.
 TypeScript never parses a provider source or opens SQLite. Per-session
-checkpoints make unchanged calls constant-work after source resolution, and
-`session_relationships` preserves Codex child identities without flattening
-their events into the selected root.
+checkpoints make unchanged calls constant-work after source resolution.
+
+## Delegation topology
+
+`session_relationships` records one row per observed delegation, keyed by
+`(source, parent_session_id, relationship_uid)`. Each row carries what
+established the link — `evidence_kind`, the provider file in
+`evidence_locator`, and the provider-native reference in `evidence_ref` (a
+Claude `toolUseId`, a Codex `parent_thread_id`) — plus whatever the provider
+recorded about the child: agent type, agent name, model, spawn depth, and the
+provider's own spawn time.
+
+`identity_status` separates two honestly different things. An `observed` row
+names the child: `child_session_id` is the provider's own identity for it, and
+`child_has_events` says whether that child is independently addressable
+through `getSessionEventsPage`. An `unlinked` row means the provider recorded
+a delegation but no stable child identity, so `child_session_id` is null and
+the child's output stays attributed to the parent. A child id is never
+synthesized, never derived from a file name, and never inferred.
+
+What a provider can record is a property of the provider, not of a database,
+so every result reports it:
+
+| Source | Stable child identity | Agent type | Spawn time | Evidence locator |
+|---|---|---|---|---|
+| `codex` | always | yes | yes | yes |
+| `claude` | sometimes (only versions that emit a per-child `agentId`) | yes | yes | yes |
+| `cursor`, `grok`, `opencode`, `relay` | never | no | no | no |
+
+A linked child's events are stored under the child's own session id and are
+never flattened into the parent. The delegated instruction that started a
+child is not a human prompt: it never becomes a `history` row, and a delegated
+thread never becomes a top-level catalog session.
+
+Children are ordered by `(spawned_at_ms, relationship_uid)` with null spawn
+times at the tail; `relationship_uid` is unique per parent, so that is a total
+order shared by `getSessionChildrenPage`, `getSessionTree`, and the SDK's
+`sessionDescendants` walker. Traversal is pre-order over an explicit stack,
+never recursion. A session appears exactly once, at its shallowest reachable
+depth; a repeated session stops expansion and emits a `RELATIONSHIP_CYCLE`
+diagnostic. `maxDepth` (default 32, maximum 64) and `maxNodes` (default 1000,
+maximum 10000) bound the work to one indexed child query per emitted node and
+surface `RELATIONSHIP_TREE_DEPTH_LIMIT` and `RELATIONSHIP_TREE_TRUNCATED`
+diagnostics instead of silently short results. Unlinked rows are reported in
+`unlinked` with a `RELATIONSHIP_UNLINKED_CHILD` diagnostic rather than
+traversed.
 
 Events use `(ts_ms, id)` keyset pagination. Catalog ordering is
 `(last_activity_ms DESC, source ASC, session_id ASC)`, with null timestamps at
-the tail. These total orders prevent duplicate or omitted rows at timestamp
-ties.
+the tail. Relationship ordering is `(spawned_at_ms, relationship_uid)`, also
+with null timestamps at the tail. These total orders prevent duplicate or
+omitted rows at timestamp ties.
 
 ## Native errors
 

@@ -18,6 +18,11 @@ Use these public operations:
   metadata.
 - `search()`, `recent()`, `getSession()`, and `getSessionEventsPage()` for
   indexed history reads.
+- `getSessionRelationships()` / MCP `get_session_relationships` and
+  `getSessionTree()` / MCP `get_session_tree` for delegation topology, plus
+  the SDK-only `getSessionChildrenPage()`, `sessionDescendants()`, and
+  `sessionEventsIncludingDescendants()` for walking large trees. Every event
+  keeps the session id of the session that produced it.
 - `sync()` / MCP `sync` for explicit full local ingestion.
 
 Pass `scope` to collection operations when the default local view is not
@@ -39,7 +44,8 @@ connector. Acquisition result `scope` echoes the request and `locationsRun`
 reports which connector locations executed; use session `locations` for
 observed presences.
 
-The CLI equivalents are `sessions list`, `sessions discover`, `search`,
+The CLI equivalents are `sessions list`, `sessions discover`,
+`sessions hydrate`, `sessions relationships`, `sessions tree`, `search`,
 `recent`, `session`, `events`, `stats`, and `sync`. See
 [Session catalog](session-catalog.md) for discovery and pagination contracts
 and [Architecture](architecture.md) for the process boundary.

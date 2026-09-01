@@ -29,7 +29,12 @@ npm install --global ai-hist
 ai-hist sessions discover --limit 100
 ai-hist sessions list --limit 100
 ai-hist sessions hydrate codex 01a04f0c-... --json
+ai-hist sessions tree codex 01a04f0c-...
 ```
+
+`sessions relationships` and `sessions tree` read the delegation topology a
+session recorded: which subagent threads it spawned, what evidence established
+each link, and whether a child's events are addressable on their own.
 
 Session-set commands share one mutually exclusive location scope:
 
