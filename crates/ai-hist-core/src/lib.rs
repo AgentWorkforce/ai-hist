@@ -437,39 +437,60 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
 const REQUIRED_SESSION_PRESENCE_COLUMNS: &[&str] =
     &["raw_locator", "source_stamp", "discovery_state"];
 
-/// Indexes the session catalog's fast paths depend on.
+/// Every index a fast path depends on, across all of them.
 ///
 /// The pre-existing guard checks tables and columns only. These are listed
-/// because each one carries a promise the catalog makes: the two recency
-/// indexes make a listing an indexed, sort-free read, and `idx_sessions_raw_path`
+/// because each one carries a promise some read makes: the two recency indexes
+/// make a catalog listing an indexed, sort-free read, `idx_sessions_raw_path`
 /// makes discovery's "has this transcript changed?" lookup a search rather than
-/// a scan of every session on every candidate. A database that somehow has the
+/// a scan of every session on every candidate, and the event and evidence page
+/// indexes carry their pagination's ordering. A database that somehow has the
 /// columns but not an index would otherwise be served with silently degraded
 /// plans. Missing means "not current", which routes the caller through the
 /// writable open that recreates them.
 ///
+/// This is the *writable* bar: [`init_db`]'s lock-free fast path skips the
+/// migration only when every one is present. Read paths are each gated on
+/// their own scoped subset below, so a database missing one index keeps its
+/// read-only handle for every read that does not need it.
+///
 /// The older `idx_sessions_cwd` / `idx_sessions_branch` / `idx_sessions_last` /
 /// `idx_sessions_source_last` are deliberately absent: nothing in the catalog
 /// path depends on them any more.
-const REQUIRED_SESSIONS_INDEXES: &[&str] = &[
+const REQUIRED_INDEXES: &[&str] = &[
     "idx_sessions_recency",
     "idx_sessions_source_recency",
     "idx_sessions_raw_path",
     "idx_session_events_source_page",
     "idx_session_events_page",
+    "idx_tool_calls_page_v2",
+    "idx_file_edits_page_v2",
     "idx_session_presences_location",
     "idx_session_presences_locator",
 ];
 
-/// Indexes retired from `sessions`: nothing queries them, and each was one
-/// more btree per catalog write. [`init_db`] drops them so existing databases
-/// shed the write amplification too; while one is still present the database
-/// has outstanding migration work, and the lock-free fast path must not run.
-const RETIRED_SESSIONS_INDEXES: &[&str] = &[
+/// Indexes no longer created: nothing queries them, or a replacement covers
+/// strictly more, and each was one more btree per write. [`init_db`] drops
+/// them so existing databases shed the write amplification too; while one is
+/// still present the database has outstanding migration work, and the
+/// lock-free fast path must not run.
+///
+/// The `sessions` four were never read by the catalog. The evidence four are
+/// prefixes of, or superseded by, the `_v2` page indexes: `(source,
+/// session_id)` is a strict prefix of the page index, and the original page
+/// indexes ordered on the bare `ts_ms` column, which cannot serve the
+/// canonical `ts_ms IS NULL, ts_ms, id` order. Because the schema guard
+/// compares index *names*, the corrected shape had to take a new name — a
+/// same-named old index would otherwise be read as current.
+const RETIRED_INDEXES: &[&str] = &[
     "idx_sessions_cwd",
     "idx_sessions_branch",
     "idx_sessions_last",
     "idx_sessions_source_last",
+    "idx_tool_calls_session",
+    "idx_file_edits_session",
+    "idx_tool_calls_page",
+    "idx_file_edits_page",
 ];
 
 const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
@@ -479,6 +500,11 @@ const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
 ];
 const REQUIRED_EVENT_READ_INDEXES: &[&str] =
     &["idx_session_events_source_page", "idx_session_events_page"];
+/// Indexes the session-scoped tool call and file edit pages depend on. Both
+/// pages always name one source and one session, so a single composite index
+/// per table carries the whole lookup and its ordering.
+const REQUIRED_EVIDENCE_READ_INDEXES: &[&str] =
+    &["idx_tool_calls_page_v2", "idx_file_edits_page_v2"];
 const REQUIRED_SCOPE_READ_INDEXES: &[&str] = &["idx_session_presences_location"];
 const REQUIRED_TRIGGERS: &[&str] = &["delete_session_presences", "delete_session_hydration_state"];
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &["session_presences_local_backfill_v1"];
@@ -491,7 +517,7 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &["session_presences_local_backfill_
 /// first search instead of a silent migration. Callers fall back to a writable
 /// open (which migrates) when this returns false.
 pub fn schema_is_current(conn: &Connection) -> Result<bool> {
-    schema_has_required_indexes(conn, REQUIRED_SESSIONS_INDEXES)
+    schema_has_required_indexes(conn, REQUIRED_INDEXES)
 }
 
 /// Whether read-only APIs can safely and efficiently query this database.
@@ -507,6 +533,11 @@ pub fn schema_is_catalog_read_current(conn: &Connection) -> Result<bool> {
 /// Whether bounded event pagination has both source-scoped and source-less indexes.
 pub fn schema_is_event_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_EVENT_READ_INDEXES)
+}
+
+/// Whether bounded tool call and file edit pagination has its page indexes.
+pub fn schema_is_evidence_read_current(conn: &Connection) -> Result<bool> {
+    schema_has_required_indexes(conn, REQUIRED_EVIDENCE_READ_INDEXES)
 }
 
 fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> Result<bool> {
@@ -567,11 +598,11 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     Ok(true)
 }
 
-/// Whether any [`RETIRED_SESSIONS_INDEXES`] entry still exists.
+/// Whether any [`RETIRED_INDEXES`] entry still exists.
 fn retired_indexes_present(conn: &Connection) -> Result<bool> {
     let mut index =
         conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1")?;
-    for name in RETIRED_SESSIONS_INDEXES {
+    for name in RETIRED_INDEXES {
         if index.exists([name])? {
             return Ok(true);
         }
@@ -784,8 +815,8 @@ VALUES ('session_presences_local_backfill_v1');
         [],
     )?;
     // The write cost of the retired indexes showed up directly in
-    // cold-discovery profiles; see RETIRED_SESSIONS_INDEXES.
-    for name in RETIRED_SESSIONS_INDEXES {
+    // cold-discovery profiles; see RETIRED_INDEXES.
+    for name in RETIRED_INDEXES {
         conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])?;
     }
     // The catalog's total order is (last_activity_ms DESC, source, session_id):
@@ -839,12 +870,19 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_events_role ON session_events(role)",
         [],
     )?;
+    // Evidence pages always name one source and one session and continue on
+    // `(ts_ms, id)` within the canonical `ts_ms IS NULL, ts_ms, id` order.
+    // Both timestamps are nullable, so the "nulls last" half of that order is
+    // carried by indexing the `ts_ms IS NULL` expression itself: an index over
+    // the bare column still leaves SQLite sorting every page in a temp b-tree.
+    // These also subsume the retired `(source, session_id)` indexes, which
+    // were strict prefixes of them.
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(source, session_id)",
+        "CREATE INDEX IF NOT EXISTS idx_tool_calls_page_v2 ON tool_calls(source, session_id, (ts_ms IS NULL), ts_ms, id)",
         [],
     )?;
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_file_edits_session ON file_edits(source, session_id)",
+        "CREATE INDEX IF NOT EXISTS idx_file_edits_page_v2 ON file_edits(source, session_id, (ts_ms IS NULL), ts_ms, id)",
         [],
     )?;
     conn.execute(
@@ -1343,13 +1381,45 @@ pub struct SessionFileEdit {
     pub id: i64,
     pub source: String,
     pub session_id: String,
+    pub message_id: Option<String>,
     pub tool_use_id: String,
     pub file_path: String,
     pub tool_name: Option<String>,
     pub lines_added: Option<i64>,
     pub lines_removed: Option<i64>,
+    pub structured_patch_json: Option<String>,
     pub user_modified: Option<i64>,
     pub ts_ms: Option<i64>,
+    pub git_branch: Option<String>,
+    pub cwd: Option<String>,
+}
+
+/// Bump whenever the tool call / file edit page row shapes, ordering, or
+/// cursor semantics require an SDK change.
+pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 1;
+
+/// Stable continuation for tool calls and file edits.
+///
+/// Neither table requires a timestamp, and the canonical order places the
+/// undated tail last, so a cursor that only carried an `i64` could not say
+/// whether it stands before or inside that tail. `ts_ms: None` means "already
+/// inside the undated tail, continue by id".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionEvidenceCursor {
+    pub ts_ms: Option<i64>,
+    pub id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionToolCallPage {
+    pub tool_calls: Vec<SessionToolCall>,
+    pub next_cursor: Option<SessionEvidenceCursor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionFileEditPage {
+    pub file_edits: Vec<SessionFileEdit>,
+    pub next_cursor: Option<SessionEvidenceCursor>,
 }
 
 /// All normalized events for one session, oldest first. Rows sharing a
@@ -1462,8 +1532,7 @@ pub fn session_tool_calls(
     session_id: &str,
     source: Option<&str>,
 ) -> Result<Vec<SessionToolCall>> {
-    let mut sql = "SELECT id, source, session_id, message_id, tool_use_id, name, target,                    args_json, is_error, ts_ms                    FROM tool_calls WHERE session_id = ?"
-        .to_string();
+    let mut sql = format!("SELECT {TOOL_CALL_COLUMNS} FROM tool_calls WHERE session_id = ?");
     let mut params_vec = vec![session_id.to_string()];
     if let Some(source) = source {
         sql.push_str(" AND source = ?");
@@ -1471,20 +1540,7 @@ pub fn session_tool_calls(
     }
     sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
-        Ok(SessionToolCall {
-            id: row.get(0)?,
-            source: row.get(1)?,
-            session_id: row.get(2)?,
-            message_id: row.get(3)?,
-            tool_use_id: row.get(4)?,
-            name: row.get(5)?,
-            target: row.get(6)?,
-            args_json: row.get(7)?,
-            is_error: row.get(8)?,
-            ts_ms: row.get(9)?,
-        })
-    })?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_tool_call)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -1493,8 +1549,7 @@ pub fn session_file_edits(
     session_id: &str,
     source: Option<&str>,
 ) -> Result<Vec<SessionFileEdit>> {
-    let mut sql = "SELECT id, source, session_id, tool_use_id, file_path, tool_name,                    lines_added, lines_removed, user_modified, ts_ms                    FROM file_edits WHERE session_id = ?"
-        .to_string();
+    let mut sql = format!("SELECT {FILE_EDIT_COLUMNS} FROM file_edits WHERE session_id = ?");
     let mut params_vec = vec![session_id.to_string()];
     if let Some(source) = source {
         sql.push_str(" AND source = ?");
@@ -1502,21 +1557,182 @@ pub fn session_file_edits(
     }
     sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
-        Ok(SessionFileEdit {
-            id: row.get(0)?,
-            source: row.get(1)?,
-            session_id: row.get(2)?,
-            tool_use_id: row.get(3)?,
-            file_path: row.get(4)?,
-            tool_name: row.get(5)?,
-            lines_added: row.get(6)?,
-            lines_removed: row.get(7)?,
-            user_modified: row.get(8)?,
-            ts_ms: row.get(9)?,
-        })
-    })?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_file_edit)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+const TOOL_CALL_COLUMNS: &str = "id, source, session_id, message_id, tool_use_id, name, target, \
+                                 args_json, is_error, ts_ms";
+const FILE_EDIT_COLUMNS: &str =
+    "id, source, session_id, message_id, tool_use_id, file_path, tool_name, lines_added, \
+     lines_removed, structured_patch_json, user_modified, ts_ms, git_branch, cwd";
+
+fn row_to_tool_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionToolCall> {
+    Ok(SessionToolCall {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        session_id: row.get(2)?,
+        message_id: row.get(3)?,
+        tool_use_id: row.get(4)?,
+        name: row.get(5)?,
+        target: row.get(6)?,
+        args_json: row.get(7)?,
+        is_error: row.get(8)?,
+        ts_ms: row.get(9)?,
+    })
+}
+
+fn row_to_file_edit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionFileEdit> {
+    Ok(SessionFileEdit {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        session_id: row.get(2)?,
+        message_id: row.get(3)?,
+        tool_use_id: row.get(4)?,
+        file_path: row.get(5)?,
+        tool_name: row.get(6)?,
+        lines_added: row.get(7)?,
+        lines_removed: row.get(8)?,
+        structured_patch_json: row.get(9)?,
+        user_modified: row.get(10)?,
+        ts_ms: row.get(11)?,
+        git_branch: row.get(12)?,
+        cwd: row.get(13)?,
+    })
+}
+
+/// One page's SQL and bound parameters, in the canonical
+/// `ts_ms IS NULL, ts_ms ASC, id ASC` order.
+///
+/// A dated cursor must still admit the whole undated tail, and an undated one
+/// must never walk back into the dated head, so the two continuation cases are
+/// different predicates rather than one comparison over a coalesced timestamp.
+///
+/// The undated continuation is also a different *shape*. Its rows are exactly
+/// the ones the page index stores under `(ts_ms IS NULL) = 1`, so it names that
+/// indexed expression itself -- SQLite does not infer it from the bare
+/// `ts_ms IS NULL` term -- and, since the first two order keys are then
+/// constant, orders on `id` alone. Written the obvious way instead, SQLite
+/// cannot reach `id` in the index and re-sorts the whole remaining tail in a
+/// temp b-tree on every page. Both spellings return the same rows in the same
+/// order.
+///
+/// Both page readers and the query-plan test build their SQL here, so a plan
+/// assertion cannot pass against a restated copy while the real query drifts.
+fn evidence_page_query(
+    columns: &str,
+    table: &str,
+    source: &str,
+    session_id: &str,
+    limit: i64,
+    after: Option<&SessionEvidenceCursor>,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let mut sql = format!("SELECT {columns} FROM {table} WHERE source = ? AND session_id = ?");
+    let mut params: Vec<rusqlite::types::Value> =
+        vec![source.to_string().into(), session_id.to_string().into()];
+    match after.map(|cursor| (cursor.ts_ms, cursor.id)) {
+        Some((Some(ts_ms), id)) => {
+            sql.push_str(" AND (ts_ms IS NULL OR ts_ms > ? OR (ts_ms = ? AND id > ?))");
+            params.push(ts_ms.into());
+            params.push(ts_ms.into());
+            params.push(id.into());
+            sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
+        }
+        Some((None, id)) => {
+            sql.push_str(" AND ((ts_ms IS NULL) = 1 AND ts_ms IS NULL AND id > ?)");
+            params.push(id.into());
+            sql.push_str(" ORDER BY id ASC");
+        }
+        None => {
+            sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
+        }
+    }
+    sql.push_str(" LIMIT ?");
+    params.push((limit + 1).into());
+    (sql, params)
+}
+
+/// One bounded page of recorded tool calls for one session, oldest first.
+///
+/// Both `source` and `session_id` are required: native session ids collide
+/// across providers, and a page that filtered on the id alone would interleave
+/// two unrelated sessions.
+pub fn session_tool_calls_page(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    limit: i64,
+    after: Option<&SessionEvidenceCursor>,
+) -> Result<SessionToolCallPage> {
+    let limit = limit.clamp(1, 1_000);
+    let (sql, params_vec) = evidence_page_query(
+        TOOL_CALL_COLUMNS,
+        "tool_calls",
+        source,
+        session_id,
+        limit,
+        after,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_tool_call)?;
+    let mut tool_calls = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    // One extra row was requested, so `has_more` already implies a full page.
+    let has_more = tool_calls.len() > limit as usize;
+    if has_more {
+        tool_calls.truncate(limit as usize);
+    }
+    let next_cursor = has_more.then(|| {
+        let last = tool_calls.last().expect("non-empty page");
+        SessionEvidenceCursor {
+            ts_ms: last.ts_ms,
+            id: last.id,
+        }
+    });
+    Ok(SessionToolCallPage {
+        tool_calls,
+        next_cursor,
+    })
+}
+
+/// One bounded page of recorded file edits for one session, oldest first.
+///
+/// Scoped to one `source` for the same reason as
+/// [`session_tool_calls_page`].
+pub fn session_file_edits_page(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    limit: i64,
+    after: Option<&SessionEvidenceCursor>,
+) -> Result<SessionFileEditPage> {
+    let limit = limit.clamp(1, 1_000);
+    let (sql, params_vec) = evidence_page_query(
+        FILE_EDIT_COLUMNS,
+        "file_edits",
+        source,
+        session_id,
+        limit,
+        after,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_file_edit)?;
+    let mut file_edits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    // One extra row was requested, so `has_more` already implies a full page.
+    let has_more = file_edits.len() > limit as usize;
+    if has_more {
+        file_edits.truncate(limit as usize);
+    }
+    let next_cursor = has_more.then(|| {
+        let last = file_edits.last().expect("non-empty page");
+        SessionEvidenceCursor {
+            ts_ms: last.ts_ms,
+            id: last.id,
+        }
+    });
+    Ok(SessionFileEditPage {
+        file_edits,
+        next_cursor,
+    })
 }
 
 pub fn stats(conn: &Connection, tag: Option<&str>) -> Result<Stats> {
@@ -2584,6 +2800,413 @@ mod tests {
         assert!(session_file_edits(&conn, "nope", None).unwrap().is_empty());
     }
 
+    /// Two providers whose native session ids collide, one shared timestamp
+    /// per table, and an undated tail: the shapes every page assertion below
+    /// depends on.
+    fn seed_evidence(conn: &Connection) {
+        conn.execute_batch(
+            r#"
+            INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name, target, args_json, is_error, ts_ms)
+            VALUES ('claude', 's1', 'm1', 'tu-a', 'Bash', 'cargo test', '{"command":"cargo test"}', 1, 200),
+                   ('claude', 's1', 'm1', 'tu-b', 'Read', '/tmp/p/a.rs', '{"file_path":"/tmp/p/a.rs"}', 0, 100),
+                   ('claude', 's1', 'm2', 'tu-c', 'Grep', 'needle', '{"pattern":"needle"}', NULL, 200),
+                   ('claude', 's1', 'm2', 'tu-d', 'Glob', '*.rs', '{"pattern":"*.rs"}', 0, NULL),
+                   ('claude', 's1', 'm3', 'tu-e', 'Write', '/tmp/p/b.rs', 'not json', 0, 100),
+                   ('claude', 's1', 'm3', 'tu-f', 'Edit', '/tmp/p/c.rs', NULL, NULL, NULL),
+                   ('codex', 's1', 'm9', 'tu-x', 'Shell', 'ls', '{}', 0, 150),
+                   ('claude', 's2', 'm8', 'tu-y', 'Read', '/tmp/q/a.rs', '{}', 0, 150);
+            INSERT INTO file_edits (source, session_id, message_id, tool_use_id, file_path, tool_name, lines_added, lines_removed, structured_patch_json, user_modified, ts_ms, git_branch, cwd)
+            VALUES ('claude', 's1', 'm1', 'fe-a', '/tmp/p/a.rs', 'Write', 10, 0, '[{"lines":["+a"]}]', 1, 200, 'main', '/tmp/p'),
+                   ('claude', 's1', 'm1', 'fe-b', '/tmp/p/b.rs', 'Edit', 2, 1, 'not json', 0, 100, 'main', '/tmp/p'),
+                   ('claude', 's1', 'm2', 'fe-c', '/tmp/p/c.rs', 'Edit', 1, 1, NULL, NULL, 200, NULL, NULL),
+                   ('claude', 's1', 'm2', 'fe-d', '/tmp/p/d.rs', 'Edit', 0, 0, NULL, NULL, NULL, NULL, NULL),
+                   ('claude', 's1', 'm3', 'fe-e', '/tmp/p/e.rs', 'Edit', 3, 3, NULL, 1, 100, 'main', '/tmp/p'),
+                   ('claude', 's1', 'm3', 'fe-f', '/tmp/p/f.rs', 'Edit', 0, 1, NULL, NULL, NULL, NULL, NULL),
+                   ('codex', 's1', 'm9', 'fe-x', '/tmp/p/z.rs', 'apply_patch', 1, 1, NULL, NULL, 150, NULL, NULL),
+                   ('claude', 's2', 'm8', 'fe-y', '/tmp/q/a.rs', 'Edit', 1, 0, NULL, NULL, 150, NULL, NULL);
+            "#,
+        )
+        .unwrap();
+    }
+
+    /// Every page of a full walk, plus the ids it yielded in order. Pages are
+    /// bounded, so a cursor that failed to advance would hang rather than
+    /// fail; the iteration guard turns that into an assertion.
+    fn walk_tool_calls(conn: &Connection, source: &str, session_id: &str, limit: i64) -> Vec<i64> {
+        let mut ids = Vec::new();
+        let mut cursor = None;
+        for _ in 0..100 {
+            let page =
+                session_tool_calls_page(conn, source, session_id, limit, cursor.as_ref()).unwrap();
+            assert!(page.tool_calls.len() as i64 <= limit.clamp(1, 1_000));
+            ids.extend(page.tool_calls.iter().map(|call| call.id));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return ids,
+            }
+        }
+        panic!("tool call pagination did not terminate");
+    }
+
+    fn walk_file_edits(conn: &Connection, source: &str, session_id: &str, limit: i64) -> Vec<i64> {
+        let mut ids = Vec::new();
+        let mut cursor = None;
+        for _ in 0..100 {
+            let page =
+                session_file_edits_page(conn, source, session_id, limit, cursor.as_ref()).unwrap();
+            assert!(page.file_edits.len() as i64 <= limit.clamp(1, 1_000));
+            ids.extend(page.file_edits.iter().map(|edit| edit.id));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return ids,
+            }
+        }
+        panic!("file edit pagination did not terminate");
+    }
+
+    #[test]
+    fn evidence_pages_scope_to_one_source_and_session() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_evidence(&conn);
+
+        let calls = session_tool_calls_page(&conn, "claude", "s1", 100, None).unwrap();
+        assert!(calls
+            .tool_calls
+            .iter()
+            .all(|call| call.source == "claude" && call.session_id == "s1"));
+        assert_eq!(calls.tool_calls.len(), 6);
+        assert_eq!(
+            session_tool_calls_page(&conn, "codex", "s1", 100, None)
+                .unwrap()
+                .tool_calls
+                .iter()
+                .map(|call| call.tool_use_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tu-x"]
+        );
+
+        let edits = session_file_edits_page(&conn, "claude", "s1", 100, None).unwrap();
+        assert!(edits
+            .file_edits
+            .iter()
+            .all(|edit| edit.source == "claude" && edit.session_id == "s1"));
+        assert_eq!(edits.file_edits.len(), 6);
+        let first = &edits.file_edits[0];
+        assert_eq!(first.tool_use_id, "fe-b");
+        assert_eq!(first.message_id.as_deref(), Some("m1"));
+        assert_eq!(first.structured_patch_json.as_deref(), Some("not json"));
+        assert_eq!(first.git_branch.as_deref(), Some("main"));
+        assert_eq!(first.cwd.as_deref(), Some("/tmp/p"));
+        assert_eq!(
+            session_file_edits_page(&conn, "codex", "s1", 100, None)
+                .unwrap()
+                .file_edits
+                .iter()
+                .map(|edit| edit.tool_use_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fe-x"]
+        );
+    }
+
+    #[test]
+    fn evidence_pages_walk_tied_timestamps_and_undated_tails_without_gaps() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_evidence(&conn);
+
+        let expected_calls = session_tool_calls(&conn, "s1", Some("claude"))
+            .unwrap()
+            .iter()
+            .map(|call| call.id)
+            .collect::<Vec<_>>();
+        let expected_edits = session_file_edits(&conn, "s1", Some("claude"))
+            .unwrap()
+            .iter()
+            .map(|edit| edit.id)
+            .collect::<Vec<_>>();
+        // Tied timestamps ahead of an undated tail: the order the unpaginated
+        // readers already promise.
+        assert_eq!(expected_calls.len(), 6);
+        assert_eq!(expected_edits.len(), 6);
+
+        for limit in [1, 2, 3, 5, 6, 7, 1_000] {
+            assert_eq!(
+                walk_tool_calls(&conn, "claude", "s1", limit),
+                expected_calls,
+                "tool calls at limit {limit}"
+            );
+            assert_eq!(
+                walk_file_edits(&conn, "claude", "s1", limit),
+                expected_edits,
+                "file edits at limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_page_cursors_are_exact_at_page_boundaries() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_evidence(&conn);
+
+        // A page that exactly consumes the rows reports no continuation.
+        let exact = session_tool_calls_page(&conn, "claude", "s1", 6, None).unwrap();
+        assert_eq!(exact.tool_calls.len(), 6);
+        assert_eq!(exact.next_cursor, None);
+
+        // A cursor taken mid-tie resumes at the tie's next row, not after it.
+        let first = session_tool_calls_page(&conn, "claude", "s1", 1, None).unwrap();
+        let cursor = first.next_cursor.clone().unwrap();
+        assert_eq!(cursor.ts_ms, Some(100));
+        let second = session_tool_calls_page(&conn, "claude", "s1", 1, Some(&cursor)).unwrap();
+        assert_eq!(second.tool_calls[0].ts_ms, Some(100));
+        assert!(second.tool_calls[0].id > first.tool_calls[0].id);
+
+        // A cursor on the last dated row admits the whole undated tail.
+        let dated = session_tool_calls_page(&conn, "claude", "s1", 4, None).unwrap();
+        let tail = session_tool_calls_page(&conn, "claude", "s1", 100, dated.next_cursor.as_ref())
+            .unwrap();
+        assert!(tail.tool_calls.iter().all(|call| call.ts_ms.is_none()));
+        assert_eq!(tail.tool_calls.len(), 2);
+        assert_eq!(tail.next_cursor, None);
+
+        // A cursor already inside the undated tail never walks back into the
+        // dated head.
+        let undated = SessionEvidenceCursor {
+            ts_ms: None,
+            id: tail.tool_calls[0].id,
+        };
+        let rest = session_file_edits_page(&conn, "claude", "s1", 100, None).unwrap();
+        let last_undated = rest.file_edits.last().unwrap();
+        let after_all = session_file_edits_page(
+            &conn,
+            "claude",
+            "s1",
+            100,
+            Some(&SessionEvidenceCursor {
+                ts_ms: last_undated.ts_ms,
+                id: last_undated.id,
+            }),
+        )
+        .unwrap();
+        assert!(after_all.file_edits.is_empty());
+        assert_eq!(after_all.next_cursor, None);
+        let continued =
+            session_tool_calls_page(&conn, "claude", "s1", 100, Some(&undated)).unwrap();
+        assert_eq!(continued.tool_calls.len(), 1);
+        assert!(continued.tool_calls[0].ts_ms.is_none());
+    }
+
+    #[test]
+    fn evidence_pages_clamp_limits_and_read_unknown_sessions_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_evidence(&conn);
+
+        // Out-of-range limits clamp instead of erroring or returning nothing.
+        assert_eq!(
+            session_tool_calls_page(&conn, "claude", "s1", 0, None)
+                .unwrap()
+                .tool_calls
+                .len(),
+            1
+        );
+        assert_eq!(
+            session_file_edits_page(&conn, "claude", "s1", -5, None)
+                .unwrap()
+                .file_edits
+                .len(),
+            1
+        );
+        assert_eq!(
+            session_tool_calls_page(&conn, "claude", "s1", 10_000, None)
+                .unwrap()
+                .tool_calls
+                .len(),
+            6
+        );
+
+        for (source, session_id) in [("claude", "nope"), ("nope", "s1")] {
+            let calls = session_tool_calls_page(&conn, source, session_id, 10, None).unwrap();
+            assert!(calls.tool_calls.is_empty());
+            assert_eq!(calls.next_cursor, None);
+            let edits = session_file_edits_page(&conn, source, session_id, 10, None).unwrap();
+            assert!(edits.file_edits.is_empty());
+            assert_eq!(edits.next_cursor, None);
+        }
+    }
+
+    /// A database predating the evidence page indexes has outstanding
+    /// migration work: the read guard must refuse it so the caller is routed
+    /// through the writable open that creates them, rather than serving the
+    /// page from a full table scan.
+    #[test]
+    fn evidence_page_indexes_migrate_onto_an_existing_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        assert!(schema_is_evidence_read_current(&conn).unwrap());
+
+        conn.execute_batch("DROP INDEX idx_tool_calls_page_v2; DROP INDEX idx_file_edits_page_v2;")
+            .unwrap();
+        assert!(!schema_is_evidence_read_current(&conn).unwrap());
+        assert!(!schema_is_current(&conn).unwrap());
+        // Every unrelated read path keeps its read-only handle while that
+        // migration is pending: each is gated on its own scoped guard, so
+        // only the evidence pages and the next writable open see the gap.
+        assert!(schema_is_event_read_current(&conn).unwrap());
+        assert!(schema_is_catalog_read_current(&conn).unwrap());
+        assert!(schema_is_read_current(&conn).unwrap());
+
+        // One writable open migrates it, exactly as the session-events page
+        // indexes did when they joined the required list.
+        init_db(&conn).unwrap();
+        assert!(schema_is_evidence_read_current(&conn).unwrap());
+        assert!(schema_is_current(&conn).unwrap());
+    }
+
+    /// A database carrying the first shape of the page indexes -- the same
+    /// names over the bare `ts_ms` column -- must be upgraded, not mistaken
+    /// for current. The guard compares names, so the corrected shape took new
+    /// names and the originals joined the retirement list.
+    #[test]
+    fn the_superseded_evidence_indexes_are_dropped_and_replaced() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_tool_calls_page_v2;
+             DROP INDEX idx_file_edits_page_v2;
+             CREATE INDEX idx_tool_calls_page ON tool_calls(source, session_id, ts_ms, id);
+             CREATE INDEX idx_file_edits_page ON file_edits(source, session_id, ts_ms, id);
+             CREATE INDEX idx_tool_calls_session ON tool_calls(source, session_id);
+             CREATE INDEX idx_file_edits_session ON file_edits(source, session_id);",
+        )
+        .unwrap();
+        assert!(!schema_is_evidence_read_current(&conn).unwrap());
+        assert!(!schema_is_current(&conn).unwrap());
+
+        init_db(&conn).unwrap();
+        assert!(schema_is_evidence_read_current(&conn).unwrap());
+        assert!(schema_is_current(&conn).unwrap());
+        for retired in [
+            "idx_tool_calls_page",
+            "idx_file_edits_page",
+            "idx_tool_calls_session",
+            "idx_file_edits_session",
+        ] {
+            assert!(
+                RETIRED_INDEXES.contains(&retired),
+                "{retired} must be dropped from existing databases"
+            );
+            let present: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?)",
+                    [retired],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!present, "{retired} is still present after migration");
+        }
+    }
+
+    /// The evidence page promises an indexed, sort-free read on all three
+    /// query shapes: the first page, a dated continuation, and a continuation
+    /// already inside the undated tail. The last one is the shape that walks
+    /// the longest, so a temp b-tree there would re-sort the remaining tail on
+    /// every page. The plan is taken from the same builder the readers run, so
+    /// it cannot pass against a restated copy of the query.
+    ///
+    /// Each shape is checked with and without `sqlite_stat1`: the repository
+    /// never runs `ANALYZE`, but a user's database may carry stats, and the
+    /// planner picks differently once it has them.
+    #[test]
+    fn evidence_pages_are_served_by_an_index_without_sorting() {
+        for analyze in [false, true] {
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            seed_evidence(&conn);
+            if analyze {
+                conn.execute_batch("ANALYZE").unwrap();
+            }
+
+            let plan = |table: &str, columns: &str, after: Option<&SessionEvidenceCursor>| {
+                let (sql, params) = evidence_page_query(columns, table, "claude", "s1", 10, after);
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                stmt.query_map(rusqlite::params_from_iter(params), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join(" | ")
+            };
+
+            for (table, columns, index) in [
+                ("tool_calls", TOOL_CALL_COLUMNS, "idx_tool_calls_page_v2"),
+                ("file_edits", FILE_EDIT_COLUMNS, "idx_file_edits_page_v2"),
+            ] {
+                for (shape, after) in [
+                    ("the first page", None),
+                    (
+                        "a dated continuation",
+                        Some(SessionEvidenceCursor {
+                            ts_ms: Some(100),
+                            id: 1,
+                        }),
+                    ),
+                    (
+                        "an undated continuation",
+                        Some(SessionEvidenceCursor { ts_ms: None, id: 1 }),
+                    ),
+                ] {
+                    let plan = plan(table, columns, after.as_ref());
+                    assert!(
+                        plan.contains(index)
+                            && !plan.contains("TEMP B-TREE")
+                            && !plan.contains("SCAN"),
+                        "{shape} of {table} must be an index-ordered search \
+                         (analyze={analyze}): {plan}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_pages_return_stored_json_verbatim() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_evidence(&conn);
+
+        // The core never parses stored provider JSON: unparseable and absent
+        // values are distinct, and both reach the caller intact.
+        let calls = session_tool_calls_page(&conn, "claude", "s1", 100, None).unwrap();
+        let by_id = |tool_use_id: &str| {
+            calls
+                .tool_calls
+                .iter()
+                .find(|call| call.tool_use_id == tool_use_id)
+                .unwrap()
+        };
+        assert_eq!(by_id("tu-e").args_json.as_deref(), Some("not json"));
+        assert_eq!(by_id("tu-f").args_json, None);
+        assert_eq!(by_id("tu-a").is_error, Some(1));
+        assert_eq!(by_id("tu-b").is_error, Some(0));
+        assert_eq!(by_id("tu-c").is_error, None);
+
+        let edits = session_file_edits_page(&conn, "claude", "s1", 100, None).unwrap();
+        let patched = edits
+            .file_edits
+            .iter()
+            .find(|edit| edit.tool_use_id == "fe-a")
+            .unwrap();
+        assert_eq!(
+            patched.structured_patch_json.as_deref(),
+            Some(r#"[{"lines":["+a"]}]"#)
+        );
+        assert_eq!(patched.user_modified, Some(1));
+    }
+
     #[test]
     fn init_db_uses_wal_and_legacy_session_schema() {
         let dir = tempfile::tempdir().unwrap();
@@ -2823,11 +3446,11 @@ mod tests {
             "idx_sessions_raw_path",
         ] {
             assert!(
-                REQUIRED_SESSIONS_INDEXES.contains(&needed),
+                REQUIRED_INDEXES.contains(&needed),
                 "{needed} is load-bearing and must stay in the guard"
             );
         }
-        for index in REQUIRED_SESSIONS_INDEXES {
+        for index in REQUIRED_INDEXES {
             conn.execute_batch(&format!("DROP INDEX {index}")).unwrap();
             assert!(
                 !schema_is_current(&conn).unwrap(),

@@ -119,6 +119,151 @@ test('sessions hydrate uses the SDK contract and is idempotent', async () => {
   }
 });
 
+test('sessions tools and edits page versioned JSON and continue from a cursor', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-evidence-'));
+  const home = join(root, 'home');
+  const claude = join(home, '.claude', 'projects', 'project');
+  const db = join(root, 'history.db');
+  await mkdir(claude, { recursive: true });
+  const transcript = [
+    { type: 'user', uuid: 'u1', sessionId: 'claude-evidence', cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:00.000Z', message: { role: 'user', content: 'edit two files' } },
+    { type: 'assistant', uuid: 'a1', parentUuid: 'u1', sessionId: 'claude-evidence', cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:01.000Z', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Edit', input: { file_path: '/work/app/a.ts', old_string: 'a', new_string: 'b' } }] } },
+    { type: 'assistant', uuid: 'a2', parentUuid: 'a1', sessionId: 'claude-evidence', cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:02.000Z', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_2', name: 'Write', input: { file_path: '/work/app/b.ts', content: 'b' } }] } },
+  ];
+  await writeFile(join(claude, 'claude-evidence.jsonl'), `${transcript.map((line) => JSON.stringify(line)).join('\n')}\n`);
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  try {
+    await run(process.execPath, [cli, 'sync', '--db', db, '--no-warning'], { env });
+
+    const first = await run(process.execPath, [
+      cli, 'sessions', 'tools', 'claude', 'claude-evidence', '--limit', '1', '--db', db, '--json', '--no-warning',
+    ], { env });
+    const page = JSON.parse(first.stdout) as Record<string, unknown>;
+    assert.equal(page.contract_version, 1);
+    assert.equal(page.source, 'claude');
+    assert.equal(page.session_id, 'claude-evidence');
+    const calls = page.tool_calls as Array<Record<string, unknown>>;
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].tool_use_id, 'toolu_1');
+    // Provider argument keys are data and survive the snake_case wire mapping.
+    assert.deepEqual(calls[0].args, { file_path: '/work/app/a.ts', old_string: 'a', new_string: 'b' });
+    const cursor = page.next_cursor as Record<string, unknown>;
+    assert.equal(typeof cursor.id, 'number');
+
+    // The printed cursor feeds straight back into --after, unedited.
+    const second = await run(process.execPath, [
+      cli, 'sessions', 'tools', 'claude', 'claude-evidence', '--after', JSON.stringify(cursor),
+      '--db', db, '--json', '--no-warning',
+    ], { env });
+    const rest = JSON.parse(second.stdout) as Record<string, unknown>;
+    assert.deepEqual((rest.tool_calls as Array<Record<string, unknown>>).map((call) => call.tool_use_id), ['toolu_2']);
+    assert.equal(rest.next_cursor, null);
+
+    const edits = await run(process.execPath, [
+      cli, 'sessions', 'edits', 'claude', 'claude-evidence', '--db', db, '--json', '--no-warning',
+    ], { env });
+    const editPage = JSON.parse(edits.stdout) as Record<string, unknown>;
+    assert.equal(editPage.contract_version, 1);
+    assert.deepEqual((editPage.file_edits as Array<Record<string, unknown>>).map((edit) => edit.file_path), ['/work/app/a.ts', '/work/app/b.ts']);
+
+    const human = await run(process.execPath, [
+      cli, 'sessions', 'edits', 'claude', 'claude-evidence', '--db', db, '--no-warning',
+    ], { env });
+    assert.match(human.stdout, /\/work\/app\/a\.ts/);
+    // Human rows are positional: every column is printed, so an absent value
+    // never shifts the ones after it, and an uncounted line delta reads as `?`
+    // rather than a fabricated zero.
+    for (const line of human.stdout.trim().split('\n')) {
+      const columns = line.split('  ');
+      assert.equal(columns.length, 6, `edit row keeps six columns: ${line}`);
+      assert.match(columns[5], /^\+(\d+|\?)\/-(\d+|\?)$/);
+    }
+    const humanTools = await run(process.execPath, [
+      cli, 'sessions', 'tools', 'claude', 'claude-evidence', '--db', db, '--no-warning',
+    ], { env });
+    for (const line of humanTools.stdout.trim().split('\n')) {
+      assert.equal(line.split('  ').length, 6, `tool call row keeps six columns: ${line}`);
+    }
+    const empty = await run(process.execPath, [
+      cli, 'sessions', 'tools', 'claude', 'missing-session', '--db', db, '--no-warning',
+    ], { env });
+    assert.match(empty.stdout, /No tool calls\./);
+    // The human continuation hint is the other accepted cursor spelling.
+    const humanPage = await run(process.execPath, [
+      cli, 'sessions', 'tools', 'claude', 'claude-evidence', '--limit', '1', '--db', db, '--no-warning',
+    ], { env });
+    const hint = /more available: --after '(.+)'/.exec(humanPage.stdout)?.[1];
+    assert.ok(hint, 'human output prints a continuation cursor');
+    const continued = await run(process.execPath, [
+      cli, 'sessions', 'tools', 'claude', 'claude-evidence', '--after', hint,
+      '--db', db, '--json', '--no-warning',
+    ], { env });
+    assert.deepEqual(
+      (JSON.parse(continued.stdout).tool_calls as Array<Record<string, unknown>>).map((call) => call.tool_use_id),
+      ['toolu_2'],
+    );
+
+    // An undated cursor is spelled either way — `"tsMs": null` as the human
+    // hint and the JSON page print it, or no `tsMs` at all — and both reach
+    // the native boundary, which only accepts an absent one. On this dated
+    // session both name an empty undated tail instead of failing the command.
+    for (const after of [`{"tsMs":null,"id":${cursor.id as number}}`, '{"id":1}', '{"ts_ms":null,"id":1}']) {
+      const tail = await run(process.execPath, [
+        cli, 'sessions', 'tools', 'claude', 'claude-evidence', '--after', after,
+        '--db', db, '--json', '--no-warning',
+      ], { env });
+      assert.deepEqual((JSON.parse(tail.stdout) as Record<string, unknown>).tool_calls, []);
+      const tailEdits = await run(process.execPath, [
+        cli, 'sessions', 'edits', 'claude', 'claude-evidence', '--after', after,
+        '--db', db, '--no-warning',
+      ], { env });
+      assert.match(tailEdits.stdout, /No file edits\./);
+    }
+
+    // A cursor field that is present but not an integer is malformed, not
+    // undated: coercing it to null would move the page into the undated tail
+    // and silently omit every dated record instead of reporting the bad flag.
+    for (const [after, message] of [
+      ['{"ts_ms":"1720000000000","id":1}', '--after cursor ts_ms must be an integer or null'],
+      ['{"tsMs":"1720000000000","id":1}', '--after cursor ts_ms must be an integer or null'],
+      ['{"tsMs":1.5,"id":1}', '--after cursor ts_ms must be an integer or null'],
+      ['{"id":"1"}', '--after must be a JSON cursor with an integer id'],
+      ['{"tsMs":null}', '--after must be a JSON cursor with an integer id'],
+      ['{"tsMs":null,"id":1.5}', '--after must be a JSON cursor with an integer id'],
+    ] as const) {
+      for (const subcommand of ['tools', 'edits']) {
+        await assert.rejects(
+          run(process.execPath, [
+            cli, 'sessions', subcommand, 'claude', 'claude-evidence', '--after', after,
+            '--db', db, '--json', '--no-warning',
+          ], { env }),
+          (error: unknown) => typeof error === 'object' && error !== null
+            && 'code' in error && error.code === 1
+            && 'stderr' in error && String(error.stderr).includes(message),
+          `sessions ${subcommand} --after ${after}`,
+        );
+      }
+    }
+
+    for (const args of [
+      ['sessions', 'tools', 'claude'],
+      ['sessions', 'edits', 'claude'],
+    ]) {
+      await assert.rejects(
+        run(process.execPath, [cli, ...args, '--db', db, '--no-warning'], { env }),
+        (error: unknown) => isUsageFailure(error, 'requires SOURCE and SESSION_ID'),
+        args.join(' '),
+      );
+    }
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions', 'tools', 'claude', 'claude-evidence', '--remote', '--db', db, '--no-warning'], { env }),
+      (error: unknown) => isUsageFailure(error, 'sessions tools does not accept --remote'),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('scope flags are boolean, default to local, and are mutually exclusive', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-scope-'));
   const db = join(root, 'missing.db');
@@ -152,6 +297,8 @@ test('commands reject surplus positional arguments with usage exit 2', async () 
   for (const args of [
     ['sessions', 'list', 'extra'],
     ['sessions', 'discover', 'extra'],
+    ['sessions', 'tools', 'claude', 'session-id', 'extra'],
+    ['sessions', 'edits', 'claude', 'session-id', 'extra'],
     ['recent', '1', 'extra'],
     ['session', 'session-id', 'extra'],
     ['events', 'session-id', 'extra'],

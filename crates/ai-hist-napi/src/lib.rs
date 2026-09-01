@@ -8,16 +8,20 @@ use std::path::{Path, PathBuf};
 
 use ai_hist_core::{
     default_db_path, open_db, open_db_readonly, recent as core_recent,
-    schema_is_catalog_read_current, schema_is_event_read_current, schema_is_read_current,
-    search as core_search, session as core_session,
-    session_events_page as core_session_events_page, session_locations,
-    stats_scoped as core_stats_scoped, HistoryEntry, QueryFilter, SessionEvent as CoreSessionEvent,
-    SessionEventCursor as CoreEventCursor, SessionScope,
+    schema_is_catalog_read_current, schema_is_event_read_current, schema_is_evidence_read_current,
+    schema_is_read_current, search as core_search, session as core_session,
+    session_events_page as core_session_events_page,
+    session_file_edits_page as core_session_file_edits_page, session_locations,
+    session_tool_calls_page as core_session_tool_calls_page, stats_scoped as core_stats_scoped,
+    HistoryEntry, QueryFilter, SessionEvent as CoreSessionEvent,
+    SessionEventCursor as CoreEventCursor, SessionEvidenceCursor as CoreEvidenceCursor,
+    SessionFileEdit as CoreSessionFileEdit, SessionScope, SessionToolCall as CoreSessionToolCall,
+    SESSION_EVIDENCE_CONTRACT_VERSION,
 };
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 4;
+pub const NATIVE_CONTRACT_VERSION: u32 = 5;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -49,6 +53,44 @@ fn validate_limit(limit: Option<i64>, default: i64, max: i64) -> napi::Result<i6
         ));
     }
     Ok(limit)
+}
+
+/// Session identity is two required strings; an empty one would silently widen
+/// a page to every row a provider ever recorded.
+///
+/// A padded value is rejected rather than trimmed, because the query is an
+/// exact match: trimming for the emptiness check alone would answer
+/// `" sess-1 "` with an empty page, and silently trimming would echo an
+/// identity the caller did not ask for. This boundary rejects every other
+/// invalid argument outright too.
+fn validate_identity(value: String, field: &str) -> napi::Result<String> {
+    if value.trim().is_empty() {
+        return Err(native_error(
+            "INVALID_ARGUMENT",
+            format!("{field} must not be empty"),
+        ));
+    }
+    if value.trim() != value {
+        return Err(native_error(
+            "INVALID_ARGUMENT",
+            format!("{field} must not be padded with whitespace"),
+        ));
+    }
+    Ok(value)
+}
+
+fn core_evidence_cursor(cursor: EvidenceCursor) -> CoreEvidenceCursor {
+    CoreEvidenceCursor {
+        ts_ms: cursor.ts_ms,
+        id: cursor.id,
+    }
+}
+
+fn evidence_cursor(cursor: CoreEvidenceCursor) -> EvidenceCursor {
+    EvidenceCursor {
+        ts_ms: cursor.ts_ms,
+        id: cursor.id,
+    }
 }
 
 fn parse_scope(scope: Option<String>) -> napi::Result<SessionScope> {
@@ -237,6 +279,116 @@ pub struct EventsPageOptions {
 pub struct SessionEventsPage {
     pub events: Vec<NativeSessionEvent>,
     pub next_cursor: Option<EventCursor>,
+}
+
+#[napi(object)]
+pub struct NativeSessionToolCall {
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    pub message_id: Option<String>,
+    pub tool_use_id: String,
+    pub name: String,
+    pub target: Option<String>,
+    /// Stored provider arguments, unparsed. The SDK owns JSON parsing so an
+    /// unreadable value cannot fail a whole page at the boundary.
+    pub args_json: Option<String>,
+    pub is_error: Option<bool>,
+    pub ts_ms: Option<i64>,
+}
+
+impl From<CoreSessionToolCall> for NativeSessionToolCall {
+    fn from(call: CoreSessionToolCall) -> Self {
+        Self {
+            id: call.id,
+            source: call.source,
+            session_id: call.session_id,
+            message_id: call.message_id,
+            tool_use_id: call.tool_use_id,
+            name: call.name,
+            target: call.target,
+            args_json: call.args_json,
+            is_error: call.is_error.map(|value| value != 0),
+            ts_ms: call.ts_ms,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct NativeSessionFileEdit {
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    pub message_id: Option<String>,
+    pub tool_use_id: String,
+    pub file_path: String,
+    pub tool_name: Option<String>,
+    pub lines_added: Option<i64>,
+    pub lines_removed: Option<i64>,
+    /// Stored provider patch, unparsed, for the same reason as `args_json`.
+    pub structured_patch_json: Option<String>,
+    pub user_modified: Option<bool>,
+    pub ts_ms: Option<i64>,
+    pub git_branch: Option<String>,
+    pub cwd: Option<String>,
+}
+
+impl From<CoreSessionFileEdit> for NativeSessionFileEdit {
+    fn from(edit: CoreSessionFileEdit) -> Self {
+        Self {
+            id: edit.id,
+            source: edit.source,
+            session_id: edit.session_id,
+            message_id: edit.message_id,
+            tool_use_id: edit.tool_use_id,
+            file_path: edit.file_path,
+            tool_name: edit.tool_name,
+            lines_added: edit.lines_added,
+            lines_removed: edit.lines_removed,
+            structured_patch_json: edit.structured_patch_json,
+            user_modified: edit.user_modified.map(|value| value != 0),
+            ts_ms: edit.ts_ms,
+            git_branch: edit.git_branch,
+            cwd: edit.cwd,
+        }
+    }
+}
+
+/// Continuation for tool call and file edit pages. `tsMs` is optional because
+/// both tables order their undated rows last.
+///
+/// Absent-or-`undefined` is how a caller says "inside the undated tail": an
+/// explicit JavaScript `null` cannot be converted to `i64` and fails at the
+/// boundary, so the SDK normalizes `null` to `undefined` before calling in.
+#[napi(object)]
+pub struct EvidenceCursor {
+    pub ts_ms: Option<i64>,
+    pub id: i64,
+}
+
+#[napi(object)]
+pub struct EvidencePageOptions {
+    pub db_path: Option<String>,
+    pub limit: Option<i64>,
+    pub after: Option<EvidenceCursor>,
+}
+
+#[napi(object)]
+pub struct SessionToolCallsPage {
+    pub contract_version: u32,
+    pub source: String,
+    pub session_id: String,
+    pub tool_calls: Vec<NativeSessionToolCall>,
+    pub next_cursor: Option<EvidenceCursor>,
+}
+
+#[napi(object)]
+pub struct SessionFileEditsPage {
+    pub contract_version: u32,
+    pub source: String,
+    pub session_id: String,
+    pub file_edits: Vec<NativeSessionFileEdit>,
+    pub next_cursor: Option<EvidenceCursor>,
 }
 
 #[napi(object)]
@@ -438,6 +590,91 @@ pub async fn get_session_events_page(
         },
     )
     .await
+}
+
+/// One bounded page of recorded tool calls for one session.
+///
+/// Both `source` and `sessionId` are required: provider session ids are not
+/// globally unique, so an id-only lookup could interleave two sessions.
+#[napi]
+pub async fn get_session_tool_calls_page(
+    source: String,
+    session_id: String,
+    options: Option<EvidencePageOptions>,
+) -> napi::Result<SessionToolCallsPage> {
+    let options = options.unwrap_or(EvidencePageOptions {
+        db_path: None,
+        limit: None,
+        after: None,
+    });
+    let source = validate_identity(source, "source")?;
+    let session_id = validate_identity(session_id, "sessionId")?;
+    let limit = validate_limit(options.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
+    let path = db_path(options.db_path);
+    let after = options.after.map(core_evidence_cursor);
+    let (page_source, page_session_id) = (source.clone(), session_id.clone());
+    read_database_with_schema(
+        path,
+        ai_hist_core::SessionToolCallPage {
+            tool_calls: Vec::new(),
+            next_cursor: None,
+        },
+        schema_is_evidence_read_current,
+        move |conn| core_session_tool_calls_page(conn, &source, &session_id, limit, after.as_ref()),
+    )
+    .await
+    .map(|page| SessionToolCallsPage {
+        contract_version: SESSION_EVIDENCE_CONTRACT_VERSION,
+        source: page_source,
+        session_id: page_session_id,
+        tool_calls: page
+            .tool_calls
+            .into_iter()
+            .map(NativeSessionToolCall::from)
+            .collect(),
+        next_cursor: page.next_cursor.map(evidence_cursor),
+    })
+}
+
+/// One bounded page of recorded file edits for one session.
+#[napi]
+pub async fn get_session_file_edits_page(
+    source: String,
+    session_id: String,
+    options: Option<EvidencePageOptions>,
+) -> napi::Result<SessionFileEditsPage> {
+    let options = options.unwrap_or(EvidencePageOptions {
+        db_path: None,
+        limit: None,
+        after: None,
+    });
+    let source = validate_identity(source, "source")?;
+    let session_id = validate_identity(session_id, "sessionId")?;
+    let limit = validate_limit(options.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
+    let path = db_path(options.db_path);
+    let after = options.after.map(core_evidence_cursor);
+    let (page_source, page_session_id) = (source.clone(), session_id.clone());
+    read_database_with_schema(
+        path,
+        ai_hist_core::SessionFileEditPage {
+            file_edits: Vec::new(),
+            next_cursor: None,
+        },
+        schema_is_evidence_read_current,
+        move |conn| core_session_file_edits_page(conn, &source, &session_id, limit, after.as_ref()),
+    )
+    .await
+    .map(|page| SessionFileEditsPage {
+        contract_version: SESSION_EVIDENCE_CONTRACT_VERSION,
+        source: page_source,
+        session_id: page_session_id,
+        file_edits: page
+            .file_edits
+            .into_iter()
+            .map(NativeSessionFileEdit::from)
+            .collect(),
+        next_cursor: page.next_cursor.map(evidence_cursor),
+    })
 }
 
 /// Database statistics over already-indexed data.

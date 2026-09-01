@@ -20,6 +20,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add structured, paginated access to one session's recorded tool calls and
+  file edits: `getSessionToolCallsPage(source, sessionId, options?)` and
+  `getSessionFileEditsPage(source, sessionId, options?)`, the
+  `sessionToolCalls` / `sessionFileEdits` async iterators, and the
+  `getSessionToolCalls` / `getSessionFileEdits` collecting conveniences, plus
+  `ai-hist sessions tools` / `ai-hist sessions edits` and MCP
+  `get_session_tool_calls` / `get_session_file_edits`. Source and session ID
+  are both required so records from two providers that share a session ID
+  never mix, and a source outside the published `Source` set raises
+  `InvalidArgumentError` rather than reading as an empty session. The cursor is `{ tsMs: number | null; id: number }` because a
+  record may be indexed without a timestamp and undated records are ordered
+  last. `args` and `structuredPatch` are parsed JSON; an absent or unparseable
+  value is `null` and the raw string stays in `argsJson` /
+  `structuredPatchJson`; the same parse is exported as `parseStoredJson(raw)`
+  for callers holding a raw string of their own. A cursor going back in may
+  spell its undated tail either way — `tsMs: null` (what a page hands back) or
+  no `tsMs` at all (what a transport that drops nulls delivers) — so a printed
+  or serialized cursor always feeds back unedited. Pages carry session
+  evidence contract 1, and this advances the native-addon contract to 5.
 - Support remote acquisition through the engine's provider connectors:
   `discoverSessions`/`sync` with `scope: 'remote'` (and the remote half of
   `'all'`) run the claude.ai/code and Codex cloud connectors when the provider
