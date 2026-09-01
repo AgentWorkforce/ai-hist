@@ -79,7 +79,9 @@ large transcript. `getSessionEvents` is an explicit collecting convenience.
 Tool calls and file edits follow the same page / iterator / collect trio
 (`getSessionToolCallsPage`, `sessionToolCalls`, `getSessionToolCalls`, and the
 `...FileEdit...` equivalents), and take both a source and a session ID because
-provider session IDs are not unique across providers. Their cursor is
+provider session IDs are not unique across providers. The source is half of
+that identity, so one outside the `Source` set raises `InvalidArgumentError`
+instead of reading as an empty session. Their cursor is
 `{ tsMs: number | null, id: number }`: a record may be indexed without a
 timestamp, and undated records are ordered last. Feeding a cursor back in
 accepts either spelling of that tail — `tsMs: null` as emitted, or no `tsMs` at

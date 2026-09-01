@@ -14,7 +14,15 @@ export const SESSION_CATALOG_CONTRACT_VERSION = 2;
 export const SESSION_HYDRATION_CONTRACT_VERSION = 1;
 export const SESSION_EVIDENCE_CONTRACT_VERSION = 1;
 
-export type Source = 'claude' | 'codex' | 'cursor' | 'grok' | 'relay' | 'trajectory' | 'opencode';
+/**
+ * The provider ids this build knows, as a value. `Source` is derived from it
+ * so the runtime checks below and the compile-time type cannot drift apart,
+ * and it is the same list the MCP server's `SOURCE` enum publishes.
+ */
+const SOURCES = ['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode'] as const;
+const CATALOG_SOURCES: readonly string[] = SOURCES.filter((source) => source !== 'trajectory');
+
+export type Source = (typeof SOURCES)[number];
 export type CatalogSource = Exclude<Source, 'trajectory'>;
 export type SessionScope = 'local' | 'remote' | 'all';
 export type SessionLocation = Exclude<SessionScope, 'all'>;
@@ -624,9 +632,27 @@ function assertEvidenceContract(value: number): void {
   }
 }
 
+/**
+ * Both halves of an evidence page's identity, checked before the call.
+ *
+ * `source` is half of the identity here, not a filter that narrows a wider
+ * result, so an id this build has no provider for cannot mean "no rows" — it
+ * means the caller named something that does not exist, and an empty page
+ * would report that as an empty session. `hydrateSession` rejects the same
+ * mistake for the same reason.
+ */
 function evidenceIdentity(source: unknown, sessionId: unknown, operation: string): void {
   if (typeof source !== 'string' || source.trim() === '') {
     throw new InvalidArgumentError(`${operation} requires a source`, 'INVALID_ARGUMENT');
+  }
+  // Membership is asked of the trimmed id: whether a *padded* identity is
+  // acceptable is a separate question, and the native layer already answers it
+  // with its own wording for both halves.
+  if (!(SOURCES as readonly string[]).includes(source.trim())) {
+    throw new InvalidArgumentError(
+      `invalid source: ${source} (expected one of ${SOURCES.join(', ')})`,
+      'INVALID_ARGUMENT',
+    );
   }
   if (typeof sessionId !== 'string' || sessionId.trim() === '') {
     throw new InvalidArgumentError(`${operation} requires a sessionId`, 'INVALID_ARGUMENT');
@@ -711,7 +737,7 @@ export async function hydrateSession(options: HydrateSessionOptions): Promise<Hy
   if (!options || typeof options !== 'object') {
     throw new InvalidArgumentError('hydrateSession options are required', 'INVALID_ARGUMENT');
   }
-  if (!['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode'].includes(options.source)) {
+  if (!CATALOG_SOURCES.includes(options.source)) {
     throw new InvalidArgumentError(`invalid catalog source: ${String(options.source)}`, 'INVALID_ARGUMENT');
   }
   if (typeof options.sessionId !== 'string' || options.sessionId.trim() === '') {

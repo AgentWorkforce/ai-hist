@@ -32,7 +32,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   TypeScript SDK, `ai-hist sessions tools` and `ai-hist sessions edits`, and
   MCP `get_session_tool_calls` / `get_session_file_edits`. Every one of them
   requires both a source and a session ID, because provider session IDs
-  collide and evidence from two providers must never merge. Pages are keyset
+  collide and evidence from two providers must never merge; a source this
+  build has no provider for is rejected rather than answered with an empty
+  page. Pages are keyset
   paginated over `(ts_ms IS NULL, ts_ms, id)` — undated rows sort last and the
   cursor's `ts_ms` is nullable — and carry session evidence contract 1.
   File edit rows now also expose `message_id`, `structured_patch_json`,

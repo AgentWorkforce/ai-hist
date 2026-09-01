@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-hist sessions tools` / `ai-hist sessions edits` and MCP
   `get_session_tool_calls` / `get_session_file_edits`. Source and session ID
   are both required so records from two providers that share a session ID
-  never mix. The cursor is `{ tsMs: number | null; id: number }` because a
+  never mix, and a source outside the published `Source` set raises
+  `InvalidArgumentError` rather than reading as an empty session. The cursor is `{ tsMs: number | null; id: number }` because a
   record may be indexed without a timestamp and undated records are ordered
   last. `args` and `structuredPatch` are parsed JSON; an absent or unparseable
   value is `null` and the raw string stays in `argsJson` /

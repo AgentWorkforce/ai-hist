@@ -256,6 +256,36 @@ test('evidence pages read unknown sessions empty and require both identity parts
   }
 });
 
+test('an unsupported provider is rejected, not answered with an empty page', async () => {
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    // `source` is half the identity of an evidence page, so a provider this
+    // build does not know cannot honestly read as "this session recorded
+    // nothing" -- both page readers reject it the way hydrateSession does.
+    for (const source of ['claud', 'Claude', 'openai', 'sqlite']) {
+      for (const operation of [
+        () => getSessionToolCallsPage(source as never, SHARED_SESSION, { dbPath }),
+        () => getSessionFileEditsPage(source as never, SHARED_SESSION, { dbPath }),
+        () => getSessionToolCalls(source as never, SHARED_SESSION, { dbPath }),
+        () => getSessionFileEdits(source as never, SHARED_SESSION, { dbPath }),
+      ]) {
+        await assert.rejects(operation(), (error: unknown) => error instanceof InvalidArgumentError
+          && error.code === 'INVALID_ARGUMENT'
+          && error.message.includes(source));
+      }
+    }
+
+    // Every id the SDK does publish stays accepted, including `trajectory`,
+    // which the catalog excludes but evidence rows may carry.
+    for (const source of ['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode'] as const) {
+      assert.equal((await getSessionToolCallsPage(source, 'no-such-session', { dbPath })).source, source);
+      assert.equal((await getSessionFileEditsPage(source, 'no-such-session', { dbPath })).source, source);
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
 test('unparseable stored JSON yields null without discarding the raw string', () => {
   assert.deepEqual(parseStoredJson('{"a":1}'), { a: 1 });
   assert.equal(parseStoredJson('not json'), null);
