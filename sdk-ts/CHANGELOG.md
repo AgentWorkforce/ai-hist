@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Surface bounded OpenCode query and record counters through the typed SDK,
+- Surface bounded OpenCode provider-query and inspected-record counters through the typed SDK,
   CLI JSON, and MCP discovery result.
 - Add delegation topology APIs: `getSessionRelationships()`,
   `getSessionTree()`, and `getSessionChildrenPage()`, plus the

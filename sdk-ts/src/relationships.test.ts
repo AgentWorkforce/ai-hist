@@ -411,5 +411,17 @@ test('large trees stay bounded by the node budget', async () => {
     const page = await getSessionChildrenPage({ source: 'codex', sessionId: 'root', dbPath, limit: 100 });
     assert.equal(page.children.length, 100);
     assert.equal(page.nextCursor?.relationshipUid, 'child:child-099');
+
+    const walked: SessionTreeNode[] = [];
+    for await (const node of sessionDescendants({
+      source: 'codex', sessionId: 'root', dbPath, maxNodes: 50, pageLimit: 7,
+    })) {
+      walked.push(node);
+    }
+    assert.equal(walked.length, 49);
+    assert.deepEqual(
+      walked.map((node) => node.sessionId),
+      Array.from({ length: 49 }, (_, index) => `child-${String(index).padStart(3, '0')}`),
+    );
   });
 });
