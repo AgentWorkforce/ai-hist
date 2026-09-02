@@ -7,7 +7,7 @@ Notable changes to the native `ai-hist` CLI are documented here.
 ### Breaking
 
 - Add truthful OpenCode SQL work counters to discovery summaries. The catalog
-  contract is now 3 and the native-addon contract is now 5; `bytes_read` no
+  contract is now 3 and the native-addon contract is now 7; `bytes_read` no
   longer substitutes the OpenCode database file size, and summaries add
   `provider_queries` plus `records_inspected`.
 - Retire standalone Rust CLI release assets and the curl/source installer.
@@ -26,8 +26,41 @@ Notable changes to the native `ai-hist` CLI are documented here.
   prints a local command; JSON reports it as unavailable and readable mode
   exits with an explanation.
 
+- The native-addon contract also includes Claude subagent transcript identity
+  behavior: transcripts whose records carry an `agentId` are now indexed under
+  that child id instead
+  of the parent's. Hydration parser version 2 re-parses and heals existing
+  databases in place on the next `sessions hydrate`, moving those events —
+  along with the tool calls and file edits derived from them — from the parent
+  to the child rather than duplicating them, so a parent stops reporting a
+  delegated thread's actions as its own. The `session_relationships_v2` schema
+  marker is required, so the first read of an existing database is routed
+  through a writable open that migrates it.
+
 ### Added
 
+- Add first-class delegation topology. `session_relationships` gains an
+  identity status (`observed` or `unlinked`), child agent type, name, model and
+  spawn depth, the provider evidence that established the link (kind, file
+  locator, and native reference such as a Claude `toolUseId` or a Codex
+  `parent_thread_id`), the provider's spawn time, and whether the child's
+  events are independently addressable. Read it with the new
+  `getSessionRelationships`, `getSessionTree`, and `getSessionChildrenPage`
+  operations (session-relationship contract version 1), the
+  `ai-hist sessions relationships` and `ai-hist sessions tree` commands, or the
+  `get_session_relationships` and `get_session_tree` MCP tools. Traversal is
+  pre-order, deterministically ordered by `(spawned_at_ms, relationship_uid)`,
+  cycle-safe, and bounded by `max_depth` / `max_nodes`; a tree always contains
+  its root, and a repeated session reached along a second path is reported as a
+  cycle only when the edge points back into its own ancestry. Global `sync` now
+  records Codex delegation too — including a backfill for rollouts an earlier
+  version already ingested — so topology is queryable without targeted
+  hydration, and existing databases migrate automatically through the
+  `session_relationships_v2` marker. A full `sync` also treats a Claude
+  subagent sidecar as delegated evidence rather than a session: it records the
+  same observed row (or, for a sidechain the provider never named, the same
+  unlinked evidence) that targeted hydration records, keeps the child's output
+  under the child, and leaves the parent's own provider locator alone.
 - Add first-class structured access to a hydrated session's recorded tool
   calls and file edits: `session_tool_calls_page` / `session_file_edits_page`
   in the Rust engine, `getSessionToolCallsPage` / `getSessionFileEditsPage`
@@ -51,7 +84,7 @@ Notable changes to the native `ai-hist` CLI are documented here.
   page is read in order rather than sorted; existing databases add them, and
   drop the superseded `idx_tool_calls_page` / `idx_file_edits_page` and the
   now-redundant `idx_tool_calls_session` / `idx_file_edits_session`, on their
-  next writable open. The native-addon contract is now 5.
+  next writable open.
 - `ai-hist events --json` file-edit records additively carry `message_id`,
   `structured_patch_json`, `git_branch`, and `cwd`.
 - Add remote provider connectors behind the existing `--remote` / `--all`

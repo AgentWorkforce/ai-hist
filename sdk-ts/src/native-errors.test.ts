@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
-  DatabaseOpenError, InvalidArgumentError, NativeContractMismatchError, SessionNotFoundError,
+  DatabaseOpenError, InvalidArgumentError, NATIVE_CONTRACT_VERSION, NativeContractMismatchError,
+  SessionNotFoundError,
   UnsupportedOperationError, discoverSessions, getSessionFileEditsPage, getSessionToolCallsPage,
   hydrateSession, listSessionCatalogPage, recent, stats, sync,
   validateNativeContract, validateNativeLocation, validateNativeScope,
@@ -51,7 +52,7 @@ test('SDK/native contract mismatch is actionable', () => {
     () => validateNativeContract(999),
     (error: unknown) => error instanceof NativeContractMismatchError
       && error.code === 'NATIVE_CONTRACT_MISMATCH'
-      && /requires native contract 5/.test(error.message),
+      && error.message.includes(`requires native contract ${NATIVE_CONTRACT_VERSION}`),
   );
   assert.throws(
     () => validateNativeScope('cloud'),

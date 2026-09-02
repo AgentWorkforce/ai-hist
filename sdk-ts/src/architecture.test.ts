@@ -52,6 +52,31 @@ test('MCP session operations expose scope and acquisition is declared open-world
   }
 });
 
+test('identity-addressed MCP tools are read-only and take no scope', async () => {
+  const mcp = await readFile(join(sourceDir, 'mcp-server.ts'), 'utf8');
+  for (const tool of ['get_session', 'get_session_events', 'get_session_relationships', 'get_session_tree']) {
+    const start = mcp.indexOf(`server.tool('${tool}'`);
+    assert.notEqual(start, -1, `${tool} is registered`);
+    const end = mcp.indexOf("server.tool('", start + 13);
+    const registration = mcp.slice(start, end === -1 ? undefined : end);
+    assert.match(registration, /READ/, `${tool} is a read-only tool`);
+    assert.doesNotMatch(registration, /SESSION_SCOPE/, `${tool} addresses a session by identity`);
+  }
+});
+
+test('native topology enums are validated rather than cast', async () => {
+  const source = await readFile(join(sourceDir, 'index.ts'), 'utf8');
+  const start = source.indexOf('function relationship(value: UnknownRecord)');
+  assert.notEqual(start, -1, 'the relationship normalizer exists');
+  const body = source.slice(start, source.indexOf('\n}', start));
+  // An out-of-contract value must reach a caller as a contract mismatch, not
+  // as a lie about the shape of the typed API.
+  assert.match(body, /source: catalogSource\(value\.source\)/);
+  assert.match(body, /relationship: relationshipType\(value\.relationship\)/);
+  assert.match(body, /identityStatus: identityStatus\(value\.identityStatus\)/);
+  assert.doesNotMatch(body, /as CatalogSource|as RelationshipType|as IdentityStatus/);
+});
+
 test('MCP evidence tools require both halves of a session identity', async () => {
   const mcp = await readFile(join(sourceDir, 'mcp-server.ts'), 'utf8');
   for (const tool of ['get_session_tool_calls', 'get_session_file_edits']) {

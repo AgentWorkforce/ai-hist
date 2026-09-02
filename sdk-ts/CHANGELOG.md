@@ -9,9 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
-- Advance the native-addon contract to 5 and the session-catalog contract to
+- Advance the native-addon contract to 7 and the session-catalog contract to
   3. Discovery counters add `providerQueries` and `recordsInspected`; OpenCode
-  no longer reports its database file size as `bytesRead`.
+  no longer reports its database file size as `bytesRead`. The native contract
+  also includes the delegation topology additions below.
 - Replace the synchronous `openAiHist()`/`AiHist` snapshot API with top-level
   async native-backed functions.
 - Remove `sql.js`, JSONL/trajectory fallback scanners, CLI subprocess bridges,
@@ -20,11 +21,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   either operation.
 - Make session-event pagination the primitive API and ship the public
   `ai-hist` Node CLI from this package.
+- Add Claude subagent identity behavior to the native contract. Subagent
+  transcripts whose records carry an `agentId` are indexed under that child id,
+  so their events — and the tool calls and file edits derived from them — move
+  off the parent on the next `hydrateSession`.
 
 ### Added
 
 - Surface bounded OpenCode query and record counters through the typed SDK,
   CLI JSON, and MCP discovery result.
+- Add delegation topology APIs: `getSessionRelationships()`,
+  `getSessionTree()`, and `getSessionChildrenPage()`, plus the
+  `sessionDescendants()` and `sessionEventsIncludingDescendants()` async
+  iterators. Every event `sessionEventsIncludingDescendants()` yields keeps the
+  `sessionId` of the session that produced it; a child's event is never
+  rewritten as the parent's. New exported types: `SessionRelationship`,
+  `RelationshipCapabilities`, `RelationshipDiagnostic`, `SessionRelationships`,
+  `SessionTree`, `SessionTreeNode`, `SessionChildrenPage`,
+  `RelationshipCursor`, `RelationshipType`, `IdentityStatus`,
+  `StableChildIdentity`, `GetSessionRelationshipsOptions`,
+  `GetSessionTreeOptions`, `GetSessionChildrenPageOptions`,
+  `SessionDescendantsOptions`, `DescendantEventsOptions`, and the
+  `SESSION_RELATIONSHIP_CONTRACT_VERSION` constant. Results report
+  `identityStatus` and `capabilities.stableChildIdentity` instead of
+  synthesizing a child identity the provider never recorded. `getSessionTree()`
+  always returns the root as `nodes[0]`, including for a session with no
+  recorded delegation and for a database that does not exist yet.
+- Add the SDK-only `sessions relationships` and `sessions tree` CLI commands
+  and the read-only `get_session_relationships` and `get_session_tree` MCP
+  tools. Both address a session by identity and take no scope.
 - Add structured, paginated access to one session's recorded tool calls and
   file edits: `getSessionToolCallsPage(source, sessionId, options?)` and
   `getSessionFileEditsPage(source, sessionId, options?)`, the
@@ -43,7 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spell its undated tail either way — `tsMs: null` (what a page hands back) or
   no `tsMs` at all (what a transport that drops nulls delivers) — so a printed
   or serialized cursor always feeds back unedited. Pages carry session
-  evidence contract 1, and this advances the native-addon contract to 5.
+  evidence contract 1.
+
 - Support remote acquisition through the engine's provider connectors:
   `discoverSessions`/`sync` with `scope: 'remote'` (and the remote half of
   `'all'`) run the claude.ai/code and Codex cloud connectors when the provider

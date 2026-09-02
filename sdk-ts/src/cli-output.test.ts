@@ -119,6 +119,106 @@ test('sessions hydrate uses the SDK contract and is idempotent', async () => {
   }
 });
 
+test('sessions relationships and sessions tree render topology in both modes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-topology-'));
+  const home = join(root, 'home');
+  const day = join(home, '.codex', 'sessions', '2026', '08', '31');
+  const db = join(root, 'history.db');
+  await mkdir(day, { recursive: true });
+  const rollout = (id: string, at: string, parent?: string) => [
+    JSON.stringify({
+      timestamp: at, type: 'session_meta',
+      payload: parent === undefined
+        ? { id, cwd: '/work/app' }
+        : {
+          id, cwd: '/work/app', session_id: parent, parent_thread_id: parent,
+          thread_source: 'subagent', source: { subagent: { other: 'guardian' } },
+        },
+    }),
+    JSON.stringify({ timestamp: at, type: 'event_msg', payload: { type: 'user_message', message: `${id} prompt` } }),
+    JSON.stringify({ timestamp: at, type: 'event_msg', payload: { type: 'agent_message', message: `${id} answer` } }),
+    '',
+  ].join('\n');
+  await writeFile(join(day, 'rollout-topology-root.jsonl'), rollout('topology-root', '2026-08-31T10:00:00Z'));
+  await writeFile(join(day, 'rollout-topology-child.jsonl'), rollout('topology-child', '2026-08-31T10:00:01Z', 'topology-root'));
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  try {
+    await run(process.execPath, [cli, 'sessions', 'discover', '--source', 'codex', '--db', db, '--no-warning'], { env });
+    await run(process.execPath, [cli, 'sessions', 'hydrate', 'codex', 'topology-root', '--db', db, '--no-warning'], { env });
+
+    const relationships = await run(process.execPath, [
+      cli, 'sessions', 'relationships', 'codex', 'topology-root', '--db', db, '--json', '--no-warning',
+    ], { env });
+    const wire = JSON.parse(relationships.stdout) as Record<string, unknown>;
+    assert.equal(wire.contract_version, 1);
+    assert.equal(wire.session_id, 'topology-root');
+    assert.deepEqual(wire.as_child, []);
+    const [edge] = wire.as_parent as Array<Record<string, unknown>>;
+    assert.equal(edge.child_session_id, 'topology-child');
+    assert.equal(edge.identity_status, 'observed');
+    assert.equal(edge.child_has_events, true);
+    assert.equal(edge.relationship_uid, 'child:topology-child');
+    assert.equal((wire.capabilities as Record<string, unknown>).stable_child_identity, 'always');
+
+    const readable = await run(process.execPath, [
+      cli, 'sessions', 'relationships', 'codex', 'topology-root', '--db', db, '--no-warning',
+    ], { env });
+    assert.match(readable.stdout, /codex\/topology-root: 1 child relationship\(s\), 0 parent relationship\(s\)/);
+    assert.match(readable.stdout, /child {2}topology-child {2}delegated {2}guardian/);
+    assert.match(readable.stdout, /identity=observed/);
+    assert.match(readable.stdout, /capability: stable child identity = always/);
+
+    const empty = await run(process.execPath, [
+      cli, 'sessions', 'relationships', 'codex', 'topology-child', '--db', db, '--no-warning',
+    ], { env });
+    assert.match(empty.stdout, /codex\/topology-child: 0 child relationship\(s\), 1 parent relationship\(s\)/);
+    assert.match(empty.stdout, /parent {2}topology-root/);
+
+    const treeJson = await run(process.execPath, [
+      cli, 'sessions', 'tree', 'codex', 'topology-root', '--db', db, '--json', '--no-warning',
+    ], { env });
+    const tree = JSON.parse(treeJson.stdout) as Record<string, unknown>;
+    assert.equal(tree.root_session_id, 'topology-root');
+    assert.equal(tree.truncated, false);
+    assert.deepEqual((tree.nodes as Array<Record<string, unknown>>).map((node) => node.session_id), [
+      'topology-root', 'topology-child',
+    ]);
+
+    const treeHuman = await run(process.execPath, [
+      cli, 'sessions', 'tree', 'codex', 'topology-root', '--max-depth', '4', '--db', db, '--no-warning',
+    ], { env });
+    assert.match(treeHuman.stdout, /^topology-root\n {2}topology-child {2}\[delegated guardian] {2}events=yes\n1 descendant\(s\), max depth 1\n$/);
+
+    // A tree always contains its root, so a session with no recorded
+    // delegation renders as itself rather than as nothing at all.
+    const lone = await run(process.execPath, [
+      cli, 'sessions', 'tree', 'codex', 'topology-child', '--db', db, '--no-warning',
+    ], { env });
+    assert.match(lone.stdout, /^topology-child\n0 descendant\(s\), max depth 0\n$/);
+
+    // A budget that stops the walk is worth saying out loud: the readable
+    // tree prints the same diagnostics the JSON form carries.
+    const bounded = await run(process.execPath, [
+      cli, 'sessions', 'tree', 'codex', 'topology-root', '--max-nodes', '1', '--db', db, '--no-warning',
+    ], { env });
+    assert.match(
+      bounded.stdout,
+      /^topology-root {2}…\n0 descendant\(s\), max depth 0\nRELATIONSHIP_TREE_TRUNCATED: tree exceeded max_nodes=1\ntruncated: node\/depth budget reached\n$/,
+    );
+
+    await assert.rejects(
+      run(process.execPath, [
+        cli, 'sessions', 'tree', 'codex', 'topology-root', '--max-depth', '0', '--db', db, '--no-warning',
+      ], { env }),
+      (error: unknown) => typeof error === 'object' && error !== null
+        && 'code' in error && error.code === 1
+        && 'stderr' in error && String(error.stderr).includes('INVALID_ARGUMENT'),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('sessions tools and edits page versioned JSON and continue from a cursor', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-evidence-'));
   const home = join(root, 'home');
@@ -261,6 +361,23 @@ test('sessions tools and edits page versioned JSON and continue from a cursor', 
     );
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('topology commands require SOURCE and SESSION_ID and reject location scope', async () => {
+  for (const subcommand of ['relationships', 'tree']) {
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions', subcommand, '--no-warning']),
+      (error: unknown) => isUsageFailure(error, `sessions ${subcommand} requires SOURCE and SESSION_ID`),
+    );
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions', subcommand, 'codex', 'root', 'extra', '--no-warning']),
+      (error: unknown) => isUsageFailure(error, 'does not accept positional argument'),
+    );
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions', subcommand, 'codex', 'root', '--remote', '--no-warning']),
+      (error: unknown) => isUsageFailure(error, 'does not accept --local, --remote, or --all'),
+    );
   }
 });
 

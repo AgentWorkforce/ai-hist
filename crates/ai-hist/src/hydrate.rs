@@ -6,7 +6,10 @@ use serde::Serialize;
 use std::time::Instant;
 
 pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 1;
-const HYDRATION_PARSER_VERSION: i64 = 1;
+/// Bumped to 2 when Claude subagent transcripts that carry an `agentId`
+/// started being indexed under that child id: existing databases re-parse once
+/// and the earlier parent-attributed rows are healed in place.
+const HYDRATION_PARSER_VERSION: i64 = 2;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -65,6 +68,9 @@ struct SourceSnapshot {
     bytes: i64,
     records: i64,
     path: Option<PathBuf>,
+    /// Claude subagent sidecars, parsed once while stamping the source so the
+    /// ingestion pass does not walk and re-parse the same files.
+    claude_subagents: Vec<ClaudeSubagentEvidence>,
 }
 
 fn hydration_error(code: &str, message: impl std::fmt::Display) -> anyhow::Error {
@@ -123,7 +129,13 @@ fn hydrate_session_at_with_home(
     // has a provider-native uniqueness key, so interruption followed by retry is
     // safe for both new and growing sessions.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    ingest_selected(&tx, options, &target, snapshot.path.as_deref())?;
+    ingest_selected(
+        &tx,
+        options,
+        &target,
+        snapshot.path.as_deref(),
+        &snapshot.claude_subagents,
+    )?;
     tx.execute(
         "UPDATE sessions SET discovery_state = 'full', source_stamp = ?, parser_version = ? \
          WHERE source = ? AND session_id = ?",
@@ -305,6 +317,7 @@ fn source_snapshot(
             // complete `part` table on older stores missing its usual index.
             records: 0,
             path: Some(path),
+            claude_subagents: Vec::new(),
         });
     }
 
@@ -332,12 +345,23 @@ fn source_snapshot(
     } else {
         file_stamp(&path)?
     };
+    let mut subagents = Vec::new();
     if options.source == "claude" && options.include_related {
-        for sidecar in claude_sidecars(&path, &options.session_id)? {
+        subagents = claude_subagents(&path, &options.session_id)?;
+        for evidence in &subagents {
             stamp.push('|');
-            stamp.push_str(&file_stamp(&sidecar)?);
-            bytes += sidecar.metadata()?.len() as i64;
-            records += complete_jsonl_records(&sidecar)?;
+            stamp.push_str(&file_stamp(&evidence.path)?);
+            bytes += evidence.path.metadata()?.len() as i64;
+            records += complete_jsonl_records(&evidence.path)?;
+            // The metadata sidecar describes the child — its type, model and
+            // spawn depth, and the tool use that started it — so a sidecar
+            // that arrives or changes on its own is still new evidence.
+            let metadata = claude_subagent_meta_path(&evidence.path);
+            if metadata.is_file() {
+                stamp.push('|');
+                stamp.push_str(&file_stamp(&metadata)?);
+                bytes += metadata.metadata()?.len() as i64;
+            }
         }
     }
     if options.source == "codex" && options.include_related {
@@ -353,6 +377,7 @@ fn source_snapshot(
         bytes,
         records,
         path: Some(path),
+        claude_subagents: subagents,
     })
 }
 
@@ -406,9 +431,10 @@ fn ingest_selected(
     options: &HydrateSessionOptions,
     target: &CatalogTarget,
     path: Option<&Path>,
+    claude_subagents: &[ClaudeSubagentEvidence],
 ) -> Result<()> {
     match options.source.as_str() {
-        "claude" => ingest_claude(conn, options, path.unwrap()),
+        "claude" => ingest_claude(conn, options, path.unwrap(), claude_subagents),
         "codex" => ingest_codex(conn, options, path.unwrap()),
         "cursor" => ingest_cursor(conn, options, target, path.unwrap()),
         "grok" => ingest_grok(conn, options, path.unwrap()),
@@ -423,7 +449,12 @@ fn ingest_selected(
     }
 }
 
-fn ingest_claude(conn: &Connection, options: &HydrateSessionOptions, path: &Path) -> Result<()> {
+fn ingest_claude(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    path: &Path,
+    subagents: &[ClaudeSubagentEvidence],
+) -> Result<()> {
     let meta = scan_claude_session_file(path)?.ok_or_else(|| {
         hydration_error(
             "SESSION_SOURCE_MISMATCH",
@@ -448,28 +479,191 @@ fn ingest_claude(conn: &Connection, options: &HydrateSessionOptions, path: &Path
         Some(&path.to_string_lossy()),
     )?;
     ingest_claude_transcript(conn, path)?;
-    if options.include_related {
-        for sidecar in claude_sidecars(path, &options.session_id)? {
-            ingest_claude_transcript(conn, &sidecar)?;
-        }
+    // The snapshot already walked and parsed these sidecars to stamp them, so
+    // this pass indexes that evidence instead of finding it a second time.
+    for evidence in subagents {
+        ingest_claude_subagent(conn, &options.session_id, evidence)?;
     }
     Ok(())
 }
 
-fn claude_sidecars(path: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
-    let Some(directory) = path.parent() else {
+/// Index one Claude subagent transcript and record what established it.
+///
+/// With an `agentId` the child is a session in its own right: its events are
+/// stored under that id so they stay independently addressable, and the id is
+/// kept out of the catalog because a delegated thread is not a human session.
+/// Without one this provider version simply does not name the child, so the
+/// sidechain assistant output stays on the parent exactly as before and the
+/// row records unlinked evidence rather than a fabricated identity.
+///
+/// Shared with the full sync walk, which meets the same sidecars from the
+/// other direction: one sidecar produces the same events and the same
+/// `session_relationships` row whichever path reaches it first, and the row
+/// is an idempotent upsert so the path that arrives second changes nothing.
+pub(crate) fn ingest_claude_subagent(
+    conn: &Connection,
+    parent_session_id: &str,
+    evidence: &ClaudeSubagentEvidence,
+) -> Result<()> {
+    let locator = evidence.path.to_string_lossy().to_string();
+    match evidence.agent_id.as_deref() {
+        Some(agent_id) => {
+            ingest_claude_transcript_as(conn, &evidence.path, Some(agent_id))?;
+            cleanup_subagent_registration(conn, "claude", agent_id)?;
+            record_relationship(
+                conn,
+                &ObservedRelationship {
+                    source: "claude",
+                    parent_session_id,
+                    child_session_id: Some(agent_id),
+                    relationship: "delegated",
+                    child_agent_type: evidence.agent_type.as_deref(),
+                    child_agent_name: evidence.description.as_deref(),
+                    child_model: evidence.model.as_deref(),
+                    spawn_depth: evidence.spawn_depth,
+                    evidence_kind: "claude_subagent_meta",
+                    evidence_locator: Some(&locator),
+                    evidence_ref: evidence.tool_use_id.as_deref(),
+                    child_has_events: session_events_exist(conn, "claude", agent_id)?,
+                    spawned_at_ms: evidence.first_ts_ms,
+                },
+            )
+        }
+        None => {
+            ingest_claude_transcript_as(conn, &evidence.path, None)?;
+            record_relationship(
+                conn,
+                &ObservedRelationship {
+                    source: "claude",
+                    parent_session_id,
+                    child_session_id: None,
+                    relationship: "delegated",
+                    child_agent_type: evidence.agent_type.as_deref(),
+                    child_agent_name: evidence.description.as_deref(),
+                    child_model: evidence.model.as_deref(),
+                    spawn_depth: evidence.spawn_depth,
+                    evidence_kind: "claude_sidechain_records",
+                    evidence_locator: Some(&locator),
+                    evidence_ref: evidence.tool_use_id.as_deref(),
+                    child_has_events: false,
+                    spawned_at_ms: evidence.first_ts_ms,
+                },
+            )
+        }
+    }
+}
+
+/// One Claude subagent transcript beside a parent's, with whatever identity
+/// and description the provider recorded for it.
+#[derive(Debug)]
+pub(crate) struct ClaudeSubagentEvidence {
+    path: PathBuf,
+    /// The in-record `agentId`. `None` for provider versions that do not emit
+    /// it.
+    agent_id: Option<String>,
+    agent_type: Option<String>,
+    description: Option<String>,
+    model: Option<String>,
+    spawn_depth: Option<i64>,
+    tool_use_id: Option<String>,
+    first_ts_ms: Option<i64>,
+}
+
+/// Read one subagent sidecar's delegation evidence.
+///
+/// `meta` is the scan of this same file, whose `agent_id` is the child's
+/// identity as the provider recorded it: the file name embeds the same id,
+/// but a name is not evidence, and deriving an identity from it would invent
+/// one for provider versions that never recorded any. Everything else the
+/// delegation is described by comes from the sibling
+/// `agent-<agentId>.meta.json`, or from the transcript's first record when
+/// that sidecar does not exist.
+pub(crate) fn claude_subagent_evidence(
+    path: PathBuf,
+    meta: &ClaudeSessionMeta,
+) -> ClaudeSubagentEvidence {
+    let first = first_claude_record(&path);
+    let record_str = |key: &str| {
+        first
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let sidecar = claude_subagent_meta(&path);
+    let meta_str = |key: &str| {
+        sidecar
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    ClaudeSubagentEvidence {
+        agent_id: meta.agent_id.clone(),
+        agent_type: meta_str("agentType").or_else(|| record_str("attributionAgent")),
+        description: meta_str("description"),
+        model: meta_str("model"),
+        spawn_depth: sidecar
+            .as_ref()
+            .and_then(|value| value.get("spawnDepth"))
+            .and_then(Value::as_i64),
+        tool_use_id: meta_str("toolUseId"),
+        first_ts_ms: first.as_ref().and_then(|value| {
+            value
+                .get("timestamp")
+                .and_then(|ts| ts.as_str().and_then(parse_iso_ms).or_else(|| ts.as_i64()))
+        }),
+        path,
+    }
+}
+
+/// Every subagent transcript belonging to one parent session.
+///
+/// `collect_matching_files` is recursive, so this reaches both the flat
+/// `agent-*.jsonl` layout and `<parentSessionId>/subagents/agent-*.jsonl`, and
+/// returns them sorted by path so ingestion is deterministic.
+fn claude_subagents(transcript: &Path, session_id: &str) -> Result<Vec<ClaudeSubagentEvidence>> {
+    let Some(directory) = transcript.parent() else {
         return Ok(Vec::new());
     };
-    Ok(collect_matching_files(directory, "agent-", "jsonl")?
-        .into_iter()
-        .filter(|candidate| candidate != path)
-        .filter(|candidate| {
-            scan_claude_session_file(candidate)
-                .ok()
-                .flatten()
-                .is_some_and(|meta| meta.session_id == session_id)
-        })
-        .collect())
+    let mut evidence = Vec::new();
+    for candidate in collect_matching_files(directory, "agent-", "jsonl")? {
+        if candidate == transcript {
+            continue;
+        }
+        // A subagent transcript's records carry the PARENT's sessionId, which
+        // is what ties this file to the session being hydrated.
+        let Some(meta) = scan_claude_session_file(&candidate).ok().flatten() else {
+            continue;
+        };
+        if meta.session_id != session_id {
+            continue;
+        }
+        evidence.push(claude_subagent_evidence(candidate, &meta));
+    }
+    Ok(evidence)
+}
+
+fn first_claude_record(path: &Path) -> Option<Value> {
+    let text = fs::read_to_string(path).ok()?;
+    text.lines()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+}
+
+/// Where the `agent-<agentId>.meta.json` sidecar sits beside a subagent
+/// transcript. The provider version that writes one names it after the
+/// transcript, so the path is derived rather than searched for.
+pub(crate) fn claude_subagent_meta_path(transcript: &Path) -> PathBuf {
+    transcript.with_extension("meta.json")
+}
+
+/// The `agent-<agentId>.meta.json` sidecar beside a subagent transcript, when
+/// the provider version writes one.
+fn claude_subagent_meta(transcript: &Path) -> Option<Value> {
+    let path = claude_subagent_meta_path(transcript);
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
 fn ingest_codex(conn: &Connection, options: &HydrateSessionOptions, path: &Path) -> Result<()> {
@@ -517,13 +711,7 @@ fn ingest_codex_children(
         ingest_codex_rollout(conn, &candidate, &meta)?;
         cleanup_codex_subagent_history(conn, &meta.session_id)?;
         cleanup_codex_subagent_registration(conn, &meta.session_id)?;
-        conn.execute(
-            "INSERT INTO session_relationships \
-             (source, parent_session_id, child_session_id, relationship, created_ms) \
-             VALUES ('codex', ?, ?, 'delegated', ?) \
-             ON CONFLICT(source, parent_session_id, child_session_id) DO NOTHING",
-            params![options.session_id, meta.session_id, now_ms()],
-        )?;
+        record_codex_delegation(conn, &options.session_id, &meta, &candidate)?;
     }
     Ok(())
 }
@@ -628,6 +816,20 @@ fn build_result(
             (None, value) | (value, None) => value,
         })
     })?;
+    let mut diagnostics = vec![HydrationDiagnostic {
+        code: "HYDRATION_METRICS".to_string(),
+        message: "targeted provider evidence acquisition completed".to_string(),
+        duration_ms: Some(duration_ms),
+        source_bytes: Some(snapshot.bytes),
+        records_parsed: Some(snapshot.records),
+    }];
+    if options.include_related {
+        diagnostics.extend(unlinked_diagnostics(
+            conn,
+            &options.source,
+            &options.session_id,
+        )?);
+    }
     Ok(HydrateSessionResult {
         contract_version: SESSION_HYDRATION_CONTRACT_VERSION,
         source: options.source.clone(),
@@ -641,13 +843,7 @@ fn build_result(
         },
         evidence,
         related_session_ids,
-        diagnostics: vec![HydrationDiagnostic {
-            code: "HYDRATION_METRICS".to_string(),
-            message: "targeted provider evidence acquisition completed".to_string(),
-            duration_ms: Some(duration_ms),
-            source_bytes: Some(snapshot.bytes),
-            records_parsed: Some(snapshot.records),
-        }],
+        diagnostics,
     })
 }
 
@@ -655,10 +851,46 @@ fn related_ids(conn: &Connection, source: &str, session_id: &str) -> Result<Vec<
     Ok(conn
         .prepare(
             "SELECT child_session_id FROM session_relationships \
-             WHERE source = ? AND parent_session_id = ? ORDER BY child_session_id",
+             WHERE source = ? AND parent_session_id = ? AND child_session_id IS NOT NULL \
+             ORDER BY child_session_id",
         )?
         .query_map(params![source, session_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Related evidence this session's provider recorded without naming the child.
+///
+/// Reported as diagnostics rather than as related session ids: there is no id
+/// to hand back, and the caller needs to know the evidence exists and where
+/// its events actually live.
+fn unlinked_diagnostics(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<Vec<HydrationDiagnostic>> {
+    Ok(conn
+        .prepare(
+            "SELECT evidence_locator FROM session_relationships \
+             WHERE source = ? AND parent_session_id = ? AND child_session_id IS NULL \
+             ORDER BY relationship_uid",
+        )?
+        .query_map(params![source, session_id], |row| {
+            row.get::<_, Option<String>>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|locator| HydrationDiagnostic {
+            code: "RELATIONSHIP_UNLINKED_CHILD".to_string(),
+            message: format!(
+                "{source} related evidence at {} has no stable child identity; \
+                 its events remain attributed to the parent",
+                locator.as_deref().unwrap_or("unknown"),
+            ),
+            duration_ms: None,
+            source_bytes: None,
+            records_parsed: None,
+        })
+        .collect())
 }
 
 fn evidence_counts(
@@ -694,13 +926,6 @@ fn max_event_time(conn: &Connection, source: &str, session_id: &str) -> Result<O
         params![source, session_id],
         |row| row.get(0),
     )?)
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 #[cfg(test)]
@@ -955,7 +1180,7 @@ mod tests {
         fs::write(
             &child,
             concat!(
-                "{\"timestamp\":\"2026-08-31T10:00:03Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"session_id\":\"root\",\"cwd\":\"/work/app\",\"thread_source\":\"subagent\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:03Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"session_id\":\"root\",\"parent_thread_id\":\"root\",\"cwd\":\"/work/app\",\"thread_source\":\"subagent\",\"source\":{\"subagent\":{\"other\":\"guardian\"}}}}\n",
                 "{\"timestamp\":\"2026-08-31T10:00:04Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"delegated task\"}}\n",
                 "{\"timestamp\":\"2026-08-31T10:00:05Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"child answer\"}}\n",
             ),
@@ -1000,6 +1225,661 @@ mod tests {
             )
             .unwrap();
         assert_eq!(child_catalog, 0);
+        let relationship: (String, String, String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT identity_status, evidence_kind, evidence_locator, child_agent_type, spawned_at_ms \
+                 FROM session_relationships WHERE source='codex' AND child_session_id='child'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(relationship.0, "observed");
+        assert_eq!(relationship.1, "codex_session_meta");
+        assert_eq!(relationship.2, child.to_string_lossy());
+        assert_eq!(relationship.3.as_deref(), Some("guardian"));
+        assert!(relationship.4.is_some());
+    }
+
+    #[test]
+    fn codex_child_prompts_are_not_human_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/08/31");
+        fs::create_dir_all(&day).unwrap();
+        let root = day.join("rollout-root.jsonl");
+        fs::write(
+            &root,
+            concat!(
+                "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"root\",\"cwd\":\"/work/app\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"root prompt\"}}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            day.join("rollout-child.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-08-31T10:00:03Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"session_id\":\"root\",\"cwd\":\"/work/app\",\"thread_source\":\"subagent\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:04Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"delegated task\"}}\n",
+            ),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "codex", "root", Some(&root));
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        let counts: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM history WHERE source='codex' AND session_id='child'), \
+                   (SELECT COUNT(*) FROM sessions WHERE source='codex' AND session_id='child'), \
+                   (SELECT COUNT(*) FROM history WHERE source='codex' AND session_id='root')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0, 1));
+    }
+
+    /// A parent transcript plus one subagent transcript under
+    /// `<sessionId>/subagents/`, in the layout the provider actually writes.
+    fn claude_parent_with_subagent(
+        home: &Path,
+        agent_records: &str,
+        agent_meta: Option<&str>,
+        stem: &str,
+    ) -> PathBuf {
+        let transcript = home.join(".claude/projects/app/session-1.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"sessionId\":\"session-1\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"first prompt\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+                "{\"sessionId\":\"session-1\",\"uuid\":\"a1\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Agent\",\"input\":{\"prompt\":\"plan it\"}}]},\"timestamp\":\"2026-08-31T10:00:01Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let subagents = home.join(".claude/projects/app/session-1/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(subagents.join(format!("{stem}.jsonl")), agent_records).unwrap();
+        if let Some(meta) = agent_meta {
+            fs::write(subagents.join(format!("{stem}.meta.json")), meta).unwrap();
+        }
+        transcript
+    }
+
+    const CLAUDE_AGENT_RECORDS: &str = concat!(
+        "{\"sessionId\":\"session-1\",\"agentId\":\"abc\",\"isSidechain\":true,\"uuid\":\"side-u\",\"cwd\":\"/work/app\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"delegated instruction\"},\"timestamp\":\"2026-08-31T10:00:02Z\"}\n",
+        "{\"sessionId\":\"session-1\",\"agentId\":\"abc\",\"isSidechain\":true,\"uuid\":\"side-a\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"child result\"},\"timestamp\":\"2026-08-31T10:00:03Z\"}\n",
+    );
+    const CLAUDE_AGENT_META: &str = "{\"agentType\":\"Plan\",\"description\":\"plan the work\",\"toolUseId\":\"toolu_1\",\"spawnDepth\":1,\"model\":\"opus\"}";
+
+    struct LinkedChild {
+        identity_status: String,
+        agent_type: Option<String>,
+        agent_name: Option<String>,
+        model: Option<String>,
+        spawn_depth: Option<i64>,
+        evidence_ref: Option<String>,
+        has_events: bool,
+    }
+
+    #[test]
+    fn claude_subagent_with_agent_id_is_a_linked_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = claude_parent_with_subagent(
+            dir.path(),
+            CLAUDE_AGENT_RECORDS,
+            Some(CLAUDE_AGENT_META),
+            "agent-abc",
+        );
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        assert_eq!(result.related_session_ids, vec!["abc"]);
+
+        let conn = open_db(&db).unwrap();
+        let row = conn
+            .query_row(
+                "SELECT identity_status, child_agent_type, child_agent_name, child_model, \
+                        spawn_depth, evidence_ref, child_has_events \
+                 FROM session_relationships WHERE source='claude' AND child_session_id='abc'",
+                [],
+                |row| {
+                    Ok(LinkedChild {
+                        identity_status: row.get(0)?,
+                        agent_type: row.get(1)?,
+                        agent_name: row.get(2)?,
+                        model: row.get(3)?,
+                        spawn_depth: row.get(4)?,
+                        evidence_ref: row.get(5)?,
+                        has_events: row.get(6)?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(row.identity_status, "observed");
+        assert_eq!(row.agent_type.as_deref(), Some("Plan"));
+        assert_eq!(row.agent_name.as_deref(), Some("plan the work"));
+        assert_eq!(row.model.as_deref(), Some("opus"));
+        assert_eq!(row.spawn_depth, Some(1));
+        assert_eq!(row.evidence_ref.as_deref(), Some("toolu_1"));
+        assert!(row.has_events);
+
+        // The child's own output is addressable under the child, its
+        // delegated instruction is nobody's human prompt, and a delegated
+        // thread never becomes a session of its own.
+        let counts: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='abc'), \
+                   (SELECT COUNT(*) FROM history WHERE source='claude' AND session_id='abc'), \
+                   (SELECT COUNT(*) FROM sessions WHERE source='claude' AND session_id='abc'), \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='session-1' AND event_uid LIKE 'side-%')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 0, 0, 0));
+    }
+
+    #[test]
+    fn claude_sidechain_without_agent_id_stays_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = concat!(
+            "{\"sessionId\":\"session-1\",\"isSidechain\":true,\"uuid\":\"side-u\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"delegated instruction\"},\"timestamp\":\"2026-08-31T10:00:02Z\"}\n",
+            "{\"sessionId\":\"session-1\",\"isSidechain\":true,\"uuid\":\"side-a\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"side result\"},\"timestamp\":\"2026-08-31T10:00:03Z\"}\n",
+        );
+        let transcript = claude_parent_with_subagent(dir.path(), records, None, "agent-child");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        assert!(result.related_session_ids.is_empty());
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RELATIONSHIP_UNLINKED_CHILD"));
+
+        let conn = open_db(&db).unwrap();
+        let row: (String, i64, i64) = conn
+            .query_row(
+                "SELECT identity_status, child_session_id IS NULL, child_has_events \
+                 FROM session_relationships WHERE source='claude' AND parent_session_id='session-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("unlinked".to_string(), 1, 0));
+        // The subagent's assistant output stays on the parent, where it is
+        // the only place it can be addressed.
+        let parent_side_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE source='claude' AND session_id='session-1' AND event_uid = 'side-a:0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_side_events, 1);
+    }
+
+    #[test]
+    fn claude_child_identity_is_never_taken_from_the_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = "{\"sessionId\":\"session-1\",\"isSidechain\":true,\"uuid\":\"side-a\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"side result\"},\"timestamp\":\"2026-08-31T10:00:03Z\"}\n";
+        let transcript = claude_parent_with_subagent(dir.path(), records, None, "agent-deadbeef");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        let named_after_the_file: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_relationships WHERE child_session_id = 'deadbeef'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(named_after_the_file, 0);
+        let events_under_the_file_stem: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE session_id = 'deadbeef'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events_under_the_file_stem, 0);
+    }
+
+    #[test]
+    fn reparse_moves_parent_attributed_sidechain_events_to_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = claude_parent_with_subagent(
+            dir.path(),
+            CLAUDE_AGENT_RECORDS,
+            Some(CLAUDE_AGENT_META),
+            "agent-abc",
+        );
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        // What the previous parser version left behind: the subagent's
+        // assistant output attributed to the parent session.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'session-1', 1, 'assistant', 'text', 'child result', 'side-a:0')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        let placement: (i64, i64) = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='session-1' AND event_uid='side-a:0'), \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='abc' AND event_uid='side-a:0')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(placement, (0, 1));
+    }
+
+    #[test]
+    fn reparse_moves_parent_attributed_tool_calls_and_file_edits_to_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        // The child's own tool use: an earlier parser version derived a tool
+        // call and a file edit from it under the parent's identity.
+        let records = concat!(
+            r#"{"sessionId":"session-1","agentId":"abc","isSidechain":true,"uuid":"side-a","cwd":"/work/app","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_child","name":"Edit","input":{"file_path":"/work/app/lib.rs"}}]},"timestamp":"2026-08-31T10:00:03Z"}"#,
+            "\n",
+        );
+        let transcript = claude_parent_with_subagent(dir.path(), records, None, "agent-abc");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'session-1', 1, 'assistant', 'tool_use', 'Edit /work/app/lib.rs', 'side-a:0')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tool_calls \
+             (source, session_id, message_id, tool_use_id, name, target, args_json, ts_ms) \
+             VALUES ('claude', 'session-1', 'side-a', 'toolu_child', 'Edit', '/work/app/lib.rs', '{}', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_edits \
+             (source, session_id, message_id, tool_use_id, file_path, tool_name, ts_ms) \
+             VALUES ('claude', 'session-1', 'side-a', 'toolu_child', '/work/app/lib.rs', 'Edit', 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        // A delegated action belongs to the thread that took it: the parent
+        // must not keep exposing the child's tool call or file edit as its own.
+        let placement: (i64, i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='session-1' AND event_uid='side-a:0'), \
+                   (SELECT COUNT(*) FROM tool_calls WHERE source='claude' AND session_id='session-1' AND tool_use_id='toolu_child'), \
+                   (SELECT COUNT(*) FROM file_edits WHERE source='claude' AND session_id='session-1' AND tool_use_id='toolu_child'), \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='abc' AND event_uid='side-a:0'), \
+                   (SELECT COUNT(*) FROM tool_calls WHERE source='claude' AND session_id='abc' AND tool_use_id='toolu_child'), \
+                   (SELECT COUNT(*) FROM file_edits WHERE source='claude' AND session_id='abc' AND tool_use_id='toolu_child')",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(placement, (0, 0, 0, 1, 1, 1));
+    }
+
+    #[test]
+    fn a_child_named_only_by_a_later_record_still_links() {
+        let dir = tempfile::tempdir().unwrap();
+        // A mixed transcript: the provider started naming the child partway
+        // through, so the identity is not on the first record.
+        let records = concat!(
+            r#"{"sessionId":"session-1","isSidechain":true,"uuid":"side-u","type":"user","message":{"role":"user","content":"delegated instruction"},"timestamp":"2026-08-31T10:00:02Z"}"#,
+            "\n",
+            r#"{"sessionId":"session-1","agentId":"abc","isSidechain":true,"uuid":"side-a","type":"assistant","message":{"role":"assistant","content":"child result"},"timestamp":"2026-08-31T10:00:03Z"}"#,
+            "\n",
+        );
+        let transcript = claude_parent_with_subagent(dir.path(), records, None, "agent-abc");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        assert_eq!(result.related_session_ids, vec!["abc"]);
+        assert!(!result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RELATIONSHIP_UNLINKED_CHILD"));
+        let conn = open_db(&db).unwrap();
+        let placement: (i64, i64) = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='abc'), \
+                   (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='session-1' AND event_uid='side-a:0')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(placement, (1, 0));
+    }
+
+    #[test]
+    fn a_changed_metadata_sidecar_refreshes_the_child_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = claude_parent_with_subagent(
+            dir.path(),
+            CLAUDE_AGENT_RECORDS,
+            Some(CLAUDE_AGENT_META),
+            "agent-abc",
+        );
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+
+        // The transcript is untouched; only what describes the child changed.
+        fs::write(
+            dir.path()
+                .join(".claude/projects/app/session-1/subagents/agent-abc.meta.json"),
+            "{\"agentType\":\"Explore\",\"description\":\"explore the code\",\"toolUseId\":\"toolu_1\",\"spawnDepth\":2,\"model\":\"haiku\"}",
+        )
+        .unwrap();
+        let refreshed =
+            hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        assert_eq!(refreshed.status, "updated");
+
+        let conn = open_db(&db).unwrap();
+        let row: (Option<String>, Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT child_agent_type, child_agent_name, child_model, spawn_depth \
+                 FROM session_relationships WHERE source='claude' AND child_session_id='abc'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some("Explore".to_string()),
+                Some("explore the code".to_string()),
+                Some("haiku".to_string()),
+                Some(2),
+            )
+        );
+    }
+
+    #[test]
+    fn hydration_metrics_count_every_file_the_run_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = claude_parent_with_subagent(
+            dir.path(),
+            CLAUDE_AGENT_RECORDS,
+            Some(CLAUDE_AGENT_META),
+            "agent-abc",
+        );
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        let subagents = dir.path().join(".claude/projects/app/session-1/subagents");
+        // The metadata sidecar is evidence the run acquired like any other, so
+        // its bytes belong in what the metrics report was read.
+        let expected: i64 = [
+            transcript,
+            subagents.join("agent-abc.jsonl"),
+            subagents.join("agent-abc.meta.json"),
+        ]
+        .iter()
+        .map(|path| fs::metadata(path).unwrap().len() as i64)
+        .sum();
+        let metrics = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "HYDRATION_METRICS")
+            .unwrap();
+        assert_eq!(metrics.source_bytes, Some(expected));
+    }
+
+    #[test]
+    fn a_later_full_sync_leaves_subagent_events_on_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = claude_parent_with_subagent(
+            dir.path(),
+            CLAUDE_AGENT_RECORDS,
+            Some(CLAUDE_AGENT_META),
+            "agent-abc",
+        );
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+
+        let conn = open_db(&db).unwrap();
+        let projects = dir.path().join(".claude/projects");
+        // A sidecar walked by the full sync is not a session: it must not
+        // pull the child's output back onto the parent, take over the
+        // parent's catalog locator, or register itself.
+        for _ in 0..2 {
+            sync_claude_session_metadata(&conn, &mut Map::new(), &projects).unwrap();
+            let placement: (i64, i64, i64, String) = conn
+                .query_row(
+                    "SELECT \
+                       (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='abc'), \
+                       (SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='session-1' AND event_uid='side-a:0'), \
+                       (SELECT COUNT(*) FROM sessions WHERE source='claude' AND session_id='abc'), \
+                       (SELECT raw_path FROM sessions WHERE source='claude' AND session_id='session-1')",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                placement,
+                (1, 0, 0, transcript.to_string_lossy().to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn healing_a_record_never_matches_another_id_by_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = "{\"sessionId\":\"session-1\",\"agentId\":\"abc\",\"isSidechain\":true,\"uuid\":\"side_a%1\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"child result\"},\"timestamp\":\"2026-08-31T10:00:03Z\"}\n";
+        let transcript = claude_parent_with_subagent(dir.path(), records, None, "agent-abc");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        // The stale row this record left on the parent, plus an unrelated
+        // event whose uid a `LIKE 'side_a%1:%'` pattern would also match.
+        for uid in ["side_a%1:0", "sideXaY1:0"] {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 'session-1', 1, 'assistant', 'text', 'stale', ?)",
+                params![uid],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        let placement: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE session_id='session-1' AND event_uid='side_a%1:0'), \
+                   (SELECT COUNT(*) FROM session_events WHERE session_id='session-1' AND event_uid='sideXaY1:0'), \
+                   (SELECT COUNT(*) FROM session_events WHERE session_id='abc' AND event_uid='side_a%1:0')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(placement, (0, 1, 1));
+    }
+
+    #[test]
+    fn a_record_without_a_uuid_is_healed_under_its_derived_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = "{\"sessionId\":\"session-1\",\"agentId\":\"abc\",\"isSidechain\":true,\"type\":\"assistant\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":\"child result\"},\"timestamp\":\"2026-08-31T10:00:03Z\"}\n";
+        let transcript = claude_parent_with_subagent(dir.path(), records, None, "agent-abc");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        // Insertion falls back to the message id when a record carries no
+        // uuid, so healing has to reach the same identity.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'session-1', 1, 'assistant', 'text', 'child result', 'msg_1:0')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        let placement: (i64, i64) = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE session_id='session-1' AND event_uid='msg_1:0'), \
+                   (SELECT COUNT(*) FROM session_events WHERE session_id='abc' AND event_uid='msg_1:0')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(placement, (0, 1));
+    }
+
+    #[test]
+    fn an_upgraded_provider_retires_the_unlinked_row_it_supersedes() {
+        let dir = tempfile::tempdir().unwrap();
+        // First the provider version that records the sidechain without
+        // naming the child.
+        let unnamed = "{\"sessionId\":\"session-1\",\"isSidechain\":true,\"uuid\":\"side-a\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"child result\"},\"timestamp\":\"2026-08-31T10:00:03Z\"}\n";
+        let transcript = claude_parent_with_subagent(dir.path(), unnamed, None, "agent-abc");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+
+        // Then the same file, rewritten by a version that does name it.
+        let subagents = dir.path().join(".claude/projects/app/session-1/subagents");
+        fs::write(subagents.join("agent-abc.jsonl"), CLAUDE_AGENT_RECORDS).unwrap();
+        fs::write(subagents.join("agent-abc.meta.json"), CLAUDE_AGENT_META).unwrap();
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        assert_eq!(result.related_session_ids, vec!["abc"]);
+        assert!(!result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RELATIONSHIP_UNLINKED_CHILD"));
+
+        let conn = open_db(&db).unwrap();
+        let rows: Vec<(Option<String>, String)> = conn
+            .prepare(
+                "SELECT child_session_id, identity_status FROM session_relationships \
+                 WHERE source='claude' AND parent_session_id='session-1'",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(Some("abc".to_string()), "observed".to_string())]
+        );
+    }
+
+    #[test]
+    fn root_only_hydration_then_related_hydration() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = claude_parent_with_subagent(
+            dir.path(),
+            CLAUDE_AGENT_RECORDS,
+            Some(CLAUDE_AGENT_META),
+            "agent-abc",
+        );
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+
+        let mut request = options("claude", "session-1");
+        request.include_related = false;
+        let root_only = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
+        assert!(root_only.related_session_ids.is_empty());
+        let root_prompts = root_only.evidence.prompts;
+        let conn = open_db(&db).unwrap();
+        let untouched: (i64, i64) = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_relationships), \
+                   (SELECT COUNT(*) FROM session_events WHERE session_id='abc')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(untouched, (0, 0));
+        drop(conn);
+
+        request.include_related = true;
+        let related = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
+        assert_eq!(related.related_session_ids, vec!["abc"]);
+        assert_eq!(related.evidence.prompts, root_prompts);
+        let conn = open_db(&db).unwrap();
+        let now: (i64, i64) = conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_relationships), \
+                   (SELECT COUNT(*) FROM session_events WHERE session_id='abc')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(now, (1, 1));
     }
 
     #[test]

@@ -305,6 +305,108 @@ export interface HydrateSessionResult {
 }
 /** Fully index one cataloged session without enumerating unrelated sessions. */
 export declare function hydrateSession(options: HydrateSessionOptions): Promise<HydrateSessionResult>
+export interface NativeSessionRelationship {
+  source: string
+  parentSessionId: string
+  childSessionId?: string
+  relationship: string
+  identityStatus: string
+  childAgentType?: string
+  childAgentName?: string
+  childModel?: string
+  spawnDepth?: number
+  evidenceKind: string
+  evidenceLocator?: string
+  evidenceRef?: string
+  childHasEvents: boolean
+  spawnedAtMs?: number
+  createdMs: number
+  relationshipUid: string
+}
+export interface NativeRelationshipCapabilities {
+  source: string
+  stableChildIdentity: string
+  recordsAgentType: boolean
+  recordsSpawnTime: boolean
+  recordsEvidenceLocator: boolean
+}
+export interface NativeRelationshipDiagnostic {
+  code: string
+  message: string
+  relationshipUid?: string
+}
+export interface NativeSessionRelationships {
+  contractVersion: number
+  source: string
+  sessionId: string
+  asParent: Array<NativeSessionRelationship>
+  asChild: Array<NativeSessionRelationship>
+  capabilities: NativeRelationshipCapabilities
+  diagnostics: Array<NativeRelationshipDiagnostic>
+}
+export interface NativeSessionTreeNode {
+  source: string
+  sessionId: string
+  depth: number
+  parentSessionId?: string
+  relationship?: NativeSessionRelationship
+  childCount: number
+  hasEvents: boolean
+  truncated: boolean
+}
+export interface NativeSessionTree {
+  contractVersion: number
+  source: string
+  rootSessionId: string
+  nodes: Array<NativeSessionTreeNode>
+  unlinked: Array<NativeSessionRelationship>
+  capabilities: NativeRelationshipCapabilities
+  diagnostics: Array<NativeRelationshipDiagnostic>
+  truncated: boolean
+  maxDepthReached: number
+}
+export interface RelationshipCursor {
+  spawnedAtMs?: number
+  relationshipUid: string
+}
+export interface NativeSessionChildrenPage {
+  children: Array<NativeSessionRelationship>
+  nextCursor?: RelationshipCursor
+}
+export interface RelationshipOptions {
+  source: string
+  sessionId: string
+  dbPath?: string
+}
+export interface SessionTreeOptions {
+  source: string
+  sessionId: string
+  dbPath?: string
+  maxDepth?: number
+  maxNodes?: number
+}
+export interface SessionChildrenPageOptions {
+  source: string
+  sessionId: string
+  dbPath?: string
+  limit?: number
+  after?: RelationshipCursor
+}
+/**
+ * Direct delegation relationships for one session, in both directions.
+ * A missing database is an empty result, not an error.
+ */
+export declare function getSessionRelationships(options: RelationshipOptions): Promise<NativeSessionRelationships>
+/**
+ * The complete descendant delegation tree for one session: pre-order,
+ * cycle-safe, and bounded by `maxDepth` / `maxNodes`.
+ */
+export declare function getSessionTree(options: SessionTreeOptions): Promise<NativeSessionTree>
+/**
+ * One bounded page of a session's direct children, in the same total order
+ * the tree traversal uses.
+ */
+export declare function getSessionChildrenPage(options: SessionChildrenPageOptions): Promise<NativeSessionChildrenPage>
 export interface SyncOptions {
   dbPath?: string
   scope?: string
