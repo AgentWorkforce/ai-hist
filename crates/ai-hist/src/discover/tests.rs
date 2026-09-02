@@ -977,10 +977,10 @@ fn opencode_applies_the_global_id_tiebreak_before_its_limit() {
     assert_eq!(found.ids(), vec!["opencode:ses_a", "opencode:ses_b"]);
 }
 
-fn explain_details(conn: &Connection, sql: &str) -> String {
+fn explain_details<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> String {
     conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
         .unwrap()
-        .query_map([], |row| row.get::<_, String>(3))
+        .query_map(params, |row| row.get::<_, String>(3))
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap()
@@ -994,17 +994,20 @@ fn opencode_selected_session_queries_use_provider_indexes() {
     let db = Connection::open(home.path().join("opencode.db")).unwrap();
     let prompt = explain_details(
         &db,
-        "SELECT substr(json_extract(p.data, '$.text'), 1, 4096)
+        "SELECT substr(json_extract(p.data, '$.text'), 1, ?)
          FROM part p JOIN message m ON m.id = p.message_id
-         WHERE p.session_id = 'selected' AND json_valid(m.data) AND json_valid(p.data)
+         WHERE p.session_id = ? AND json_valid(m.data) AND json_valid(p.data)
            AND json_extract(m.data, '$.role') = 'user'
            AND json_extract(p.data, '$.type') = 'text'
            AND json_type(p.data, '$.text') = 'text'
-           AND trim(substr(json_extract(p.data, '$.text'), 1, 4096),
-                    char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,
-                         8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,
-                         8287,12288)) <> ''
+           AND trim(substr(json_extract(p.data, '$.text'), 1, ?), ?) <> ''
          ORDER BY COALESCE(p.time_created, m.time_created) ASC LIMIT 1",
+        rusqlite::params![
+            EXCERPT_MAX_CHARS as i64,
+            "selected",
+            EXCERPT_MAX_CHARS as i64,
+            EXCERPT_TRIM_WHITESPACE
+        ],
     );
     assert!(
         prompt.contains("SEARCH p USING INDEX part_session_idx"),
@@ -1020,6 +1023,7 @@ fn opencode_selected_session_queries_use_provider_indexes() {
          FROM message WHERE session_id = 'selected' AND json_valid(data)
          AND COALESCE(json_extract(data, '$.modelID'),
                       json_extract(data, '$.model.modelID')) IS NOT NULL LIMIT 1",
+        [],
     );
     assert!(
         model.contains("SEARCH message USING INDEX message_session_time_created_id_idx"),
@@ -1116,6 +1120,7 @@ fn current_opencode_schema_without_recency_index_uses_primary_key_fallback() {
         &db,
         "SELECT id, directory, time_created, time_updated FROM session
          WHERE id IS NOT NULL AND id <> '' ORDER BY id ASC LIMIT 1",
+        [],
     );
     assert!(plan.contains("sqlite_autoindex_session_1"), "{plan}");
     drop(db);
