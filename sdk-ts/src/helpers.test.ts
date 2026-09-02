@@ -2,7 +2,29 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { defaultDbPath, resumeCommand } from './index.js';
+import {
+  CATALOG_SOURCES,
+  SOURCES,
+  defaultDbPath,
+  isCatalogSource,
+  isSource,
+  resumeCommand,
+} from './index.js';
+
+test('exports immutable runtime source registries and matching type guards', () => {
+  assert.deepEqual(SOURCES, ['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode']);
+  assert.deepEqual(CATALOG_SOURCES, ['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode']);
+  assert.equal(Object.isFrozen(SOURCES), true);
+  assert.equal(Object.isFrozen(CATALOG_SOURCES), true);
+
+  for (const source of SOURCES) assert.equal(isSource(source), true);
+  for (const source of CATALOG_SOURCES) assert.equal(isCatalogSource(source), true);
+  assert.equal(isCatalogSource('trajectory'), false);
+  for (const value of ['unknown', '', null, undefined, 1, {}]) {
+    assert.equal(isSource(value), false);
+    assert.equal(isCatalogSource(value), false);
+  }
+});
 
 test('defaultDbPath follows native environment precedence', () => {
   const previousDb = process.env.AI_HIST_DB;

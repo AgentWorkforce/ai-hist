@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Export immutable `SOURCES` and `CATALOG_SOURCES` runtime tuples alongside
+  `isSource()` and `isCatalogSource()` guards, so consumers can validate source
+  input without duplicating the SDK's provider registry.
 - Surface bounded OpenCode provider-query and inspected-record counters through the typed SDK,
   CLI JSON, and MCP discovery result.
 - Expose hydration contract v2 with `capability`, shallow/partial outcomes,
