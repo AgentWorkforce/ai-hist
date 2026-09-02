@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Export immutable `SOURCES` and `CATALOG_SOURCES` runtime tuples alongside
+- Export immutable `SOURCES` and derived `CATALOG_SOURCES` runtime registries alongside
   `isSource()` and `isCatalogSource()` guards, so consumers can validate source
   input without duplicating the SDK's provider registry.
 - Surface bounded OpenCode provider-query and inspected-record counters through the typed SDK,

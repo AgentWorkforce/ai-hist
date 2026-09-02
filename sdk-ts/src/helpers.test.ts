@@ -11,9 +11,9 @@ import {
   resumeCommand,
 } from './index.js';
 
-test('exports immutable runtime source registries and matching type guards', () => {
+test('exports immutable, aligned runtime source registries and matching type guards', () => {
   assert.deepEqual(SOURCES, ['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode']);
-  assert.deepEqual(CATALOG_SOURCES, ['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode']);
+  assert.deepEqual(CATALOG_SOURCES, SOURCES.filter((source) => source !== 'trajectory'));
   assert.equal(Object.isFrozen(SOURCES), true);
   assert.equal(Object.isFrozen(CATALOG_SOURCES), true);
 

@@ -32,14 +32,9 @@ export const SOURCES = Object.freeze([
 
 export type Source = (typeof SOURCES)[number];
 export type CatalogSource = Exclude<Source, 'trajectory'>;
-export const CATALOG_SOURCES = Object.freeze([
-  'claude',
-  'codex',
-  'cursor',
-  'grok',
-  'relay',
-  'opencode',
-] as const satisfies readonly CatalogSource[]);
+export const CATALOG_SOURCES: readonly CatalogSource[] = Object.freeze(
+  SOURCES.filter((source): source is CatalogSource => source !== 'trajectory'),
+);
 
 const SOURCE_SET: ReadonlySet<string> = new Set(SOURCES);
 const CATALOG_SOURCE_SET: ReadonlySet<string> = new Set(CATALOG_SOURCES);

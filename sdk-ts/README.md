@@ -57,11 +57,12 @@ or `shallow_only` when no richer evidence is exposed. Partial results retain
 `discoveryState: 'shallow'`. `sync` is full ingestion.
 Missing databases return empty read results; they do not trigger provider I/O.
 
-`SOURCES` and `CATALOG_SOURCES` are immutable runtime tuples corresponding to
+`SOURCES` and `CATALOG_SOURCES` are immutable runtime registries corresponding to
 the exported `Source` and `CatalogSource` types. Use `isSource(value)` or
 `isCatalogSource(value)` to validate untyped input without maintaining a copied
-provider list. `trajectory` is a history source but not a discoverable session
-catalog source, so it appears only in `SOURCES`.
+provider list. `CATALOG_SOURCES` is derived from `SOURCES`; `trajectory` is a
+history source but not a discoverable session catalog source, so it appears
+only in `SOURCES`.
 
 Session discovery, listing, search, recent history, statistics, and sync accept
 `scope: 'local' | 'remote' | 'all'`. Scope defaults to `local`, preserving
