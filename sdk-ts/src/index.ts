@@ -20,11 +20,35 @@ export const SESSION_EVIDENCE_CONTRACT_VERSION = 1;
  * so the runtime checks below and the compile-time type cannot drift apart,
  * and it is the same list the MCP server's `SOURCE` enum publishes.
  */
-const SOURCES = ['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode'] as const;
-const CATALOG_SOURCES: readonly string[] = SOURCES.filter((source) => source !== 'trajectory');
+export const SOURCES = Object.freeze([
+  'claude',
+  'codex',
+  'cursor',
+  'grok',
+  'relay',
+  'trajectory',
+  'opencode',
+] as const);
 
 export type Source = (typeof SOURCES)[number];
 export type CatalogSource = Exclude<Source, 'trajectory'>;
+export const CATALOG_SOURCES: readonly CatalogSource[] = Object.freeze(
+  SOURCES.filter((source): source is CatalogSource => source !== 'trajectory'),
+);
+
+const SOURCE_SET: ReadonlySet<string> = new Set(SOURCES);
+const CATALOG_SOURCE_SET: ReadonlySet<string> = new Set(CATALOG_SOURCES);
+
+/** Return whether an unknown value is a source recognized by this SDK build. */
+export function isSource(value: unknown): value is Source {
+  return typeof value === 'string' && SOURCE_SET.has(value);
+}
+
+/** Return whether an unknown value can identify a session catalog entry. */
+export function isCatalogSource(value: unknown): value is CatalogSource {
+  return typeof value === 'string' && CATALOG_SOURCE_SET.has(value);
+}
+
 export type SessionScope = 'local' | 'remote' | 'all';
 export type SessionLocation = Exclude<SessionScope, 'all'>;
 
@@ -803,7 +827,7 @@ function assertEvidenceContract(value: number): void {
 }
 
 function catalogSource(value: unknown): CatalogSource {
-  if (typeof value === 'string' && CATALOG_SOURCES.includes(value)) return value as CatalogSource;
+  if (isCatalogSource(value)) return value;
   throw new NativeContractMismatchError(
     `ai-hist-native returned an invalid catalog source: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
     'NATIVE_CONTRACT_MISMATCH',

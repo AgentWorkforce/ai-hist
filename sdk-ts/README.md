@@ -10,6 +10,7 @@ npm install ai-hist
 
 ```ts
 import {
+  CATALOG_SOURCES,
   discoverSessions,
   hydrateSession,
   listSessionCatalogPage,
@@ -25,6 +26,9 @@ import {
   stats,
   sync,
 } from 'ai-hist';
+
+// Runtime validation stays in step with the sources supported by this build.
+for (const source of CATALOG_SOURCES) console.log(source);
 
 await discoverSessions({ scope: 'all', limit: 100 });
 const page = await listSessionCatalogPage({ scope: 'all', limit: 20 });
@@ -52,6 +56,13 @@ Codex cloud tasks return `partial` when their supported unified diff is indexed
 or `shallow_only` when no richer evidence is exposed. Partial results retain
 `discoveryState: 'shallow'`. `sync` is full ingestion.
 Missing databases return empty read results; they do not trigger provider I/O.
+
+`SOURCES` and `CATALOG_SOURCES` are immutable runtime registries corresponding to
+the exported `Source` and `CatalogSource` types. Use `isSource(value)` or
+`isCatalogSource(value)` to validate untyped input without maintaining a copied
+provider list. `CATALOG_SOURCES` is derived from `SOURCES`; `trajectory` is a
+history source but not a discoverable session catalog source, so it appears
+only in `SOURCES`.
 
 Session discovery, listing, search, recent history, statistics, and sync accept
 `scope: 'local' | 'remote' | 'all'`. Scope defaults to `local`, preserving
