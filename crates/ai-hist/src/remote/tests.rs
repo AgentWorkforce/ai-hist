@@ -586,11 +586,7 @@ fn codex_inherited_pipe_is_bounded_after_the_direct_child_exits() {
 
     let dir = tempfile::tempdir().unwrap();
     let command = dir.path().join("codex-inherited-pipe");
-    std::fs::write(
-        &command,
-        "#!/usr/bin/env python3\nimport os, time\nif os.fork() == 0:\n    time.sleep(2)\nelse:\n    os._exit(0)\n",
-    )
-    .unwrap();
+    std::fs::write(&command, "#!/bin/sh\nsleep 2 &\nexit 0\n").unwrap();
     std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
     let started = Instant::now();
     let error = acquire_codex_remote_session_with_command_timeout(

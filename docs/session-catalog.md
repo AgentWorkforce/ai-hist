@@ -260,8 +260,9 @@ Absent metadata stays `null`. Nothing is ever invented to fill a column.
 
 ### What the catalog deliberately does not have
 
-Except for the partial Codex cloud diff exposed by targeted remote hydration,
-these require a full `ai-hist sync` through an available provider connector:
+Except for targeted remote hydration — full Claude teleport evidence or the
+partial Codex cloud diff — these require a full `ai-hist sync` through an
+available provider connector:
 
 - per-message events (`session_events`) and tool calls; file edits are partial
   for a Codex cloud row whose available diff has been hydrated

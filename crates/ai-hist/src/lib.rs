@@ -159,9 +159,9 @@ fn sync_remote_connectors(db_path: &Path, scope: SessionScope) -> Result<bool> {
         limit: None,
     };
     let summary = discover_sessions(&conn, &options, |_| {})?;
-    // `all` ingests local transcripts before remote discovery. Correlate again
-    // after the remote presences land so a first local-first run records exact
-    // provider ids even when the local transcript is unchanged thereafter.
+    // `all` ingests local transcripts before remote discovery. Correlate from
+    // the exact ids cached by that local pass; remote-only sync never opens a
+    // local transcript merely to repair topology.
     reconcile_claude_remote_relationships(&conn)?;
     for (source, provider) in &summary.providers {
         sync_note!(
@@ -6381,15 +6381,16 @@ fn sync_claude_session_metadata(
     if !root.exists() {
         return Ok(());
     }
-    // The v2 key forces one full re-scan on upgrade: transcripts whose
-    // stamps never change again still need the sidechain healing pass that
-    // removes previously ingested fake user turns.
+    // The v3 key forces one full re-scan on upgrade so exact remote/local ids
+    // are cached for bounded post-discovery correlation. The earlier v2 pass
+    // healed sidechains that had been attributed to their parent.
     let mut session_state = state
-        .get("claude_sessions_v2")
+        .get("claude_sessions_v3")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
     state.remove("claude_sessions");
+    state.remove("claude_sessions_v2");
     let mut scanned = 0;
     let mut upserted = 0;
     for path in collect_matching_files(root, "", "jsonl")? {
@@ -6437,7 +6438,7 @@ fn sync_claude_session_metadata(
         }
     }
     state.insert(
-        "claude_sessions_v2".to_string(),
+        "claude_sessions_v3".to_string(),
         Value::Object(session_state),
     );
     if scanned > 0 {
@@ -6627,17 +6628,21 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
 }
 
 fn reconcile_claude_remote_relationships(conn: &Connection) -> Result<()> {
-    let paths = conn
+    let correlations = conn
         .prepare(
-            "SELECT raw_locator FROM session_presences \
-             WHERE source = 'claude' AND location = 'local' AND raw_locator IS NOT NULL",
+            "SELECT c.remote_session_id, c.local_session_id \
+             FROM session_identity_correlations c \
+             JOIN session_presences p \
+               ON p.source = c.source AND p.session_id = c.remote_session_id \
+              AND p.location = 'remote' \
+             WHERE c.source = 'claude' AND c.relationship = 'materialized_local'",
         )?
-        .query_map([], |row| row.get::<_, String>(0))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for path in paths {
-        if let Some(meta) = scan_claude_session_file(Path::new(&path))? {
-            record_claude_remote_relationship(conn, &meta)?;
-        }
+    for (remote_id, local_id) in correlations {
+        record_claude_materialized_relationship(conn, &remote_id, &local_id)?;
     }
     Ok(())
 }
@@ -6649,6 +6654,15 @@ fn record_claude_remote_relationship(conn: &Connection, meta: &ClaudeSessionMeta
     if remote_id == meta.session_id {
         return Ok(());
     }
+    conn.execute(
+        "INSERT INTO session_identity_correlations \
+         (source, local_session_id, remote_session_id, relationship, evidence_kind, updated_ms) \
+         VALUES ('claude', ?, ?, 'materialized_local', 'claude_remote_session_id', ?) \
+         ON CONFLICT(source, local_session_id, relationship) DO UPDATE SET \
+           remote_session_id = excluded.remote_session_id, \
+           evidence_kind = excluded.evidence_kind, updated_ms = excluded.updated_ms",
+        params![meta.session_id, remote_id, (now_ns() / 1_000_000) as i64],
+    )?;
     let remote_exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_presences \
          WHERE source = 'claude' AND session_id = ? AND location = 'remote')",
@@ -6656,26 +6670,34 @@ fn record_claude_remote_relationship(conn: &Connection, meta: &ClaudeSessionMeta
         |row| row.get(0),
     )?;
     if remote_exists {
-        record_relationship(
-            conn,
-            &ObservedRelationship {
-                source: "claude",
-                parent_session_id: remote_id,
-                child_session_id: Some(&meta.session_id),
-                relationship: "materialized_local",
-                child_agent_type: None,
-                child_agent_name: None,
-                child_model: None,
-                spawn_depth: None,
-                evidence_kind: "claude_remote_session_id",
-                evidence_locator: None,
-                evidence_ref: Some(remote_id),
-                child_has_events: session_events_exist(conn, "claude", &meta.session_id)?,
-                spawned_at_ms: None,
-            },
-        )?;
+        record_claude_materialized_relationship(conn, remote_id, &meta.session_id)?;
     }
     Ok(())
+}
+
+fn record_claude_materialized_relationship(
+    conn: &Connection,
+    remote_id: &str,
+    local_id: &str,
+) -> Result<()> {
+    record_relationship(
+        conn,
+        &ObservedRelationship {
+            source: "claude",
+            parent_session_id: remote_id,
+            child_session_id: Some(local_id),
+            relationship: "materialized_local",
+            child_agent_type: None,
+            child_agent_name: None,
+            child_model: None,
+            spawn_depth: None,
+            evidence_kind: "claude_remote_session_id",
+            evidence_locator: None,
+            evidence_ref: Some(remote_id),
+            child_has_events: session_events_exist(conn, "claude", local_id)?,
+            spawned_at_ms: None,
+        },
+    )
 }
 
 fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
@@ -8795,20 +8817,20 @@ mod tests {
         let path = dir.path().join(".sync-state.json");
         let mut on_disk = Map::new();
         on_disk.insert(
-            "claude_sessions_v2".into(),
+            "claude_sessions_v3".into(),
             json!({"first.jsonl": "old", "nested": {"left": 1}}),
         );
         save_sync_state(&path, &on_disk).unwrap();
 
         let mut ours = Map::new();
         ours.insert(
-            "claude_sessions_v2".into(),
+            "claude_sessions_v3".into(),
             json!({"second.jsonl": "new", "nested": {"right": 2}}),
         );
         checkpoint_sync_state(&path, &ours);
 
         assert_eq!(
-            load_sync_state(&path).unwrap()["claude_sessions_v2"],
+            load_sync_state(&path).unwrap()["claude_sessions_v3"],
             json!({
                 "first.jsonl": "old",
                 "second.jsonl": "new",
@@ -9898,7 +9920,7 @@ mod tests {
         );
         let mut state = Map::new();
         state.insert(
-            "claude_sessions_v2".to_string(),
+            "claude_sessions_v3".to_string(),
             Value::Object(claude_sessions),
         );
 
@@ -10015,6 +10037,18 @@ mod tests {
         init_db(&conn).unwrap();
         let mut state = Map::new();
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let cached: (String, String) = conn
+            .query_row(
+                "SELECT local_session_id, remote_session_id \
+                 FROM session_identity_correlations WHERE source = 'claude'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            cached,
+            ("local-materialized".into(), "session_01remote".into())
+        );
         let before: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_relationships", [], |row| {
                 row.get(0)
@@ -10034,6 +10068,10 @@ mod tests {
             [],
         )
         .unwrap();
+
+        // Remote reconciliation must use the observed identity cache. The
+        // transcript may have disappeared between local and remote syncs.
+        fs::remove_file(&transcript).unwrap();
 
         reconcile_claude_remote_relationships(&conn).unwrap();
         let relationship: (String, String, String) = conn
@@ -10201,7 +10239,7 @@ mod tests {
         .unwrap();
         let key = named.to_string_lossy().to_string();
         state
-            .get_mut("claude_sessions_v2")
+            .get_mut("claude_sessions_v3")
             .and_then(Value::as_object_mut)
             .unwrap()
             .insert(key, json!(claude_sync_stamp(&named).unwrap()));
@@ -10290,7 +10328,7 @@ mod tests {
         }
         let mut state = Map::new();
         state.insert(
-            "claude_sessions_v2".to_string(),
+            "claude_sessions_v3".to_string(),
             Value::Object(claude_sessions),
         );
 

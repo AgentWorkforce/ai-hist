@@ -217,7 +217,23 @@ fn acquire_remote_hydration_lock(
     db_path: &Path,
     options: &HydrateSessionOptions,
 ) -> Result<RemoteHydrationLock> {
-    let lock_dir = db_path
+    let absolute = if db_path.is_absolute() {
+        db_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(db_path)
+    };
+    let canonical_db = fs::canonicalize(&absolute).or_else(|_| {
+        let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
+        let parent = fs::canonicalize(parent)?;
+        Ok::<_, std::io::Error>(
+            parent.join(
+                absolute
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("history.db")),
+            ),
+        )
+    })?;
+    let lock_dir = canonical_db
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(".relayhistory-hydration-locks");
@@ -293,30 +309,49 @@ fn classify_remote_error(error: anyhow::Error) -> anyhow::Error {
 
 fn redact_remote_diagnostic(message: &str) -> String {
     let mut redacted = Vec::new();
-    let mut parts = message.split_whitespace();
-    while let Some(part) = parts.next() {
+    let parts = message.split_whitespace().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < parts.len() {
+        let part = parts[index];
         let lower = part.to_ascii_lowercase();
-        let marker = lower.contains("bearer")
-            || lower.contains("authorization")
-            || lower.contains("access_token")
-            || lower.contains("accesstoken")
-            || lower.contains("refresh_token")
-            || lower.contains("refreshtoken");
+        let normalized = lower.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_');
+        let token_key = matches!(
+            normalized,
+            "access_token" | "accesstoken" | "refresh_token" | "refreshtoken"
+        );
+        let bearer = normalized == "bearer";
+        let authorization_bearer = normalized == "authorization"
+            && parts
+                .get(index + 1)
+                .is_some_and(|next| next.eq_ignore_ascii_case("bearer"));
         let inline_secret = lower.contains("sk-ant-")
-            || marker && part.contains(['=', ':']) && !part.ends_with(['=', ':']);
+            || [
+                "access_token",
+                "accesstoken",
+                "refresh_token",
+                "refreshtoken",
+            ]
+            .iter()
+            .any(|key| {
+                lower
+                    .find(key)
+                    .is_some_and(|start| lower[start + key.len()..].starts_with(['=', ':']))
+            });
         if inline_secret || probable_secret(part) {
             redacted.push("[REDACTED]");
-        } else if marker {
+        } else if authorization_bearer {
             redacted.push("[REDACTED]");
-            // `Bearer TOKEN`, `access_token = TOKEN`, and their colon forms
-            // must not leave the value behind as an innocent-looking token.
-            if matches!(parts.clone().next(), Some("=" | ":")) {
-                parts.next();
+            index += 2;
+        } else if bearer || token_key {
+            redacted.push("[REDACTED]");
+            index += 1;
+            if matches!(parts.get(index), Some(&"=") | Some(&":")) {
+                index += 1;
             }
-            parts.next();
         } else {
             redacted.push(part);
         }
+        index += 1;
     }
     redacted.join(" ")
 }
@@ -1514,6 +1549,14 @@ mod tests {
             "INVALID_ARGUMENT: remote Claude session id is malformed"
         ));
         assert!(invalid.to_string().starts_with("INVALID_ARGUMENT:"));
+        assert_eq!(
+            redact_remote_diagnostic("CONNECTOR_FAILURE: authorization failed for provider"),
+            "CONNECTOR_FAILURE: authorization failed for provider"
+        );
+        assert_eq!(
+            redact_remote_diagnostic("CONNECTOR_FAILURE: Authorization Bearer secret-value"),
+            "CONNECTOR_FAILURE: [REDACTED]"
+        );
     }
 
     #[test]
@@ -1530,6 +1573,42 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             let second = acquire_remote_hydration_lock(&db, &request).unwrap();
+            sender.send(()).unwrap();
+            drop(second);
+        });
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+        drop(first);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_hydration_file_lock_canonicalizes_database_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let db = real_dir.join("history.db");
+        fs::write(&db, []).unwrap();
+        let alias_dir = dir.path().join("alias");
+        symlink(&real_dir, &alias_dir).unwrap();
+        let alias = alias_dir.join("history.db");
+        let request = HydrateSessionOptions {
+            source: "codex".into(),
+            session_id: "task_alias_lock".into(),
+            scope: SessionScope::Remote,
+            include_related: false,
+        };
+        let first = acquire_remote_hydration_lock(&db, &request).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let second = acquire_remote_hydration_lock(&alias, &request).unwrap();
             sender.send(()).unwrap();
             drop(second);
         });
