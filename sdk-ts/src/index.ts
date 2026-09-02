@@ -1229,7 +1229,11 @@ export async function getSessionChildrenPage(options: GetSessionChildrenPageOpti
 export async function* sessionDescendants(options: SessionDescendantsOptions): AsyncGenerator<SessionTreeNode> {
   validateSessionRef(options, 'sessionDescendants');
   const maxDepth = Math.min(Math.max(Math.trunc(options.maxDepth ?? DEFAULT_TREE_MAX_DEPTH), 1), MAX_TREE_MAX_DEPTH);
-  const maxNodes = Math.min(Math.max(Math.trunc(options.maxNodes ?? DEFAULT_TREE_MAX_NODES), 1), MAX_TREE_MAX_NODES);
+  const requestedMaxNodes = options.maxNodes ?? DEFAULT_TREE_MAX_NODES;
+  if (!Number.isFinite(requestedMaxNodes)) {
+    throw new InvalidArgumentError('maxNodes must be a finite number', 'INVALID_ARGUMENT');
+  }
+  const maxNodes = Math.min(Math.max(Math.trunc(requestedMaxNodes), 1), MAX_TREE_MAX_NODES);
   const request = { source: options.source, dbPath: options.dbPath };
   const visited = new Set<string>([options.sessionId]);
   // Each walked session's parent, so a repeated edge can be told apart: back

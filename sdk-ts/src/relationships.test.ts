@@ -146,6 +146,20 @@ test('relationship queries reject invalid identities before reaching the engine'
   }
 });
 
+test('sessionDescendants rejects a non-finite node budget', async () => {
+  const dbPath = join(tmpdir(), 'relayhistory-never-created.db');
+  await assert.rejects(
+    async () => {
+      for await (const _ of sessionDescendants({
+        source: 'codex', sessionId: 'root', dbPath, maxNodes: Number.NaN,
+      })) break;
+    },
+    (error: unknown) => error instanceof InvalidArgumentError
+      && error.code === 'INVALID_ARGUMENT'
+      && /maxNodes must be a finite number/.test(error.message),
+  );
+});
+
 test('codex delegation topology round-trips through discovery and hydration', async () => {
   await withHome('relayhistory-relationships-codex-', async (home, dbPath) => {
     await codexRollout(home, 'root', { at: '2026-08-31T10:00:00Z' });
