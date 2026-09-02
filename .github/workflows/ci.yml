@@ -41,6 +41,7 @@ jobs:
         run: |
           npm ci
           npm run build:debug
+          node ../../scripts/verify-native-contract.mjs ./index.js
           git diff --exit-code -- index.d.ts
 
       - name: TypeScript tests
