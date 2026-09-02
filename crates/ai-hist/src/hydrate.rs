@@ -1315,7 +1315,9 @@ fn ingest_codex_children(
         ingest_codex_rollout(conn, &candidate, &meta)?;
         cleanup_codex_subagent_history(conn, &meta.session_id)?;
         cleanup_codex_subagent_registration(conn, &meta.session_id)?;
-        record_codex_delegation(conn, &options.session_id, &meta, &candidate)?;
+        if let Some(parent_session_id) = meta.parent_session_id.as_deref() {
+            record_codex_delegation(conn, parent_session_id, &meta, &candidate)?;
+        }
     }
     Ok(())
 }
@@ -1324,18 +1326,49 @@ fn codex_children(root_path: &Path, parent_session_id: &str) -> Result<Vec<PathB
     let Some(directory) = root_path.parent() else {
         return Ok(Vec::new());
     };
-    Ok(collect_matching_files(directory, "rollout-", "jsonl")?
-        .into_iter()
-        .filter(|candidate| candidate != root_path)
-        .filter(|candidate| {
-            read_codex_session_meta(candidate)
-                .ok()
-                .flatten()
-                .is_some_and(|meta| {
-                    meta.is_subagent && meta.parent_session_id.as_deref() == Some(parent_session_id)
-                })
-        })
-        .collect())
+    let mut children_by_parent: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
+    for candidate in collect_matching_files(directory, "rollout-", "jsonl")? {
+        if candidate == root_path {
+            continue;
+        }
+        let Some(meta) = read_codex_session_meta(&candidate)? else {
+            continue;
+        };
+        if !meta.is_subagent {
+            continue;
+        }
+        let Some(parent) = meta.parent_session_id.as_deref() else {
+            continue;
+        };
+        children_by_parent
+            .entry(parent.to_string())
+            .or_default()
+            .push((meta.session_id, candidate));
+    }
+
+    let mut descendants = Vec::new();
+    let mut pending = vec![parent_session_id.to_string()];
+    let mut visited_sessions = HashSet::from([parent_session_id.to_string()]);
+    let mut visited_paths = HashSet::new();
+    while let Some(parent) = pending.pop() {
+        let Some(children) = children_by_parent.remove(&parent) else {
+            continue;
+        };
+        for (child_session_id, path) in children {
+            if child_session_id == parent_session_id {
+                continue;
+            }
+            if !visited_paths.insert(path.clone()) {
+                continue;
+            }
+            descendants.push(path);
+            if visited_sessions.insert(child_session_id.clone()) {
+                pending.push(child_session_id);
+            }
+        }
+    }
+    descendants.sort();
+    Ok(descendants)
 }
 
 fn ingest_cursor(
@@ -1455,9 +1488,17 @@ fn build_result(
 fn related_ids(conn: &Connection, source: &str, session_id: &str) -> Result<Vec<String>> {
     Ok(conn
         .prepare(
-            "SELECT child_session_id FROM session_relationships \
-             WHERE source = ? AND parent_session_id = ? AND child_session_id IS NOT NULL \
-             ORDER BY child_session_id",
+            "WITH RECURSIVE descendants(child_session_id) AS ( \
+               SELECT child_session_id FROM session_relationships \
+               WHERE source = ?1 AND parent_session_id = ?2 \
+                 AND child_session_id IS NOT NULL AND child_session_id != ?2 \
+               UNION \
+               SELECT relationship.child_session_id FROM session_relationships relationship \
+               JOIN descendants ON relationship.parent_session_id = descendants.child_session_id \
+               WHERE relationship.source = ?1 AND relationship.child_session_id IS NOT NULL \
+                 AND relationship.child_session_id != ?2 \
+             ) \
+             SELECT child_session_id FROM descendants ORDER BY child_session_id",
         )?
         .query_map(params![source, session_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1857,12 +1898,42 @@ mod tests {
         fs::create_dir_all(&day).unwrap();
         let root = day.join("rollout-root.jsonl");
         let child = day.join("rollout-child.jsonl");
+        let child_parent_thread = day.join("rollout-child-parent-thread.jsonl");
+        let child_thread_spawn = day.join("rollout-child-thread-spawn.jsonl");
+        let grandchild = day.join("rollout-grandchild.jsonl");
         fs::write(
             &root,
             concat!(
                 "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"root\",\"cwd\":\"/work/app\"}}\n",
                 "{\"timestamp\":\"2026-08-31T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"root prompt\"}}\n",
                 "{\"timestamp\":\"2026-08-31T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"root answer\"}}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &grandchild,
+            concat!(
+                "{\"timestamp\":\"2026-08-31T10:00:12Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"grandchild\",\"cwd\":\"/work/app\",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"child-thread-spawn\",\"depth\":2}}}}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:13Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"nested task\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:14Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"nested answer\"}}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &child_parent_thread,
+            concat!(
+                "{\"timestamp\":\"2026-08-31T10:00:06Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"child-parent-thread\",\"parent_thread_id\":\"root\",\"cwd\":\"/work/app\",\"source\":{\"subagent\":{\"other\":\"guardian\"}}}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:07Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"guardian task\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:08Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"guardian answer\"}}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &child_thread_spawn,
+            concat!(
+                "{\"timestamp\":\"2026-08-31T10:00:09Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"child-thread-spawn\",\"cwd\":\"/work/app\",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"root\",\"depth\":1}}}}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:10Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"spawned task\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:11Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"spawned answer\"}}\n",
             ),
         )
         .unwrap();
@@ -1888,19 +1959,27 @@ mod tests {
         request.include_related = true;
         let with_child = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
         assert_eq!(with_child.status, "updated");
-        assert_eq!(with_child.related_session_ids, vec!["child"]);
+        assert_eq!(
+            with_child.related_session_ids,
+            vec![
+                "child",
+                "child-parent-thread",
+                "child-thread-spawn",
+                "grandchild"
+            ]
+        );
         let conn = open_db(&db).unwrap();
         let child_events: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM session_events WHERE source='codex' AND session_id='child'",
+                "SELECT COUNT(*) FROM session_events WHERE source='codex' AND session_id != 'root'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(child_events >= 2);
+        assert!(child_events >= 8);
         let child_prompts: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM history WHERE source='codex' AND session_id='child'",
+                "SELECT COUNT(*) FROM history WHERE source='codex' AND session_id != 'root'",
                 [],
                 |row| row.get(0),
             )
@@ -1908,7 +1987,7 @@ mod tests {
         assert_eq!(child_prompts, 0);
         let child_catalog: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sessions WHERE source='codex' AND session_id='child'",
+                "SELECT COUNT(*) FROM sessions WHERE source='codex' AND session_id != 'root'",
                 [],
                 |row| row.get(0),
             )
@@ -1927,6 +2006,15 @@ mod tests {
         assert_eq!(relationship.2, child.to_string_lossy());
         assert_eq!(relationship.3.as_deref(), Some("guardian"));
         assert!(relationship.4.is_some());
+        let grandchild_parent: String = conn
+            .query_row(
+                "SELECT parent_session_id FROM session_relationships \
+                 WHERE source='codex' AND child_session_id='grandchild'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(grandchild_parent, "child-thread-spawn");
     }
 
     #[test]
