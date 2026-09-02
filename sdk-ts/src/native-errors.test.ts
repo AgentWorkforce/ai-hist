@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
-  DatabaseOpenError, InvalidArgumentError, NativeContractMismatchError, SessionNotFoundError,
+  DatabaseOpenError, InvalidArgumentError, NATIVE_CONTRACT_VERSION, NativeContractMismatchError,
+  SessionNotFoundError,
   UnsupportedOperationError, discoverSessions, getSessionFileEditsPage, getSessionToolCallsPage,
   hydrateSession, listSessionCatalogPage, recent, stats, sync,
   validateNativeContract, validateNativeLocation, validateNativeScope,
@@ -15,7 +16,7 @@ test('missing database reads are explicit empty cache operations', async () => {
   const dbPath = join(root, 'missing', 'history.db');
   try {
     assert.deepEqual(await listSessionCatalogPage({ dbPath, limit: 20 }), {
-      contractVersion: 2, scope: 'local', sessions: [], nextCursor: null,
+      contractVersion: 3, scope: 'local', sessions: [], nextCursor: null,
     });
     assert.deepEqual(await getSessionToolCallsPage('claude', 'missing', { dbPath }), {
       contractVersion: 1, source: 'claude', sessionId: 'missing', toolCalls: [], nextCursor: null,
@@ -51,7 +52,7 @@ test('SDK/native contract mismatch is actionable', () => {
     () => validateNativeContract(999),
     (error: unknown) => error instanceof NativeContractMismatchError
       && error.code === 'NATIVE_CONTRACT_MISMATCH'
-      && /requires native contract 6/.test(error.message),
+      && error.message.includes(`requires native contract ${NATIVE_CONTRACT_VERSION}`),
   );
   assert.throws(
     () => validateNativeScope('cloud'),

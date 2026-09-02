@@ -246,6 +246,8 @@ export interface DiscoveryCounters {
   skippedUnchanged: number
   filesOpened: number
   bytesRead: number
+  providerQueries: number
+  recordsInspected: number
 }
 export interface SourceExemption {
   source: string

@@ -169,7 +169,7 @@ assert_eq "discovered sources" "$discovered_sources" "claude,codex,cursor,grok,o
 
 discover_contract=$(printf '%s\n' "$discover_json" | jsonl_field \
   'd.find((l) => l.type === "summary").contract_version')
-assert_eq "discover contract version" "$discover_contract" "2"
+assert_eq "discover contract version" "$discover_contract" "3"
 
 discover_trailer=$(printf '%s\n' "$discover_json" | jsonl_field 'd[d.length - 1].type')
 assert_eq "discover trailer" "$discover_trailer" "summary"
@@ -215,7 +215,7 @@ assert_eq "global discover limit" "$limited" "2"
 
 list_json=$("$ROOT/ai-hist" sessions list --json)
 list_contract=$(printf '%s\n' "$list_json" | json_field 'd.contract_version')
-assert_eq "sessions list contract version" "$list_contract" "2"
+assert_eq "sessions list contract version" "$list_contract" "3"
 
 list_sessions=$(printf '%s\n' "$list_json" | json_field \
   'd.sessions.map((s) => `${s.source}:${s.session_id}`).sort().join(",")')

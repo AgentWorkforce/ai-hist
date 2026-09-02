@@ -1600,7 +1600,7 @@ pub fn run() -> Result<()> {
 ///
 /// The JSON form is one object, not a bare array, so the contract version and
 /// the pagination cursor travel with the payload:
-/// `{"contract_version":2,"scope":"local","sessions":[…],"next_cursor":{…}|null}`. Feed
+/// `{"contract_version":3,"scope":"local","sessions":[…],"next_cursor":{…}|null}`. Feed
 /// `next_cursor` back as `--after-ms/--after-source/--after-session-id` to get
 /// the next page; it is null once the catalog is exhausted.
 fn print_session_catalog(page: &SessionCatalogPage, as_json: bool) -> Result<()> {

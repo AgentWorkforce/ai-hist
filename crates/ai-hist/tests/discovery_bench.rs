@@ -43,7 +43,7 @@
 //!    same bytes from a 5x larger archive.
 
 use ai_hist_core::open_db;
-use ai_hist_engine::discover::{HEAD_SCAN_MAX_BYTES, TAIL_SCAN_MAX_BYTES};
+use ai_hist_engine::discover::{EXCERPT_TRIM_WHITESPACE, HEAD_SCAN_MAX_BYTES, TAIL_SCAN_MAX_BYTES};
 use ai_hist_engine::{
     discover_sessions_with_env, list_session_catalog, CatalogListOptions, DiscoverOptions,
     DiscoveryEnv, DiscoverySummary,
@@ -53,6 +53,8 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -213,7 +215,11 @@ impl ArchiveBuilder {
         db.execute_batch(
             "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER, time_updated INTEGER);
              CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
-             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);",
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+             CREATE INDEX session_time_updated_id_idx ON session(time_updated DESC, id);
+             CREATE INDEX message_session_time_created_id_idx ON message(session_id, time_created, id);
+             CREATE INDEX part_session_idx ON part(session_id);
+             CREATE INDEX part_message_id_id_idx ON part(message_id, id);",
         )
         .expect("opencode schema");
         for index in 0..sessions {
@@ -400,6 +406,213 @@ fn session_catalog_performance_report() {
     measure_cache_only_listing(home.path());
     println!(
         "\nAll assertions above are operation counts. Timings are reported, never asserted.\n"
+    );
+}
+
+fn create_opencode_scaling_fixture(path: &Path, unrelated_sessions: usize) {
+    let db = Connection::open(path).expect("scaling opencode db");
+    db.pragma_update(None, "journal_mode", "WAL").unwrap();
+    db.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER, time_updated INTEGER);
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+         CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+         CREATE INDEX session_time_updated_id_idx ON session(time_updated DESC, id);
+         CREATE INDEX message_session_time_created_id_idx ON message(session_id, time_created, id);
+         CREATE INDEX part_session_idx ON part(session_id);
+         CREATE INDEX part_message_id_id_idx ON part(message_id, id);
+         BEGIN",
+    )
+    .unwrap();
+    let padding = "x".repeat(384);
+    for index in 0..unrelated_sessions {
+        let id = format!("ses_old_{index:06}");
+        let message = format!("msg_old_{index:06}");
+        db.execute(
+            "INSERT INTO session VALUES (?, '/work/old', ?, ?)",
+            rusqlite::params![id, index as i64, index as i64],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO message VALUES (?, ?, ?, ?)",
+            rusqlite::params![
+                message,
+                id,
+                index as i64,
+                r#"{"role":"user","modelID":"old-model"}"#
+            ],
+        )
+        .unwrap();
+        for part in 0..8 {
+            db.execute(
+                "INSERT INTO part VALUES (?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    format!("prt_old_{index:06}_{part}"),
+                    message,
+                    id,
+                    index as i64,
+                    format!(r#"{{"type":"tool","padding":"{padding}"}}"#)
+                ],
+            )
+            .unwrap();
+        }
+    }
+    for index in 0..20 {
+        let id = format!("ses_newest_{index:02}");
+        let message = format!("msg_newest_{index:02}");
+        let timestamp = 2_000_000_000_000_i64 + index as i64;
+        db.execute(
+            "INSERT INTO session VALUES (?, '/work/newest', ?, ?)",
+            rusqlite::params![id, timestamp, timestamp],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO message VALUES (?, ?, ?, '{\"role\":\"user\",\"modelID\":\"new-model\"}')",
+            rusqlite::params![message, id, timestamp],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO part VALUES (?, ?, ?, ?, '{\"type\":\"text\",\"text\":\"same newest prompt\"}')",
+            rusqlite::params![format!("prt_newest_{index:02}"), message, id, timestamp],
+        )
+        .unwrap();
+    }
+    db.execute_batch("COMMIT").unwrap();
+}
+
+fn opencode_plan<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> String {
+    conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map(params, |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join(" | ")
+}
+
+/// Fixed-limit OpenCode discovery against 1,000 and 10,000-session stores.
+/// Both stores contain the same newest 20 sessions; only unrelated message and
+/// part history grows. WAL commits run concurrently with each measurement.
+#[test]
+#[ignore = "benchmark: creates a 10,000-session OpenCode store with large unrelated histories"]
+fn opencode_fixed_limit_scaling_report() {
+    let root = tempfile::tempdir().unwrap();
+    let mut rows = Vec::new();
+    for unrelated in [1_000_usize, 10_000] {
+        let provider_path = root.path().join(format!("opencode-{unrelated}.db"));
+        create_opencode_scaling_fixture(&provider_path, unrelated);
+        let provider_bytes = fs::metadata(&provider_path).unwrap().len();
+
+        let planning = Connection::open(&provider_path).unwrap();
+        let candidate_plan = opencode_plan(
+            &planning,
+            "SELECT id, directory, time_created, time_updated FROM session
+             WHERE id IS NOT NULL AND id <> ''
+             ORDER BY time_updated DESC, id ASC LIMIT ?",
+            rusqlite::params![20_i64],
+        );
+        let prompt_plan = opencode_plan(
+            &planning,
+            "SELECT substr(json_extract(p.data, '$.text'), 1, ?)
+             FROM part p JOIN message m ON m.id = p.message_id
+             WHERE p.session_id = ? AND json_valid(m.data) AND json_valid(p.data)
+             AND json_extract(m.data, '$.role') = 'user'
+             AND json_extract(p.data, '$.type') = 'text'
+             AND json_type(p.data, '$.text') = 'text'
+             AND trim(substr(json_extract(p.data, '$.text'), 1, ?), ?) <> ''
+             ORDER BY COALESCE(p.time_created, m.time_created) ASC LIMIT 1",
+            rusqlite::params![4096_i64, "ses_newest_19", 4096_i64, EXCERPT_TRIM_WHITESPACE],
+        );
+        let model_plan = opencode_plan(
+            &planning,
+            "SELECT COALESCE(json_extract(data, '$.modelID'),
+                             json_extract(data, '$.model.modelID'))
+             FROM message WHERE session_id = ? AND json_valid(data)
+             AND COALESCE(json_extract(data, '$.modelID'),
+                          json_extract(data, '$.model.modelID')) IS NOT NULL LIMIT 1",
+            rusqlite::params!["ses_newest_19"],
+        );
+        assert!(
+            candidate_plan.contains("session_time_updated_id_idx"),
+            "{candidate_plan}"
+        );
+        assert!(
+            prompt_plan.contains("SEARCH p USING INDEX part_session_idx"),
+            "{prompt_plan}"
+        );
+        assert!(!prompt_plan.contains("SCAN p"), "{prompt_plan}");
+        assert!(!prompt_plan.contains("SCAN m"), "{prompt_plan}");
+        assert!(
+            model_plan.contains("SEARCH message USING INDEX message_session_time_created_id_idx"),
+            "{model_plan}"
+        );
+        assert!(!model_plan.contains("SCAN message"), "{model_plan}");
+        drop(planning);
+
+        let running = Arc::new(AtomicBool::new(true));
+        let writer_running = Arc::clone(&running);
+        let writer_path = provider_path.clone();
+        let writer = std::thread::spawn(move || {
+            let writer = Connection::open(writer_path).unwrap();
+            writer.busy_timeout(Duration::from_secs(1)).unwrap();
+            while writer_running.load(Ordering::Relaxed) {
+                writer
+                    .execute(
+                        "UPDATE session SET directory = CASE directory WHEN '/work/old' THEN '/work/old.' ELSE '/work/old' END WHERE id = 'ses_old_000000'",
+                        [],
+                    )
+                    .unwrap();
+            }
+        });
+
+        let mut samples = Vec::new();
+        let mut last_summary = None;
+        for _ in 0..5 {
+            let ledger = tempfile::tempdir().unwrap();
+            let conn = open_db(&ledger.path().join("catalog.db")).unwrap();
+            let env =
+                DiscoveryEnv::with_roots(&conn, root.path().to_path_buf(), provider_path.clone());
+            let options = DiscoverOptions {
+                sources: vec!["opencode".into()],
+                limit: Some(20),
+                ..Default::default()
+            };
+            let started = Instant::now();
+            let summary = discover_sessions_with_env(&env, &options, |_| {}).unwrap();
+            samples.push(started.elapsed());
+            last_summary = Some(summary);
+        }
+        running.store(false, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        let summary = last_summary.unwrap();
+        assert_eq!(summary.discovered, 20);
+        assert_eq!(summary.counters.candidates_enumerated, 20);
+        assert_eq!(summary.counters.shallow_reads, 20);
+        assert_eq!(summary.counters.provider_queries, 41);
+        assert_eq!(summary.counters.records_inspected, 60);
+        assert_eq!(summary.counters.bytes_read, 0);
+        rows.push(vec![
+            unrelated.to_string(),
+            bytes(provider_bytes),
+            summary.counters.candidates_enumerated.to_string(),
+            summary.counters.provider_queries.to_string(),
+            summary.counters.records_inspected.to_string(),
+            micros(median(samples)),
+        ]);
+        println!("  {unrelated} session candidate plan: {candidate_plan}");
+        println!("  {unrelated} session prompt plan: {prompt_plan}");
+    }
+    table(
+        "OpenCode fixed-limit cold discovery with concurrent WAL writes",
+        &[
+            "unrelated sessions",
+            "database",
+            "candidates",
+            "queries",
+            "records",
+            "median",
+        ],
+        &rows,
     );
 }
 
@@ -660,7 +873,7 @@ fn measure_bounded_request(home: &Path, counts: &ArchiveCounts) {
     );
     assert!(
         counter(&small, "bytes_read") <= budget + 64 * 1024,
-        "five bounded reads must stay inside {} plus the opencode snapshot",
+        "five bounded reads must stay inside the documented file-read budget of {}",
         bytes(budget)
     );
     assert!(

@@ -58,11 +58,12 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
-use std::time::Duration;
 
-use ai_hist_core::{upsert_session_presence, SessionLocation, SessionScope, SOURCE_CHOICES};
+use ai_hist_core::{
+    open_db_readonly, upsert_session_presence, SessionLocation, SessionScope, SOURCE_CHOICES,
+};
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, DatabaseName, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -70,7 +71,7 @@ use serde_json::Value;
 ///
 /// Bumped when the shape or meaning of [`ShallowSession`] / the CLI JSON
 /// payloads changes in a way a consumer must notice.
-pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 2;
+pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 3;
 
 /// Version of the shallow scanners themselves.
 ///
@@ -88,6 +89,16 @@ pub const HEAD_SCAN_MAX_LINES: usize = 400;
 pub const TAIL_SCAN_MAX_BYTES: u64 = 64 * 1024;
 /// Character cap for stored text excerpts, matching `last_assistant_text`.
 pub const EXCERPT_MAX_CHARS: usize = 4096;
+/// Unicode White_Space characters recognized by Rust's `str::trim`.
+///
+/// SQLite's one-argument `trim` removes only U+0020, so SQL predicates that
+/// decide whether an excerpt is substantive must pass this exact character
+/// set explicitly to stay in lockstep with [`excerpt`].
+pub const EXCERPT_TRIM_WHITESPACE: &str = concat!(
+    "\u{0009}\u{000A}\u{000B}\u{000C}\u{000D}\u{0020}\u{0085}\u{00A0}",
+    "\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}",
+    "\u{2007}\u{2008}\u{2009}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}"
+);
 /// Default row cap for `list_session_catalog` when the caller gives none.
 pub const DEFAULT_CATALOG_LIMIT: i64 = 50;
 
@@ -189,10 +200,18 @@ pub struct DiscoveryCounters {
     pub shallow_reads: u64,
     /// Candidates served from the catalog because their stamp was unchanged.
     pub skipped_unchanged: u64,
-    /// Provider files (and database snapshots) opened for reading.
+    /// Provider files and live provider databases opened for reading.
     pub files_opened: u64,
-    /// Bytes read out of provider sources.
+    /// Bytes read explicitly from file-backed provider sources. SQLite does
+    /// not expose exact filesystem bytes, so database reads never contribute.
     pub bytes_read: u64,
+    /// Bounded provider data queries issued. Schema-capability introspection is
+    /// excluded. Currently used by OpenCode.
+    pub provider_queries: u64,
+    /// Rows returned by bounded provider data queries. Currently used by
+    /// OpenCode to make session/message/part work visible without pretending
+    /// SQLite reports exact bytes.
+    pub records_inspected: u64,
 }
 
 /// Thread-safe accumulator behind [`DiscoveryCounters`], shared with the read
@@ -204,6 +223,8 @@ struct CounterCell {
     skipped_unchanged: AtomicU64,
     files_opened: AtomicU64,
     bytes_read: AtomicU64,
+    provider_queries: AtomicU64,
+    records_inspected: AtomicU64,
 }
 
 impl CounterCell {
@@ -214,6 +235,8 @@ impl CounterCell {
             skipped_unchanged: self.skipped_unchanged.load(Ordering::Relaxed),
             files_opened: self.files_opened.load(Ordering::Relaxed),
             bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            provider_queries: self.provider_queries.load(Ordering::Relaxed),
+            records_inspected: self.records_inspected.load(Ordering::Relaxed),
         }
     }
 }
@@ -311,6 +334,18 @@ impl ScanEnv<'_> {
     fn note_bytes(&self, bytes: u64) {
         self.counters.bytes_read.fetch_add(bytes, Ordering::Relaxed);
     }
+
+    fn note_query(&self) {
+        self.counters
+            .provider_queries
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_records(&self, records: u64) {
+        self.counters
+            .records_inspected
+            .fetch_add(records, Ordering::Relaxed);
+    }
 }
 
 /// What a provider's [`read_shallow`](ShallowSessionProvider::read_shallow)
@@ -345,7 +380,11 @@ pub trait ShallowSessionProvider: Sync {
     /// Cheap enumeration: directory walk + stat, or one indexed query. For a
     /// remote connector the bounded service listing *is* the enumeration —
     /// there is no cheaper way to learn what exists.
-    fn enumerate(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>>;
+    fn enumerate(
+        &self,
+        env: &DiscoveryEnv<'_>,
+        requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>>;
     /// What [`read_shallow`](ShallowSessionProvider::read_shallow) touches.
     fn read_access(&self) -> ShallowReadAccess {
         ShallowReadAccess::Filesystem
@@ -629,7 +668,11 @@ impl ShallowSessionProvider for ClaudeProvider {
         "claude"
     }
 
-    fn enumerate(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+    fn enumerate(
+        &self,
+        env: &DiscoveryEnv<'_>,
+        _requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
         file_candidates(
             "claude",
             crate::collect_matching_files(&env.home.join(".claude/projects"), "", "jsonl")?,
@@ -788,7 +831,11 @@ impl ShallowSessionProvider for CodexProvider {
         "codex"
     }
 
-    fn enumerate(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+    fn enumerate(
+        &self,
+        env: &DiscoveryEnv<'_>,
+        _requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
         let mut files = Vec::new();
         for root in [
             env.home.join(".codex/sessions"),
@@ -934,7 +981,11 @@ impl ShallowSessionProvider for CursorProvider {
         "cursor"
     }
 
-    fn enumerate(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+    fn enumerate(
+        &self,
+        env: &DiscoveryEnv<'_>,
+        _requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
         let root = env.home.join(".cursor/projects");
         let mut out = Vec::new();
         for project_dir in crate::sorted_dirs(&root)? {
@@ -1016,7 +1067,11 @@ impl ShallowSessionProvider for GrokProvider {
         "grok"
     }
 
-    fn enumerate(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+    fn enumerate(
+        &self,
+        env: &DiscoveryEnv<'_>,
+        _requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
         file_candidates(
             "grok",
             crate::collect_matching_files(
@@ -1123,101 +1178,147 @@ impl ShallowSessionProvider for GrokProvider {
 // opencode
 // ---------------------------------------------------------------------------
 
-/// Shallow adapter over the opencode SQLite store.
+/// Shallow adapter over the live OpenCode SQLite store.
 ///
-/// Reads the `session` table directly instead of the full sync's
-/// session/message/part join. The database is snapshotted once per run with
-/// `Connection::backup`, exactly as the full sync does, so an in-flight WAL
-/// never yields a torn read.
+/// One read-only connection and one deferred transaction live for the whole
+/// discovery run. The first schema read establishes a coherent SQLite
+/// snapshot; candidate enumeration and every selected-session query therefore
+/// see the same committed state even while OpenCode appends in WAL mode.
 ///
-/// The snapshot is held open on one connection for the whole run, and —
-/// because it is a private throwaway copy — indexed by `session_id` up
-/// front when the live store isn't: the per-candidate excerpt and model
-/// queries then seek instead of scanning `message` and `part` once per
-/// session, which made a cold discovery quadratic in store size.
+/// No provider DDL is ever issued. Before querying `message` or `part`, the
+/// adapter verifies that an existing provider index can seek by session (or by
+/// message after a session seek). Metadata remains available on older schemas,
+/// but prompt/model extraction is omitted when it would require a table scan.
 #[derive(Default)]
 struct OpencodeProvider {
-    snapshot: Mutex<Option<OpencodeSnapshot>>,
+    live: Mutex<Option<OpencodeReadSnapshot>>,
 }
 
-/// One run's open snapshot: the connection, plus per-store facts that are
-/// invariant across candidates and so are read exactly once.
-struct OpencodeSnapshot {
+#[derive(Clone)]
+struct OpencodeSessionSeed {
+    directory: Option<String>,
+    created: Option<i64>,
+    updated: Option<i64>,
+}
+
+/// One run's coherent live snapshot and the schema/index facts that are
+/// invariant across its selected candidates.
+struct OpencodeReadSnapshot {
     conn: Connection,
+    store_identity: String,
     session_columns: BTreeSet<String>,
-    /// Keeps the snapshot file on disk for as long as the connection lives.
-    _file: tempfile::TempPath,
+    message_columns: BTreeSet<String>,
+    part_columns: BTreeSet<String>,
+    message_by_session: bool,
+    part_by_session: bool,
+    part_by_message: bool,
+    sessions: BTreeMap<String, OpencodeSessionSeed>,
 }
 
 impl OpencodeProvider {
-    /// The run's snapshot, created on first use. `None` inside the guard
-    /// means there is no opencode store on this machine.
-    fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<OpencodeSnapshot>>> {
-        let mut guard = self.snapshot.lock().expect("opencode snapshot lock");
+    /// Open the provider once, read-only, and start the transaction that pins
+    /// the run's SQLite snapshot. `None` means there is no OpenCode store.
+    fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<OpencodeReadSnapshot>>> {
+        let mut guard = self.live.lock().expect("opencode live snapshot lock");
         if guard.is_none() && scan.opencode_db.exists() {
-            let file = tempfile::NamedTempFile::new()?.into_temp_path();
-            let live = Connection::open_with_flags(
-                scan.opencode_db,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-            )
-            .with_context(|| format!("opening {}", scan.opencode_db.display()))?;
-            live.busy_timeout(Duration::from_secs(5))?;
-            live.backup(DatabaseName::Main, &file, None)
-                .with_context(|| format!("snapshotting {}", scan.opencode_db.display()))?;
-            scan.note_open();
-            scan.note_bytes(fs::metadata(scan.opencode_db).map(|m| m.len()).unwrap_or(0));
-            let conn = Connection::open(&file)?;
-            index_opencode_snapshot(&conn)?;
-            let session_columns = table_columns(&conn, "session");
-            *guard = Some(OpencodeSnapshot {
-                conn,
-                session_columns,
-                _file: file,
-            });
+            *guard = Some(open_opencode_snapshot(scan)?);
         }
         Ok(guard)
     }
 }
 
-/// Give the snapshot the `session_id` seeks the per-candidate queries need,
-/// unless the store already ships an equivalent index. Nobody else reads the
-/// snapshot and it never outlives the run, so durability is turned off: the
-/// build costs one scan per table instead of one scan per candidate.
-fn index_opencode_snapshot(conn: &Connection) -> Result<()> {
-    let mut ddl = String::new();
-    for table in ["message", "part"] {
-        if table_columns(conn, table).contains("session_id") && !has_session_id_index(conn, table) {
-            ddl.push_str(&format!(
-                "CREATE INDEX ai_hist_{table}_session ON {table}(session_id);"
-            ));
+/// Open a connection whose filesystem generation is known to match the path
+/// we inspected. The before/after check closes the replacement race between
+/// SQLite opening the file and RelayHistory computing the source stamp.
+fn open_opencode_snapshot(scan: &ScanEnv<'_>) -> Result<OpencodeReadSnapshot> {
+    for _ in 0..3 {
+        let generation_before = opencode_store_generation(scan.opencode_db)?;
+        let conn = open_db_readonly(scan.opencode_db)?;
+        scan.note_open();
+        conn.execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED")?;
+        let session_columns = table_columns(&conn, "session")?;
+        let message_columns = table_columns(&conn, "message")?;
+        let part_columns = table_columns(&conn, "part")?;
+        let message_by_session = has_leading_index(&conn, "message", "session_id")?;
+        let part_by_session = has_leading_index(&conn, "part", "session_id")?;
+        let part_by_message = has_leading_index(&conn, "part", "message_id")?;
+        let schema_version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+        let generation_after = opencode_store_generation(scan.opencode_db)?;
+        if generation_before != generation_after {
+            continue;
+        }
+        return Ok(OpencodeReadSnapshot {
+            conn,
+            store_identity: format!("{generation_before}:{schema_version}"),
+            session_columns,
+            message_columns,
+            part_columns,
+            message_by_session,
+            part_by_session,
+            part_by_message,
+            sessions: BTreeMap::new(),
+        });
+    }
+    anyhow::bail!(
+        "OpenCode database {} was repeatedly replaced while discovery opened it",
+        scan.opencode_db.display()
+    )
+}
+
+/// Whether `table` already has an index whose leading column is `column`.
+/// SQLite's primary-key autoindexes are included by the pragma.
+fn has_leading_index(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    Ok(conn
+        .prepare(&format!(
+            "SELECT 1 FROM pragma_index_list('{table}') indexes \
+         JOIN pragma_index_info(indexes.name) columns \
+         WHERE columns.seqno = 0 AND columns.name = ? LIMIT 1"
+        ))?
+        .query_row([column], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// Whether an existing provider index has exactly the ordered prefix needed
+/// to apply a deterministic SQL LIMIT without sorting an unbounded tie group.
+fn has_ordered_index_prefix(
+    conn: &Connection,
+    table: &str,
+    prefix: &[(&str, bool)],
+) -> Result<bool> {
+    let mut indexes = conn.prepare(&format!("SELECT name FROM pragma_index_list('{table}')"))?;
+    let names = indexes
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for name in names {
+        let mut columns = conn.prepare(
+            "SELECT name, desc FROM pragma_index_xinfo(?) \
+             WHERE key = 1 ORDER BY seqno",
+        )?;
+        let ordered = columns
+            .query_map([name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if ordered.len() >= prefix.len()
+            && ordered
+                .iter()
+                .zip(prefix)
+                .all(|((actual_name, actual_desc), (name, desc))| {
+                    actual_name == name && actual_desc == desc
+                })
+        {
+            return Ok(true);
         }
     }
-    if !ddl.is_empty() {
-        conn.execute_batch(&format!(
-            "PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; {ddl}"
-        ))?;
-    }
-    Ok(())
+    Ok(false)
 }
 
-/// Whether `table` already has an index whose leading column is `session_id`.
-fn has_session_id_index(conn: &Connection, table: &str) -> bool {
-    conn.prepare(&format!(
-        "SELECT 1 FROM pragma_index_list('{table}') indexes \
-         JOIN pragma_index_info(indexes.name) columns \
-         WHERE columns.seqno = 0 AND columns.name = 'session_id' LIMIT 1"
-    ))
-    .and_then(|mut stmt| stmt.query_row([], |_| Ok(())))
-    .is_ok()
-}
-
-fn table_columns(conn: &Connection, table: &str) -> BTreeSet<String> {
-    conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<BTreeSet<String>>>()
-        })
-        .unwrap_or_default()
+fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
+    Ok(conn
+        .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<String>>>()?)
 }
 
 impl ShallowSessionProvider for OpencodeProvider {
@@ -1225,9 +1326,14 @@ impl ShallowSessionProvider for OpencodeProvider {
         "opencode"
     }
 
-    fn enumerate(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
-        let guard = self.snapshot(&env.scan())?;
-        let Some(snapshot) = guard.as_ref() else {
+    fn enumerate(
+        &self,
+        env: &DiscoveryEnv<'_>,
+        requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
+        let scan = env.scan();
+        let mut guard = self.snapshot(&scan)?;
+        let Some(snapshot) = guard.as_mut() else {
             return Ok(Vec::new());
         };
         let columns = &snapshot.session_columns;
@@ -1244,29 +1350,81 @@ impl ShallowSessionProvider for OpencodeProvider {
         } else {
             "NULL"
         };
+        let directory = if columns.contains("directory") {
+            "directory"
+        } else {
+            "NULL"
+        };
+        // Current OpenCode releases index the session primary key but do not
+        // all provide the compound ordering needed to apply both update
+        // recency and the global id tie-break before LIMIT. Otherwise the
+        // provider's descending, time-encoded `ses_` ids make PRIMARY KEY ASC
+        // a bounded newest-created fallback; resumed old sessions can be
+        // delayed on that schema (documented).
+        let recency_order = if columns.contains("time_updated")
+            && has_ordered_index_prefix(
+                &snapshot.conn,
+                "session",
+                &[("time_updated", true), ("id", false)],
+            )? {
+            "time_updated DESC, id ASC"
+        } else {
+            "id ASC"
+        };
+        let sqlite_limit = requested_limit
+            .map(i64::try_from)
+            .transpose()
+            .context("OpenCode discovery limit exceeds SQLite's signed 64-bit range")?;
+        let limit_sql = sqlite_limit.map(|_| " LIMIT ?").unwrap_or_default();
         let sql = format!(
-            "SELECT id, {created}, {updated} FROM session WHERE id IS NOT NULL AND id <> ''"
+            "SELECT id, {directory}, {created}, {updated} FROM session \
+             WHERE id IS NOT NULL AND id <> '' ORDER BY {recency_order}{limit_sql}"
         );
         let mut stmt = snapshot.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        scan.note_query();
+        let collect = |row: &rusqlite::Row<'_>| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        };
+        let rows = match sqlite_limit {
+            Some(limit) => stmt
+                .query_map([limit], collect)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map([], collect)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        scan.note_records(rows.len() as u64);
+        snapshot.sessions = rows
+            .iter()
+            .map(|(id, directory, created, updated)| {
+                (
+                    id.clone(),
+                    OpencodeSessionSeed {
+                        directory: directory.clone(),
+                        created: *created,
+                        updated: *updated,
+                    },
+                )
+            })
+            .collect();
         Ok(rows
             .into_iter()
-            .map(|(id, created, updated)| Candidate {
+            .map(|(id, _directory, created, updated)| Candidate {
                 source: "opencode",
                 locator: id.clone(),
                 session_id: Some(id),
                 recency_hint_ms: updated.or(created),
-                // Opencode has no file per session; the session's own
-                // created/updated stamps are its change marker.
-                stamp: format!("{}:{}", created.unwrap_or(0), updated.unwrap_or(0)),
+                stamp: format!(
+                    "{}:{}:{}",
+                    snapshot.store_identity,
+                    created.unwrap_or(0),
+                    updated.unwrap_or(0)
+                ),
             })
             .collect())
     }
@@ -1282,78 +1440,93 @@ impl ShallowSessionProvider for OpencodeProvider {
             return Ok(None);
         };
         let conn = &snapshot.conn;
-        let columns = &snapshot.session_columns;
-        let directory = if columns.contains("directory") {
-            "directory"
-        } else {
-            "NULL"
-        };
-        let created = if columns.contains("time_created") {
-            "time_created"
-        } else {
-            "NULL"
-        };
-        let updated = if columns.contains("time_updated") {
-            "time_updated"
-        } else {
-            "NULL"
-        };
-        let sql = format!("SELECT {directory}, {created}, {updated} FROM session WHERE id = ?");
-        let row = conn
-            .prepare_cached(&sql)
-            .and_then(|mut stmt| {
-                stmt.query_row([&candidate.locator], |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                    ))
-                })
-            })
-            .ok();
-        let Some((directory, created, updated)) = row else {
+        let Some(seed) = snapshot.sessions.get(&candidate.locator).cloned() else {
             return Ok(None);
         };
         // The excerpt is cut in SQL, not in Rust: a single opencode part can
         // hold a whole pasted file, and materializing it just to take the
         // first 4096 characters would break the bounded-read promise for a
         // catalog entry.
-        let first_prompt = conn
-            .prepare_cached(
+        let prompt_schema = snapshot.part_columns.contains("data")
+            && snapshot.part_columns.contains("message_id")
+            && snapshot.message_columns.contains("id")
+            && snapshot.message_columns.contains("data");
+        let first_prompt = if prompt_schema
+            && (snapshot.part_by_session
+                || (snapshot.message_by_session && snapshot.part_by_message))
+        {
+            let keyed_predicate = if snapshot.part_by_session {
+                "p.session_id = ?"
+            } else {
+                "m.session_id = ?"
+            };
+            let order = match (
+                snapshot.part_columns.contains("time_created"),
+                snapshot.message_columns.contains("time_created"),
+            ) {
+                (true, true) => "COALESCE(p.time_created, m.time_created)",
+                (true, false) => "p.time_created",
+                (false, true) => "m.time_created",
+                (false, false) => "p.id",
+            };
+            let sql = format!(
                 "SELECT substr(json_extract(p.data, '$.text'), 1, ?) \
                  FROM part p JOIN message m ON m.id = p.message_id \
-                 WHERE p.session_id = ? AND json_extract(m.data, '$.role') = 'user' \
+                 WHERE {keyed_predicate} AND json_valid(m.data) AND json_valid(p.data) \
+                 AND json_extract(m.data, '$.role') = 'user' \
                  AND json_extract(p.data, '$.type') = 'text' \
-                 ORDER BY COALESCE(p.time_created, m.time_created) ASC LIMIT 1",
-            )
-            .and_then(|mut stmt| {
+                 AND json_type(p.data, '$.text') = 'text' \
+                 AND trim(substr(json_extract(p.data, '$.text'), 1, ?), ?) <> '' \
+                 ORDER BY {order} ASC LIMIT 1"
+            );
+            scan.note_query();
+            let prompt = {
+                let mut stmt = conn.prepare_cached(&sql)?;
                 stmt.query_row(
-                    params![EXCERPT_MAX_CHARS as i64, &candidate.locator],
-                    |row| row.get::<_, Option<String>>(0),
+                    params![
+                        EXCERPT_MAX_CHARS as i64,
+                        &candidate.locator,
+                        EXCERPT_MAX_CHARS as i64,
+                        EXCERPT_TRIM_WHITESPACE
+                    ],
+                    |row| row.get::<_, String>(0),
                 )
-            })
-            .ok()
-            .flatten()
-            .map(|text| excerpt(&text))
-            .filter(|text| !text.is_empty());
+                .optional()?
+            };
+            scan.note_records(u64::from(prompt.is_some()));
+            prompt
+                .map(|text| excerpt(&text))
+                .filter(|text| !text.is_empty())
+        } else {
+            None
+        };
         let mut models = Vec::new();
-        if let Ok(model) = conn
-            .prepare_cached(
-                "SELECT json_extract(data, '$.modelID') FROM message \
-                 WHERE session_id = ? AND json_extract(data, '$.modelID') IS NOT NULL LIMIT 1",
-            )
-            .and_then(|mut stmt| {
-                stmt.query_row([&candidate.locator], |row| row.get::<_, Option<String>>(0))
-            })
+        if snapshot.message_by_session
+            && snapshot.message_columns.contains("session_id")
+            && snapshot.message_columns.contains("data")
         {
+            scan.note_query();
+            let model = {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT COALESCE(json_extract(data, '$.modelID'), \
+                                            json_extract(data, '$.model.modelID')) \
+                     FROM message WHERE session_id = ? AND json_valid(data) \
+                     AND COALESCE(json_extract(data, '$.modelID'), \
+                                  json_extract(data, '$.model.modelID')) IS NOT NULL LIMIT 1",
+                )?;
+                stmt.query_row([&candidate.locator], |row| row.get::<_, Option<String>>(0))
+                    .optional()?
+                    .flatten()
+            };
+            scan.note_records(u64::from(model.is_some()));
             push_unique(&mut models, model.as_deref());
         }
         Ok(Some(ShallowSession {
             source: "opencode".into(),
             session_id: candidate.locator.clone(),
-            cwd: directory,
-            first_activity_ms: created,
-            last_activity_ms: updated.or(created),
+            cwd: seed.directory,
+            first_activity_ms: seed.created,
+            last_activity_ms: seed.updated.or(seed.created),
             first_prompt,
             models,
             // Preserve which concrete OpenCode store produced this catalog
@@ -1362,6 +1535,38 @@ impl ShallowSessionProvider for OpencodeProvider {
             ..Default::default()
         }))
     }
+}
+
+fn file_generation_time(metadata: &fs::Metadata) -> u128 {
+    metadata
+        .created()
+        .or_else(|_| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn opencode_store_generation(path: &Path) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(path)?;
+    Ok(format!(
+        "{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        file_generation_time(&metadata)
+    ))
+}
+
+#[cfg(not(unix))]
+fn opencode_store_generation(path: &Path) -> Result<String> {
+    let metadata = fs::metadata(path)?;
+    Ok(format!(
+        "{}:{}",
+        metadata.len(),
+        file_generation_time(&metadata)
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1382,7 +1587,11 @@ impl ShallowSessionProvider for RelayProvider {
         "relay"
     }
 
-    fn enumerate(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+    fn enumerate(
+        &self,
+        env: &DiscoveryEnv<'_>,
+        _requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
         let mut stmt = env.conn().prepare(
             "SELECT session_id, MAX(timestamp_ms), COUNT(*) FROM history \
              WHERE source = 'relay' AND session_id IS NOT NULL AND session_id <> '' \
@@ -2150,7 +2359,7 @@ pub fn discover_sessions_with_providers(
             .providers
             .entry(provider.source().to_string())
             .or_default();
-        match provider.enumerate(env) {
+        match provider.enumerate(env, options.limit) {
             Ok(found) => {
                 entry.candidates += found.len();
                 env.note_candidates(found.len() as u64);

@@ -84,6 +84,10 @@ fn opencode_db(home: &Path, statements: &str) {
         "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER, time_updated INTEGER);
          CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
          CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+         CREATE INDEX session_time_updated_id_idx ON session(time_updated DESC, id);
+         CREATE INDEX message_session_time_created_id_idx ON message(session_id, time_created, id);
+         CREATE INDEX part_session_idx ON part(session_id);
+         CREATE INDEX part_message_id_id_idx ON part(message_id, id);
          {statements}"
     ))
     .expect("opencode fixture");
@@ -813,6 +817,448 @@ fn a_huge_opencode_part_is_truncated_before_it_reaches_rust() {
         )
         .unwrap();
     assert_eq!(stored.chars().count(), EXCERPT_MAX_CHARS);
+}
+
+#[test]
+fn opencode_sql_uses_the_same_whitespace_set_as_rust_excerpts() {
+    let rust_whitespace: String = ('\0'..=char::MAX)
+        .filter(|character| character.is_whitespace())
+        .collect();
+    assert_eq!(EXCERPT_TRIM_WHITESPACE, rust_whitespace);
+}
+
+#[test]
+fn empty_and_minimal_opencode_schemas_are_tolerated() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(home.path(), "");
+    let empty = discover(&conn, home.path(), &only(&["opencode"]));
+    assert!(empty.rows.is_empty());
+    assert_eq!(empty.summary.counters.provider_queries, 1);
+    assert_eq!(empty.summary.counters.records_inspected, 0);
+
+    fs::remove_file(home.path().join("opencode.db")).unwrap();
+    let db = Connection::open(home.path().join("opencode.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY); INSERT INTO session VALUES ('ses_minimal');",
+    )
+    .unwrap();
+    drop(db);
+    let minimal = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(minimal.ids(), vec!["opencode:ses_minimal"]);
+    let row = minimal.row("ses_minimal");
+    assert_eq!(row.cwd, None);
+    assert_eq!(row.first_prompt, None);
+    assert!(row.models.is_empty());
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn opencode_rejects_a_limit_that_sqlite_cannot_represent() {
+    let catalog = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(home.path(), "");
+    let env = env_at(&catalog, home.path());
+    let error = OpencodeProvider::default()
+        .enumerate(&env, Some(usize::MAX))
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("limit exceeds SQLite's signed 64-bit range"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn opencode_fixed_limit_does_not_inspect_unrelated_history() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let db = Connection::open(home.path().join("opencode.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER, time_updated INTEGER);
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+         CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+         CREATE INDEX session_time_updated_id_idx ON session(time_updated DESC, id);
+         CREATE INDEX message_session_time_created_id_idx ON message(session_id, time_created, id);
+         CREATE INDEX part_session_idx ON part(session_id);
+         CREATE INDEX part_message_id_id_idx ON part(message_id, id);
+         BEGIN",
+    )
+    .unwrap();
+    for index in 0..2_000_i64 {
+        let id = format!("ses_{index:06}");
+        let message = format!("msg_{index:06}");
+        db.execute(
+            "INSERT INTO session VALUES (?, '/work/oc', ?, ?)",
+            params![id, index, index],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO message VALUES (?, ?, ?, '{\"role\":\"user\",\"modelID\":\"bounded-model\"}')",
+            params![message, id, index],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO part VALUES (?, ?, ?, ?, '{\"type\":\"text\",\"text\":\"bounded prompt\"}')",
+            params![format!("prt_{index:06}"), message, id, index],
+        )
+        .unwrap();
+        // Large unrelated histories make an accidental scan expensive and
+        // visible to the query-plan assertions below.
+        for extra in 0..3 {
+            db.execute(
+                "INSERT INTO part VALUES (?, ?, ?, ?, '{\"type\":\"tool\"}')",
+                params![
+                    format!("prt_{index:06}_{extra}"),
+                    message,
+                    id,
+                    index + extra
+                ],
+            )
+            .unwrap();
+        }
+    }
+    db.execute_batch("COMMIT").unwrap();
+    drop(db);
+
+    let found = discover(
+        &conn,
+        home.path(),
+        &DiscoverOptions {
+            sources: vec!["opencode".into()],
+            limit: Some(20),
+            ..Default::default()
+        },
+    );
+    assert_eq!(found.rows.len(), 20);
+    assert_eq!(found.summary.counters.candidates_enumerated, 20);
+    assert_eq!(found.summary.counters.shallow_reads, 20);
+    assert_eq!(found.summary.counters.provider_queries, 41);
+    assert_eq!(found.summary.counters.records_inspected, 60);
+    assert_eq!(found.summary.counters.bytes_read, 0);
+    assert_eq!(found.summary.counters.files_opened, 1);
+
+    let unchanged = discover(
+        &conn,
+        home.path(),
+        &DiscoverOptions {
+            sources: vec!["opencode".into()],
+            limit: Some(20),
+            ..Default::default()
+        },
+    );
+    assert_eq!(unchanged.summary.counters.candidates_enumerated, 20);
+    assert_eq!(unchanged.summary.counters.shallow_reads, 0);
+    assert_eq!(unchanged.summary.counters.provider_queries, 1);
+    assert_eq!(unchanged.summary.counters.records_inspected, 20);
+    assert_eq!(unchanged.summary.counters.bytes_read, 0);
+}
+
+#[test]
+fn opencode_applies_the_global_id_tiebreak_before_its_limit() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(
+        home.path(),
+        "INSERT INTO session VALUES ('ses_c', '/c', 1, 10);
+         INSERT INTO session VALUES ('ses_a', '/a', 1, 10);
+         INSERT INTO session VALUES ('ses_b', '/b', 1, 10);",
+    );
+    let found = discover(
+        &conn,
+        home.path(),
+        &DiscoverOptions {
+            sources: vec!["opencode".into()],
+            limit: Some(2),
+            ..Default::default()
+        },
+    );
+    assert_eq!(found.ids(), vec!["opencode:ses_a", "opencode:ses_b"]);
+}
+
+fn explain_details<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> String {
+    conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map(params, |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join("\n")
+}
+
+#[test]
+fn opencode_selected_session_queries_use_provider_indexes() {
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(home.path(), "");
+    let db = Connection::open(home.path().join("opencode.db")).unwrap();
+    let prompt = explain_details(
+        &db,
+        "SELECT substr(json_extract(p.data, '$.text'), 1, ?)
+         FROM part p JOIN message m ON m.id = p.message_id
+         WHERE p.session_id = ? AND json_valid(m.data) AND json_valid(p.data)
+           AND json_extract(m.data, '$.role') = 'user'
+           AND json_extract(p.data, '$.type') = 'text'
+           AND json_type(p.data, '$.text') = 'text'
+           AND trim(substr(json_extract(p.data, '$.text'), 1, ?), ?) <> ''
+         ORDER BY COALESCE(p.time_created, m.time_created) ASC LIMIT 1",
+        rusqlite::params![
+            EXCERPT_MAX_CHARS as i64,
+            "selected",
+            EXCERPT_MAX_CHARS as i64,
+            EXCERPT_TRIM_WHITESPACE
+        ],
+    );
+    assert!(
+        prompt.contains("SEARCH p USING INDEX part_session_idx"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("SEARCH m USING INDEX"), "{prompt}");
+    assert!(!prompt.contains("SCAN p"), "{prompt}");
+    assert!(!prompt.contains("SCAN m"), "{prompt}");
+
+    let model = explain_details(
+        &db,
+        "SELECT COALESCE(json_extract(data, '$.modelID'), json_extract(data, '$.model.modelID'))
+         FROM message WHERE session_id = 'selected' AND json_valid(data)
+         AND COALESCE(json_extract(data, '$.modelID'),
+                      json_extract(data, '$.model.modelID')) IS NOT NULL LIMIT 1",
+        [],
+    );
+    assert!(
+        model.contains("SEARCH message USING INDEX message_session_time_created_id_idx"),
+        "{model}"
+    );
+    assert!(!model.contains("SCAN message"), "{model}");
+}
+
+#[test]
+fn unindexed_opencode_history_is_not_scanned_or_mutated() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("opencode.db");
+    let db = Connection::open(&db_path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER, time_updated INTEGER);
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+         CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+         INSERT INTO session VALUES ('ses_ffffffffffffold', '/work/legacy', 1, 2);
+         INSERT INTO message VALUES ('m1', 'ses_ffffffffffffold', 1, '{\"role\":\"user\",\"modelID\":\"would-require-scan\"}');
+         INSERT INTO part VALUES ('p1', 'm1', 'ses_ffffffffffffold', 1, '{\"type\":\"text\",\"text\":\"would require scan\"}');",
+    )
+    .unwrap();
+    let schema_before: String = db
+        .query_row(
+            "SELECT group_concat(sql, ';') FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let bytes_before = fs::read(&db_path).unwrap();
+    let files_before: BTreeSet<_> = fs::read_dir(home.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    drop(db);
+
+    let found = discover(&conn, home.path(), &only(&["opencode"]));
+    let row = found.row("ses_ffffffffffffold");
+    assert_eq!(row.cwd.as_deref(), Some("/work/legacy"));
+    assert_eq!(row.first_prompt, None);
+    assert!(row.models.is_empty());
+    assert_eq!(found.summary.counters.provider_queries, 1);
+    assert_eq!(found.summary.counters.records_inspected, 1);
+    assert_eq!(found.summary.counters.bytes_read, 0);
+
+    let db = Connection::open(&db_path).unwrap();
+    let schema_after: String = db
+        .query_row(
+            "SELECT group_concat(sql, ';') FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        schema_after, schema_before,
+        "discovery must issue no provider DDL"
+    );
+    drop(db);
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        bytes_before,
+        "provider bytes changed"
+    );
+    let files_after: BTreeSet<_> = fs::read_dir(home.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        files_after, files_before,
+        "discovery created a database copy or sidecar"
+    );
+}
+
+#[test]
+fn current_opencode_schema_without_recency_index_uses_primary_key_fallback() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let db = Connection::open(home.path().join("opencode.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER, time_updated INTEGER);
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+         CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+         CREATE INDEX message_session_time_created_id_idx ON message(session_id, time_created, id);
+         CREATE INDEX part_session_idx ON part(session_id);
+         CREATE INDEX part_message_id_id_idx ON part(message_id, id);
+         INSERT INTO session VALUES ('ses_ffffffffffffold', '/old', 1, 1000);
+         INSERT INTO session VALUES ('ses_000000000000new', '/new', 2, 2);
+         INSERT INTO message VALUES ('m_new', 'ses_000000000000new', 2, '{\"role\":\"user\",\"modelID\":\"fallback-model\"}');
+         INSERT INTO part VALUES ('p_new', 'm_new', 'ses_000000000000new', 2, '{\"type\":\"text\",\"text\":\"fallback prompt\"}');",
+    )
+    .unwrap();
+    let plan = explain_details(
+        &db,
+        "SELECT id, directory, time_created, time_updated FROM session
+         WHERE id IS NOT NULL AND id <> '' ORDER BY id ASC LIMIT 1",
+        [],
+    );
+    assert!(plan.contains("sqlite_autoindex_session_1"), "{plan}");
+    drop(db);
+
+    let found = discover(
+        &conn,
+        home.path(),
+        &DiscoverOptions {
+            sources: vec!["opencode".into()],
+            limit: Some(1),
+            ..Default::default()
+        },
+    );
+    assert_eq!(found.ids(), vec!["opencode:ses_000000000000new"]);
+    assert_eq!(
+        found.row("ses_000000000000new").first_prompt.as_deref(),
+        Some("fallback prompt")
+    );
+    assert_eq!(
+        found.row("ses_000000000000new").models,
+        vec!["fallback-model"]
+    );
+}
+
+#[test]
+fn opencode_wal_append_does_not_tear_the_read_snapshot() {
+    let catalog = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(
+        home.path(),
+        "INSERT INTO session VALUES ('ses_snapshot', '/work/oc', 10, 20);
+         INSERT INTO message VALUES ('m_old', 'ses_snapshot', 10, '{\"role\":\"user\",\"modelID\":\"old-model\"}');
+         INSERT INTO part VALUES ('p_old', 'm_old', 'ses_snapshot', 10, '{\"type\":\"text\",\"text\":\"coherent old prompt\"}');",
+    );
+    let writer = Connection::open(home.path().join("opencode.db")).unwrap();
+    writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+
+    let env = env_at(&catalog, home.path());
+    let provider = OpencodeProvider::default();
+    let candidate = provider.enumerate(&env, Some(1)).unwrap().remove(0);
+    writer
+        .execute_batch(
+            "INSERT INTO message VALUES ('m_new', 'ses_snapshot', 5, '{\"role\":\"user\",\"modelID\":\"new-model\"}');
+             INSERT INTO part VALUES ('p_new', 'm_new', 'ses_snapshot', 5, '{\"type\":\"text\",\"text\":\"new prompt outside snapshot\"}');
+             UPDATE session SET time_updated = 30 WHERE id = 'ses_snapshot';",
+        )
+        .unwrap();
+    let row = provider
+        .read_shallow(&env.scan(), None, &candidate)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.first_prompt.as_deref(), Some("coherent old prompt"));
+    assert_eq!(row.models, vec!["old-model"]);
+    assert_eq!(row.last_activity_ms, Some(20));
+}
+
+#[test]
+fn malformed_and_partial_opencode_rows_do_not_hide_an_older_complete_prompt() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(
+        home.path(),
+        "INSERT INTO session VALUES ('ses_partial', '/work/oc', 1, 4);
+         INSERT INTO message VALUES ('m_ws', 'ses_partial', -1, '{\"role\":\"user\"}');
+         INSERT INTO part VALUES ('p_ws', 'm_ws', 'ses_partial', -1, '{\"type\":\"text\",\"text\":\"\\t\\n\\r  \"}');
+         INSERT INTO message VALUES ('m0', 'ses_partial', 0, '{\"role\":\"user\"}');
+         INSERT INTO part VALUES ('p0', 'm0', 'ses_partial', 0, '{\"type\":\"text\"}');
+         INSERT INTO message VALUES ('m1', 'ses_partial', 1, '{\"role\":\"user\",\"modelID\":\"ok\"}');
+         INSERT INTO part VALUES ('p1', 'm1', 'ses_partial', 1, '{\"type\":\"text\",\"text\":\"complete prompt\"}');
+         INSERT INTO message VALUES ('m2', 'ses_partial', 2, '{broken');
+         INSERT INTO part VALUES ('p2', 'm2', 'ses_partial', 2, '{broken');
+         INSERT INTO message VALUES ('m3', 'ses_partial', 3, '{\"role\":\"user\"}');",
+    );
+    let found = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(
+        found.row("ses_partial").first_prompt.as_deref(),
+        Some("complete prompt")
+    );
+    assert!(found.summary.diagnostics.is_empty());
+}
+
+#[test]
+fn replacing_the_opencode_database_invalidates_same_timestamp_stamps() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(
+        home.path(),
+        "INSERT INTO session VALUES ('ses_replaced', '/old', 1, 2);
+         INSERT INTO message VALUES ('m1', 'ses_replaced', 1, '{\"role\":\"user\"}');
+         INSERT INTO part VALUES ('p1', 'm1', 'ses_replaced', 1, '{\"type\":\"text\",\"text\":\"old prompt\"}');",
+    );
+    let first = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(
+        first.row("ses_replaced").first_prompt.as_deref(),
+        Some("old prompt")
+    );
+
+    fs::remove_file(home.path().join("opencode.db")).unwrap();
+    opencode_db(
+        home.path(),
+        "INSERT INTO session VALUES ('ses_replaced', '/new', 1, 2);
+         INSERT INTO message VALUES ('m1', 'ses_replaced', 1, '{\"role\":\"user\"}');
+         INSERT INTO part VALUES ('p1', 'm1', 'ses_replaced', 1, '{\"type\":\"text\",\"text\":\"new prompt\"}');",
+    );
+    let second = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(second.summary.counters.shallow_reads, 1);
+    assert_eq!(second.row("ses_replaced").cwd.as_deref(), Some("/new"));
+    assert_eq!(
+        second.row("ses_replaced").first_prompt.as_deref(),
+        Some("new prompt")
+    );
+}
+
+#[test]
+fn opencode_waits_for_a_transient_busy_writer() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(home.path(), "");
+    let blocker = Connection::open(home.path().join("opencode.db")).unwrap();
+    blocker
+        .pragma_update(None, "journal_mode", "DELETE")
+        .unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        blocker.execute_batch("COMMIT").unwrap();
+    });
+    let env = env_at(&conn, home.path());
+    let provider = OpencodeProvider::default();
+    let started = std::time::Instant::now();
+    assert!(provider.enumerate(&env, Some(1)).is_ok());
+    let elapsed = started.elapsed();
+    release.join().unwrap();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(250),
+        "{elapsed:?}"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
 }
 
 // ---------------------------------------------------------------------------

@@ -73,7 +73,7 @@ report preserves that status rather than describing it as cold.
 ## Benchmark definitions
 
 Discovery benchmarks use a generated home directory containing 1,000 valid,
-minimal Claude session transcripts and an opencode SQLite store
+minimal Claude session transcripts and an OpenCode SQLite store
 (`.local/share/opencode/opencode.db`) holding 1,000 minimal sessions with one
 message and one part each. Setup, fixture creation, and source-file changes
 happen outside the timed regions. The fixture makes each run repeatable and
@@ -90,9 +90,9 @@ requested session or event limit, not a cache size.
 | `cold shallow discovery N` | Fresh fixture; database does not exist | Create/migrate the database, enumerate the 1,000 candidates, shallow-read the newest N files, and upsert N catalog rows through SDK -> N-API -> Rust |
 | `unchanged shallow discovery N` | Run one cold discovery of N into a fresh database | Enumerate candidates, match source stamps, and return N cached rows without opening unchanged transcripts |
 | `cold->changed shallow discovery N` | Run one cold discovery of N, then append a valid assistant record to those N fixture transcripts | Enumerate candidates, detect changed stamps, shallow-read the N changed files, and update their catalog rows |
-| `opencode cold shallow discovery N` | Fresh fixture; database does not exist | Create/migrate the database, snapshot the opencode store, enumerate the 1,000 sessions, shallow-read the newest N from the snapshot, and upsert N catalog rows |
-| `opencode unchanged shallow discovery N` | Run one cold discovery of N into a fresh database | Snapshot the store, enumerate sessions, match `time_created`/`time_updated` stamps, and return N cached rows |
-| `opencode cold->changed shallow discovery N` | Run one cold discovery of N, then insert an assistant message and bump `time_updated` for those N sessions | Snapshot the store, detect the N changed stamps, re-read those sessions, and update their catalog rows |
+| `opencode cold shallow discovery N` | Fresh RelayHistory catalog; provider fixture already exists | Open one live read-only transaction, fetch at most N candidates, run indexed session-keyed prompt/model queries, and upsert N catalog rows |
+| `opencode unchanged shallow discovery N` | Run one cold discovery of N into a fresh catalog | Open a new coherent read snapshot, fetch at most N candidates, match source stamps, and return N cached rows without message/part queries |
+| `opencode cold->changed shallow discovery N` | Run one cold discovery of N, then insert an assistant message and bump `time_updated` for those N sessions | Open the live store read-only, detect the N changed stamps, run selected-session queries, and update those catalog rows |
 | `warm session events N` | Select a full session from the configured real database and make one untimed 200-event request | Open the database and return up to N cached events through SDK -> N-API -> Rust; provider transcripts are not read |
 | `CLI startup + cold shallow discovery 20` | Fresh database and the generated fixture | Start a new Node process, load the CLI and native addon, then perform cold discovery of 20 sessions and serialize JSON |
 | `MCP cold shallow discovery 20` | Start and initialize the MCP server with a fresh database and the generated fixture | Perform one MCP `tools/call` round trip that cold-discovers 20 sessions; MCP process startup and initialization are excluded |
@@ -137,6 +137,39 @@ Measured on macOS arm64 (Apple M2 Max) with Node.js 22.22.2 against a real
 | MCP cold shallow discovery | 16.23 ms | 20 rows |
 
 The event queries did not load or copy the 2.9 GiB database: Rust opened it
-directly and returned a bounded indexed page. Every opencode run, including
-unchanged, snapshots the whole store once with SQLite backup, so its
-`filesOpened` is always 1 and its `bytesRead` is the store's size.
+directly and returned a bounded indexed page. The OpenCode numbers in this
+2026-08-31 table are the historical pre-live-query baseline; the implementation
+no longer creates a SQLite backup or reports the provider database size as
+`bytesRead`.
+
+## 2026-09-01 OpenCode fixed-limit scaling
+
+Run only this benchmark with:
+
+```bash
+cargo test -p ai-hist-engine --test discovery_bench \
+  opencode_fixed_limit_scaling_report -- --ignored --nocapture
+```
+
+The two WAL-mode fixtures contain the same newest 20 sessions. The larger one
+adds 9,000 unrelated sessions and grows unrelated message/part history from
+roughly 4.9 MB to 49.3 MB. A writer commits concurrently throughout each
+measurement. These debug-build wall clocks are supporting evidence; the
+operation counts and query-plan assertions are the acceptance gates.
+
+| Provider store | Median cold discovery, limit 20 | Candidates | Provider queries | Records returned by provider SQL | SQLite bytes claimed |
+|---:|---:|---:|---:|---:|---:|
+| 1,000 unrelated sessions (4.9 MB) | 3.263 ms | 20 | 41 | 60 | 0 |
+| 10,000 unrelated sessions (49.3 MB) | 3.332 ms | 20 | 41 | 60 | 0 |
+
+Representative query plans:
+
+```text
+candidate: SCAN session USING INDEX session_time_updated_id_idx
+prompt:    SEARCH p USING INDEX part_session_idx (session_id=?)
+           SEARCH m USING INDEX sqlite_autoindex_message_1 (id=?)
+```
+
+The selected-session assertions fail if `message` or `part` regresses to a
+full table scan. The prompt query may use a temporary B-tree to order the few
+parts belonging to the selected session; it never sorts unrelated history.

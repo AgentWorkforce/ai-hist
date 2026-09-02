@@ -152,9 +152,11 @@ own `truncated` marks children it did not expand.
 
 For large topologies, `getSessionChildrenPage` is the keyset primitive and
 `sessionDescendants` is the async iterator over it, walking descendants
-breadth-first without materializing a tree. It yields the nodes
-`getSessionTree` emits minus the root, with the same `childCount` (linked
-children only, at the depth boundary included) and the same `truncated` rule.
+breadth-first without materializing a tree. Its `maxNodes` budget has the same
+1,000 default and 10,000 maximum as `getSessionTree`, and includes the root. It
+yields the nodes `getSessionTree` emits minus the root, with the same
+`childCount` (linked children only, at the depth boundary included) and the
+same `truncated` rule.
 The order differs: the walker is breadth-first, the tree is pre-order, so a
 consumer that depends on either the root node or `getSessionTree`'s ordering
 has to account for that. `sessionEventsIncludingDescendants` applies its

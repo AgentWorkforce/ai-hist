@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- Advance the native-addon contract to 7 and the session-catalog contract to
+  3. Discovery counters add `providerQueries` and `recordsInspected`; OpenCode
+  no longer reports its database file size as `bytesRead`. The native contract
+  also includes the delegation topology additions below.
 - Replace the synchronous `openAiHist()`/`AiHist` snapshot API with top-level
   async native-backed functions.
 - Remove `sql.js`, JSONL/trajectory fallback scanners, CLI subprocess bridges,
@@ -17,13 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   either operation.
 - Make session-event pagination the primitive API and ship the public
   `ai-hist` Node CLI from this package.
-- Advance the required `ai-hist-native` contract to 6. Claude subagent
+- Add Claude subagent identity behavior to the native contract. Subagent
   transcripts whose records carry an `agentId` are indexed under that child id,
   so their events — and the tool calls and file edits derived from them — move
   off the parent on the next `hydrateSession`.
 
 ### Added
 
+- Surface bounded OpenCode provider-query and inspected-record counters through the typed SDK,
+  CLI JSON, and MCP discovery result.
 - Add delegation topology APIs: `getSessionRelationships()`,
   `getSessionTree()`, and `getSessionChildrenPage()`, plus the
   `sessionDescendants()` and `sessionEventsIncludingDescendants()` async

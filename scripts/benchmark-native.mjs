@@ -194,7 +194,11 @@ async function createOpencodeFixture(home, count) {
     db.exec(
       'CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER, time_updated INTEGER);'
       + 'CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);'
-      + 'CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);',
+      + 'CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);'
+      + 'CREATE INDEX session_time_updated_id_idx ON session(time_updated DESC, id);'
+      + 'CREATE INDEX message_session_time_created_id_idx ON message(session_id, time_created, id);'
+      + 'CREATE INDEX part_session_idx ON part(session_id);'
+      + 'CREATE INDEX part_message_id_id_idx ON part(message_id, id);',
     );
     const insertSession = db.prepare('INSERT INTO session VALUES (?, ?, ?, ?)');
     const insertMessage = db.prepare('INSERT INTO message VALUES (?, ?, ?, ?)');
@@ -218,8 +222,8 @@ async function createOpencodeFixture(home, count) {
 // A changed opencode session is a bumped `time_updated` stamp plus a new
 // assistant message, mirroring the appended record in the Claude fixture.
 // Restoration is a byte copy of the pristine store, not reversed rows: a
-// DELETE leaves the inserted pages on the freelist, so later cases would
-// snapshot a larger store than the one the first cold case measured.
+// DELETE leaves the inserted pages on the freelist, which would make later
+// cases read a physically different fixture than the first cold case.
 function changeOpencodeSessions(databasePath, sessions) {
   const timestampMs = Date.now();
   const db = new DatabaseSync(databasePath);
@@ -351,6 +355,8 @@ function details(result) {
   if (result.counters) {
     pieces.push(`${result.counters.filesOpened} files opened`);
     pieces.push(`${result.counters.bytesRead} bytes read`);
+    pieces.push(`${result.counters.providerQueries} provider queries`);
+    pieces.push(`${result.counters.recordsInspected} records inspected`);
     pieces.push(`${result.counters.skippedUnchanged} unchanged`);
   }
   return pieces.join('; ');

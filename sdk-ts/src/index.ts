@@ -9,8 +9,8 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const NATIVE_CONTRACT_VERSION = 6;
-export const SESSION_CATALOG_CONTRACT_VERSION = 2;
+export const NATIVE_CONTRACT_VERSION = 7;
+export const SESSION_CATALOG_CONTRACT_VERSION = 3;
 export const SESSION_HYDRATION_CONTRACT_VERSION = 1;
 export const SESSION_RELATIONSHIP_CONTRACT_VERSION = 1;
 export const SESSION_EVIDENCE_CONTRACT_VERSION = 1;
@@ -142,6 +142,8 @@ export interface DiscoveryCounters {
   skippedUnchanged: number;
   filesOpened: number;
   bytesRead: number;
+  providerQueries: number;
+  recordsInspected: number;
 }
 
 export interface SourceExemption { source: string; reason: string }
@@ -355,6 +357,8 @@ export interface GetSessionChildrenPageOptions extends GetSessionRelationshipsOp
 
 export interface SessionDescendantsOptions extends GetSessionRelationshipsOptions {
   maxDepth?: number;
+  /** Includes the root. Default 1000, maximum 10000. */
+  maxNodes?: number;
   pageLimit?: number;
 }
 
@@ -364,6 +368,8 @@ export interface DescendantEventsOptions {
   /** Events read per session, not a total for the iteration. */
   limit?: number;
   maxDepth?: number;
+  /** Includes the root. Default 1000, maximum 10000. */
+  maxNodes?: number;
   /** Defaults to true. */
   includeRoot?: boolean;
 }
@@ -479,6 +485,8 @@ interface NativeBinding {
 const RELATIONSHIP_TYPES: readonly string[] = ['delegated'];
 const DEFAULT_TREE_MAX_DEPTH = 32;
 const MAX_TREE_MAX_DEPTH = 64;
+const DEFAULT_TREE_MAX_NODES = 1_000;
+const MAX_TREE_MAX_NODES = 10_000;
 
 const SUPPORTED_PLATFORMS = new Set([
   'darwin-arm64', 'darwin-x64',
@@ -1214,12 +1222,18 @@ export async function getSessionChildrenPage(options: GetSessionChildrenPageOpti
 
 /**
  * Lazily walks a session's descendants breadth-first over the paged children
- * primitive, without materializing a large tree. Unlinked evidence has no
- * traversable identity and is skipped; use `getSessionTree` when you need it.
+ * primitive, with a bounded node queue instead of materializing a large tree.
+ * Unlinked evidence has no traversable identity and is skipped; use
+ * `getSessionTree` when you need it.
  */
 export async function* sessionDescendants(options: SessionDescendantsOptions): AsyncGenerator<SessionTreeNode> {
   validateSessionRef(options, 'sessionDescendants');
   const maxDepth = Math.min(Math.max(Math.trunc(options.maxDepth ?? DEFAULT_TREE_MAX_DEPTH), 1), MAX_TREE_MAX_DEPTH);
+  const requestedMaxNodes = options.maxNodes ?? DEFAULT_TREE_MAX_NODES;
+  if (!Number.isFinite(requestedMaxNodes)) {
+    throw new InvalidArgumentError('maxNodes must be a finite number', 'INVALID_ARGUMENT');
+  }
+  const maxNodes = Math.min(Math.max(Math.trunc(requestedMaxNodes), 1), MAX_TREE_MAX_NODES);
   const request = { source: options.source, dbPath: options.dbPath };
   const visited = new Set<string>([options.sessionId]);
   // Each walked session's parent, so a repeated edge can be told apart: back
@@ -1243,35 +1257,34 @@ export async function* sessionDescendants(options: SessionDescendantsOptions): A
     const next: SessionTreeNode[] = [];
     for (const node of frontier) {
       const expand = node.depth < maxDepth;
-      const children: SessionRelationship[] = [];
       let after: RelationshipCursor | undefined;
       do {
         const page = await getSessionChildrenPage({
           ...request, sessionId: node.sessionId, limit: options.pageLimit, after,
         });
-        children.push(...page.children);
+        for (const edge of page.children) {
+          if (edge.identityStatus !== 'observed' || edge.childSessionId === null) continue;
+          node.childCount += 1;
+          if (!expand || isAncestor(node.sessionId, edge.childSessionId)) {
+            node.truncated = true;
+            continue;
+          }
+          if (visited.has(edge.childSessionId)) continue;
+          if (visited.size >= maxNodes) {
+            node.truncated = true;
+            continue;
+          }
+          visited.add(edge.childSessionId);
+          parentOf.set(edge.childSessionId, node.sessionId);
+          next.push({
+            source: edge.source, sessionId: edge.childSessionId, depth: node.depth + 1,
+            parentSessionId: node.sessionId, relationship: edge, childCount: 0,
+            hasEvents: edge.childHasEvents, truncated: false,
+          });
+        }
         after = page.nextCursor ?? undefined;
       } while (after);
-      // Unlinked evidence has no traversable identity, so it is never a child
-      // this walk owes the caller — at the depth boundary included.
-      const linked = children.filter((edge): edge is SessionRelationship & { childSessionId: string } =>
-        edge.identityStatus === 'observed' && edge.childSessionId !== null);
-      node.childCount = linked.length;
-      node.truncated = expand
-        ? linked.some((edge) => isAncestor(node.sessionId, edge.childSessionId))
-        : linked.length > 0;
       if (node.depth > 0) yield node;
-      if (!expand) continue;
-      for (const edge of linked) {
-        if (visited.has(edge.childSessionId)) continue;
-        visited.add(edge.childSessionId);
-        parentOf.set(edge.childSessionId, node.sessionId);
-        next.push({
-          source: edge.source, sessionId: edge.childSessionId, depth: node.depth + 1,
-          parentSessionId: node.sessionId, relationship: edge, childCount: 0,
-          hasEvents: edge.childHasEvents, truncated: false,
-        });
-      }
     }
     frontier = next;
   }
@@ -1293,6 +1306,7 @@ export async function* sessionEventsIncludingDescendants(
   }
   for await (const node of sessionDescendants({
     source: options.source, sessionId: options.sessionId, dbPath: options.dbPath, maxDepth: options.maxDepth,
+    maxNodes: options.maxNodes,
   })) {
     if (!node.hasEvents) continue;
     yield* sessionEvents(node.sessionId, events);

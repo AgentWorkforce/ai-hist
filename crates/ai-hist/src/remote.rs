@@ -467,7 +467,11 @@ impl ShallowSessionProvider for ClaudeWebProvider {
         SessionLocation::Remote
     }
 
-    fn enumerate(&self, _env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+    fn enumerate(
+        &self,
+        _env: &DiscoveryEnv<'_>,
+        _requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
         require_https_or_loopback(&self.base_url)?;
         let oauth = load_claude_oauth(&self.credentials_path)?;
         if let Some(expires_at_ms) = oauth.expires_at_ms {
@@ -703,7 +707,11 @@ impl ShallowSessionProvider for CodexCloudProvider {
         SessionLocation::Remote
     }
 
-    fn enumerate(&self, _env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+    fn enumerate(
+        &self,
+        _env: &DiscoveryEnv<'_>,
+        _requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
         let mut candidates = Vec::new();
         let mut rows = BTreeMap::new();
         let mut cursor: Option<String> = None;

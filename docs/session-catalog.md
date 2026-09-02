@@ -96,7 +96,7 @@ ai-hist sessions discover --json      # JSONL: sessions, diagnostics, summary
 
 ## The output contract
 
-Both operations carry `contract_version` — currently **2**
+Both operations carry `contract_version` — currently **3**
 (`SESSION_CATALOG_CONTRACT_VERSION`). It is bumped whenever the shape or the
 meaning of a row changes in a way a consumer must notice, so parse it and fail
 loudly on a version you do not know rather than guessing.
@@ -107,7 +107,7 @@ One object, never a bare array, so the version travels with the payload:
 
 ```jsonc
 {
-  "contract_version": 2,
+  "contract_version": 3,
   "scope": "local",
   "sessions": [
     {
@@ -126,7 +126,7 @@ One object, never a bare array, so the version travels with the payload:
       "initial_commit": "abc1234def",
       "workspace_roots": ["/Users/you/Projects/api"],
       "raw_path": "/Users/you/.codex/sessions/2026/06/21/rollout-codex.jsonl",
-      "source_stamp": "v1:1788042670103317900:569",
+      "source_stamp": "v2:1788042670103317900:569",
       "discovery_state": "shallow",
       "locations": ["local"],
       "from_cache": true
@@ -169,7 +169,7 @@ types, in this order:
 // so a consumer always sees the reason before the non-zero exit
 {
   "type": "summary",
-  "contract_version": 2,
+  "contract_version": 3,
   "scope": "local",
   "locations_run": ["local"],
   "discovered": 2,
@@ -190,14 +190,20 @@ types, in this order:
     "shallow_reads": 2,
     "skipped_unchanged": 0,
     "files_opened": 2,
-    "bytes_read": 978
+    "bytes_read": 978,
+    "provider_queries": 0,
+    "records_inspected": 0
   }
 }
 ```
 
 `counters` is the run's bill of work, and it is the honest way to check that
-discovery stayed cheap — `bytes_read` and `files_opened` are what a bounded
-request bounds, and `shallow_reads` is `0` on a rescan where nothing changed.
+discovery stayed cheap. `bytes_read` counts explicit reads from file-backed
+providers only; SQLite does not report exact filesystem bytes, so OpenCode
+leaves it at zero instead of substituting the database file size.
+`provider_queries` counts OpenCode's bounded data queries (schema-capability
+introspection is excluded), and `records_inspected` counts the rows those data
+queries return. `shallow_reads` is `0` on a rescan where nothing changed.
 Summary `scope` echoes the requested acquisition scope, and `locations_run`
 enumerates the connector locations that actually executed — `["local"]` on a
 machine with no remote connector configured, `["local", "remote"]` when an
@@ -361,14 +367,32 @@ How each adapter works:
   both timestamps come from `summary.json`; the first prompt comes from the head
   of `chat_history.jsonl`, skipping synthetic reminder turns.
 - **opencode** — the SQLite store at `$OPENCODE_DB` (default
-  `~/.local/share/opencode/opencode.db`). The database is snapshotted once per
-  run with SQLite's backup API, exactly as the full sync does, so an in-flight
-  WAL never yields a torn read. The snapshot stays open on one connection for
-  the whole run and — being a private throwaway copy — is indexed by
-  `session_id` up front when the live store isn't. Enumeration is one query
-  over `session`; the shallow read adds two bounded single-row seeks for the
-  first user text part and a model id, rather than the full
-  session/message/part join the sync does.
+  `~/.local/share/opencode/opencode.db`). Discovery opens the live store with
+  SQLite read-only and `query_only` enforcement, then holds one deferred read
+  transaction for the run. Candidate enumeration and every selected-session
+  query therefore share one committed SQLite snapshot. In WAL mode OpenCode's
+  writer continues normally. Cross-process `SQLITE_BUSY` uses the repository's
+  bounded, jittered retry policy (roughly 30 seconds); non-retryable
+  `SQLITE_LOCKED` conflicts remain distinct diagnostics. RelayHistory never
+  backs up the database or WAL, creates a temporary database, issues provider
+  DDL, adds indexes, or runs provider migrations.
+
+  With `--limit N`, one indexed query returns at most N candidate sessions.
+  Selected candidates then use the provider's existing `message(session_id,
+  …)`, `part(session_id, …)`, or `part(message_id, …)` indexes for prompt and
+  model extraction. If those indexes or optional tables/columns are absent,
+  discovery still returns session metadata but omits the affected prompt/model
+  field rather than scanning a historical table.
+
+  Exact newest-*updated* enumeration uses an existing index ordered by
+  `session.time_updated DESC, id ASC`, so the global deterministic tie-break is
+  applied before `LIMIT`. Some supported OpenCode schemas do not ship that
+  index. On those schemas the bounded safe fallback reads `session` through its
+  primary key in ascending order, which matches OpenCode's descending,
+  time-encoded generated session IDs and therefore finds newest-created
+  sessions. The limitation is that a much older session resumed recently can
+  be delayed until OpenCode provides the compound recency index; RelayHistory
+  will not mutate the provider database to repair that gap.
 - **relay** — a **network** source with no local transcript, and discovery must
   work offline. The adapter therefore derives rows only from `history` rows a
   previous `ai-hist sync` already stored locally; it opens no socket. If nothing
@@ -383,7 +407,9 @@ The ordering and the limit are **global**, not per provider:
 
 1. Every selected provider adapter in the requested scope enumerates its
    candidates **cheaply** — a directory walk plus `stat`, or one indexed query.
-   No file content is read.
+   Database providers may cap their own candidate page at the global limit:
+   no single provider can contribute more than that many winners. No file
+   content is read.
 2. Candidates from all providers are merged and sorted by recency hint,
    descending. Candidates with no recency signal sort last; ties break on
    `(source, locator)` so a run is reproducible.
@@ -445,7 +471,7 @@ Each connector presence stores a `source_stamp` —
 |---|---|
 | claude, codex, cursor | `{mtime nanoseconds}:{file length}` |
 | grok | the chat file's marker, `\|`, the `summary.json` marker |
-| opencode | `{time_created}:{time_updated}` |
+| opencode | `{database identity}:{schema version}:{time_created}:{time_updated}` |
 | relay | `{newest synced timestamp}:{synced row count}` |
 
 On a rescan, a candidate whose stamp matches the stamp for that same location
@@ -478,7 +504,7 @@ stamp-guarded upsert into `sessions`:
   `'full'`;
 - the full-sync path only ever upgrades a row to `'full'`;
 - writes go through the normal busy-retry connection, and the opencode
-  provider reads a WAL-safe snapshot rather than the live database.
+  provider reads one coherent snapshot from a live read-only connection.
 
 A concurrent `sync` and `discover` therefore converge on the same row rather
 than fighting over it.
@@ -604,7 +630,8 @@ measurement table. Every assertion it makes is an *operation count* — bytes
 read, files opened, shallow reads, rows returned — because those hold on any
 machine; timings are printed for the reader and never asserted.
 
-Representative numbers from one run (debug build, 450-session archive, 14.7 MB):
+Representative multi-provider numbers from one run (debug build,
+450-session archive, 14.7 MB):
 
 | Measurement | Result |
 |---|---|
@@ -614,22 +641,25 @@ Representative numbers from one run (debug build, 450-session archive, 14.7 MB):
 | `discover --limit 5` over a 90-session / 6.2 MB archive | 5 shallow reads, 1.6 MB read (26% of the archive) |
 | `discover --limit 5` over the same archive grown to 450 sessions / 14.7 MB | 5 shallow reads, **the same 1.6 MB** (11%) |
 | `sessions discover` (cold, whole archive) | 11.9 MB read, 450 rows, ~1.7 s |
-| `sessions discover` (rescan, nothing changed) | 0 shallow reads, 28 KB read, ~0.08 s |
+| `sessions discover` (rescan, nothing changed) | 0 file-backed shallow reads, ~0.08 s |
 | `ai-hist sync` (full ingest, same archive) | reads all 14.7 MB, writes 62 451 history/event rows, ~46 s |
 | Cached listing after the entire archive is deleted | same 50 rows, 0.41 ms |
 
 The shape is what matters, not the absolute numbers: the cached listing tracks
 the rows you asked for and ignores both catalog size and event volume; a
 bounded request's cost is fixed by its limit; and a shallow refresh of a whole
-archive cost roughly 1/27th of a full ingest of the same archive — while a
-rescan of unchanged bytes is nearly free (the 28 KB is the one-per-run opencode
-snapshot, which enumeration always takes).
+archive cost roughly 1/27th of a full ingest of the same archive. OpenCode's
+fixed-limit benchmark is documented separately in `benchmarks.md`; its
+operation counters stay at 20 candidates, 41 queries, 60 returned records, and
+zero claimed bytes for both 1,000- and 10,000-session stores.
 
 Complementary structural coverage lives in the unit tests:
 `the_catalog_listing_is_served_by_an_index_not_a_table_scan` (EXPLAIN QUERY
 PLAN), `the_catalog_query_reads_only_the_sessions_table`,
 `bounded_reads_do_not_grow_with_the_size_of_the_archive`, and
-`a_head_read_stays_inside_its_budget_on_a_very_large_transcript`.
+`a_head_read_stays_inside_its_budget_on_a_very_large_transcript`. OpenCode adds
+`opencode_selected_session_queries_use_provider_indexes` and the ignored
+`opencode_fixed_limit_scaling_report` benchmark.
 
 ---
 
