@@ -282,6 +282,7 @@ export interface HydrationEvidence {
   prompts: number
   events: number
   toolCalls: number
+  fileEdits: number
   relatedSessions: number
 }
 export interface HydrationDiagnostic {
@@ -296,6 +297,7 @@ export interface HydrateSessionResult {
   source: string
   sessionId: string
   status: string
+  capability: string
   discoveryState: string
   presence: string
   indexedThrough: HydrationIndexedThrough

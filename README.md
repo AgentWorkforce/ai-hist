@@ -112,11 +112,12 @@ await sync({ scope: 'local' }); // explicit full ingestion; local is the default
 ```
 
 `listSessionCatalog` is cache-only. `discoverSessions` performs bounded shallow
-provider discovery and updates the shared ledger. `hydrateSession` fully
-indexes one existing catalog identity and returns evidence counts rather than
-the transcript; repeating it is safe as a live session grows. The tool call and
-file edit pages read that hydrated evidence back as structured rows and require
-both a source and a session ID, because provider session IDs collide. `sync` performs
+provider discovery and updates the shared ledger. `hydrateSession` indexes the
+richest evidence a connector safely exposes for one existing catalog identity
+and reports `full`, `partial`, or `shallow_only` capability with evidence
+counts; repeating it is safe as a live session grows. The tool call and file
+edit pages read that hydrated evidence back as structured rows and require both
+a source and a session ID, because provider session IDs collide. `sync` performs
 full global ingestion. Reads never silently turn into discovery, hydration, or
 sync. Hydration includes linked subagent evidence by default; CLI callers can
 pass `--no-related`.

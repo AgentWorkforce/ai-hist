@@ -43,13 +43,17 @@
 //! reported as connector diagnostics, never silently swallowed.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
+use std::time::{Duration, Instant};
 
 use ai_hist_core::{SessionLocation, SOURCE_CHOICES};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::discover::{
     excerpt, Candidate, DiscoveryEnv, ScanEnv, ShallowSession, ShallowSessionProvider,
@@ -64,6 +68,27 @@ pub const CODEX_CLOUD_CONNECTOR: &str = "codex-cloud";
 const MAX_LIST_PAGES: usize = 100;
 /// Rows requested per claude.ai listing page (the endpoint's own maximum).
 const CLAUDE_PAGE_LIMIT: usize = 100;
+const CLAUDE_EVIDENCE_PAGE_LIMIT: usize = 1_000;
+const MAX_REMOTE_EVIDENCE_BYTES: usize = 16 * 1024 * 1024;
+const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+pub(crate) enum RemoteSessionEvidence {
+    ClaudeFull {
+        records: Vec<Value>,
+        source_stamp: String,
+        source_bytes: i64,
+    },
+    CodexDiff {
+        diff: String,
+        source_stamp: String,
+        source_bytes: i64,
+    },
+    CapabilityLimited {
+        code: &'static str,
+        message: String,
+    },
+}
 
 /// Whether one remote connector can run on this machine, and why not when it
 /// cannot.
@@ -267,37 +292,200 @@ pub(crate) struct ClaudeHttpResponse {
 /// The HTTP side of the claude.ai session listing, abstracted so mapping and
 /// pagination are testable without a network.
 pub(crate) trait ClaudeSessionsTransport: Send + Sync {
-    fn get(&self, url: &str, bearer_token: &str) -> Result<ClaudeHttpResponse>;
+    fn get_with_headers(
+        &self,
+        url: &str,
+        bearer_token: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<ClaudeHttpResponse>;
 }
 
 struct UreqClaudeTransport;
 
 impl ClaudeSessionsTransport for UreqClaudeTransport {
-    fn get(&self, url: &str, bearer_token: &str) -> Result<ClaudeHttpResponse> {
+    fn get_with_headers(
+        &self,
+        url: &str,
+        bearer_token: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<ClaudeHttpResponse> {
         // Redirects are never followed: ureq would re-send the Authorization
         // header to the redirect target, so a redirecting endpoint could move
         // the stored OAuth token to a host the https-or-loopback guard never
         // saw. A 3xx therefore surfaces as a failed listing, not a hop.
         let agent = ureq::AgentBuilder::new().redirects(0).build();
-        let request = agent
+        let mut request = agent
             .get(url)
             .timeout(std::time::Duration::from_secs(30))
             .set("Authorization", &format!("Bearer {bearer_token}"))
             .set("Content-Type", "application/json")
             .set("anthropic-version", "2023-06-01")
             .set("anthropic-beta", "oauth-2025-04-20");
+        for (name, value) in headers {
+            request = request.set(name, value);
+        }
         match request.call() {
-            Ok(response) => Ok(ClaudeHttpResponse {
-                status: response.status(),
-                body: response.into_string().unwrap_or_default(),
-            }),
-            Err(ureq::Error::Status(status, response)) => Ok(ClaudeHttpResponse {
-                status,
-                body: response.into_string().unwrap_or_default(),
-            }),
+            Ok(response) => bounded_claude_response(response.status(), response),
+            Err(ureq::Error::Status(status, response)) => bounded_claude_response(status, response),
             Err(error) => Err(anyhow::Error::from(error).context("claude.ai session list request")),
         }
     }
+}
+
+fn bounded_claude_response(status: u16, response: ureq::Response) -> Result<ClaudeHttpResponse> {
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take((MAX_REMOTE_EVIDENCE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_REMOTE_EVIDENCE_BYTES,
+        "Claude response exceeded the 16 MiB response-size limit"
+    );
+    Ok(ClaudeHttpResponse {
+        status,
+        body: String::from_utf8_lossy(&bytes).into_owned(),
+    })
+}
+
+pub(crate) fn acquire_remote_session_at(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+) -> Result<RemoteSessionEvidence> {
+    match source {
+        "claude" => acquire_claude_remote_session_at(
+            home,
+            session_id,
+            &claude_api_base_url(),
+            &UreqClaudeTransport,
+        ),
+        "codex" if codex_auth_path(home).is_file() => acquire_codex_remote_session(session_id),
+        "codex" => Ok(RemoteSessionEvidence::CapabilityLimited {
+            code: "CONNECTOR_NOT_CONFIGURED",
+            message: "codex-cloud is not configured; run `codex login`".to_string(),
+        }),
+        _ => Ok(RemoteSessionEvidence::CapabilityLimited {
+            code: "CONNECTOR_NOT_CONFIGURED",
+            message: format!("no remote hydration connector exists for source '{source}'"),
+        }),
+    }
+}
+
+fn acquire_claude_remote_session_at(
+    home: &Path,
+    session_id: &str,
+    base_url: &str,
+    transport: &dyn ClaudeSessionsTransport,
+) -> Result<RemoteSessionEvidence> {
+    let credentials_path = claude_credentials_path(home);
+    if !credentials_path.is_file() {
+        return Ok(RemoteSessionEvidence::CapabilityLimited {
+            code: "CONNECTOR_NOT_CONFIGURED",
+            message: "claude-web is not configured; sign in with Claude Code or set RELAYHISTORY_CLAUDE_CREDENTIALS".to_string(),
+        });
+    }
+    anyhow::ensure!(
+        is_claude_web_session_id(session_id),
+        "INVALID_ARGUMENT: remote Claude session id is malformed"
+    );
+    require_https_or_loopback(base_url)?;
+    let oauth = load_claude_oauth(&credentials_path)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    if oauth.expires_at_ms.is_some_and(|expires| expires <= now_ms) {
+        anyhow::bail!("AUTHENTICATION_EXPIRED: the stored claude.ai OAuth token has expired; run Claude Code once to refresh it");
+    }
+
+    // Claude Code itself resolves the organization this way before calling
+    // teleport-events. Both interfaces are private implementation contracts,
+    // so parser failures are explicit rather than treated as empty evidence.
+    let profile_url = format!("{base_url}/api/oauth/profile");
+    let profile = transport.get_with_headers(&profile_url, &oauth.access_token, &[])?;
+    match profile.status {
+        200 => {}
+        401 | 403 => anyhow::bail!(
+            "AUTHENTICATION_EXPIRED: claude.ai rejected the stored OAuth token (HTTP {})",
+            profile.status
+        ),
+        status => anyhow::bail!("CONNECTOR_FAILURE: Claude OAuth profile failed (HTTP {status})"),
+    }
+    anyhow::ensure!(
+        profile.body.len() <= MAX_REMOTE_EVIDENCE_BYTES,
+        "CONNECTOR_FAILURE: Claude OAuth profile exceeded the response-size limit"
+    );
+    let profile_json: Value = serde_json::from_str(&profile.body)
+        .context("CONNECTOR_FAILURE: Claude OAuth profile returned malformed JSON")?;
+    let org_uuid = profile_json
+        .pointer("/organization/uuid")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("CONNECTOR_FAILURE: Claude OAuth profile omitted organization.uuid")?;
+
+    let mut records = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut source_bytes = profile.body.len();
+    for _ in 0..MAX_LIST_PAGES {
+        let mut url = format!(
+            "{base_url}/v1/code/sessions/{session_id}/teleport-events?limit={CLAUDE_EVIDENCE_PAGE_LIMIT}"
+        );
+        if let Some(value) = cursor.as_deref() {
+            url.push_str("&cursor=");
+            url.push_str(&urlencode(value));
+        }
+        let response = transport.get_with_headers(
+            &url,
+            &oauth.access_token,
+            &[("x-organization-uuid", org_uuid)],
+        )?;
+        match response.status {
+            200 => {}
+            401 => anyhow::bail!(
+                "AUTHENTICATION_EXPIRED: Claude teleport evidence was rejected (HTTP {})",
+                response.status
+            ),
+            403 => anyhow::bail!(
+                "CONNECTOR_FAILURE: Claude teleport evidence was denied; the session may require trusted-device enrollment"
+            ),
+            404 => anyhow::bail!("SESSION_NOT_FOUND: remote Claude session no longer exists"),
+            status => anyhow::bail!(
+                "CONNECTOR_FAILURE: Claude teleport evidence failed (HTTP {status})"
+            ),
+        }
+        source_bytes = source_bytes.saturating_add(response.body.len());
+        anyhow::ensure!(
+            source_bytes <= MAX_REMOTE_EVIDENCE_BYTES,
+            "CONNECTOR_FAILURE: remote Claude evidence exceeded the 16 MiB response-size limit"
+        );
+        let payload: Value = serde_json::from_str(&response.body)
+            .context("CONNECTOR_FAILURE: Claude teleport evidence returned malformed JSON")?;
+        let page = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .context("CONNECTOR_FAILURE: Claude teleport evidence response has no data array")?;
+        for entry in page {
+            let record = entry
+                .get("payload")
+                .filter(|value| value.is_object())
+                .context(
+                    "CONNECTOR_FAILURE: Claude teleport evidence contains a malformed record",
+                )?;
+            records.push(record.clone());
+        }
+        cursor = string_field(&payload, "next_cursor");
+        if cursor.is_none() {
+            let encoded = serde_json::to_vec(&records)?;
+            let source_stamp = format!("teleport:{:x}", Sha256::digest(&encoded));
+            return Ok(RemoteSessionEvidence::ClaudeFull {
+                records,
+                source_stamp,
+                source_bytes: source_bytes as i64,
+            });
+        }
+    }
+    anyhow::bail!("EVIDENCE_PARTIAL: Claude teleport evidence exceeded the 100-page bound")
 }
 
 fn claude_api_base_url() -> String {
@@ -499,7 +687,9 @@ impl ShallowSessionProvider for ClaudeWebProvider {
                 url.push_str("&cursor=");
                 url.push_str(&urlencode(cursor));
             }
-            let response = self.transport.get(&url, &oauth.access_token)?;
+            let response = self
+                .transport
+                .get_with_headers(&url, &oauth.access_token, &[])?;
             match response.status {
                 200 => {}
                 401 | 403 => anyhow::bail!(
@@ -565,6 +755,131 @@ fn excerpt_one_line(raw: &str) -> String {
         out.push('…');
     }
     out
+}
+
+fn acquire_codex_remote_session(session_id: &str) -> Result<RemoteSessionEvidence> {
+    acquire_codex_remote_session_with_command(session_id, OsStr::new("codex"))
+}
+
+fn acquire_codex_remote_session_with_command(
+    session_id: &str,
+    command: &OsStr,
+) -> Result<RemoteSessionEvidence> {
+    acquire_codex_remote_session_with_command_timeout(session_id, command, REMOTE_COMMAND_TIMEOUT)
+}
+
+fn acquire_codex_remote_session_with_command_timeout(
+    session_id: &str,
+    command: &OsStr,
+    timeout: Duration,
+) -> Result<RemoteSessionEvidence> {
+    if !session_id.starts_with("task_")
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        anyhow::bail!("INVALID_ARGUMENT: remote Codex task id is malformed");
+    }
+    let mut child = std::process::Command::new(command)
+        .args(["cloud", "diff", session_id])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                anyhow::anyhow!("CONNECTOR_NOT_CONFIGURED: the `codex` CLI is not on PATH")
+            }
+            _ => anyhow::Error::from(error)
+                .context("CONNECTOR_FAILURE: could not run `codex cloud diff`"),
+        })?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("CONNECTOR_FAILURE: no Codex stdout pipe")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("CONNECTOR_FAILURE: no Codex stderr pipe")?;
+    let read_bounded = |mut stream: Box<dyn Read + Send>| {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 64 * 1024];
+            let result = loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break Ok(bytes),
+                    Ok(read) => {
+                        // Retain only enough to detect the limit, but keep
+                        // draining so an oversized child cannot block on a
+                        // full pipe and masquerade as a command timeout.
+                        let remaining = (MAX_REMOTE_EVIDENCE_BYTES + 1).saturating_sub(bytes.len());
+                        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+                    }
+                    Err(error) => break Err(error),
+                }
+            };
+            let _ = sender.send(result);
+        });
+        receiver
+    };
+    let stdout_reader = read_bounded(Box::new(stdout));
+    let stderr_reader = read_bounded(Box::new(stderr));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("CONNECTOR_FAILURE: `codex cloud diff` exceeded the 30 second timeout");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let receive = |reader: mpsc::Receiver<std::io::Result<Vec<u8>>>, name: &str| {
+        let remaining = timeout.checked_sub(started.elapsed()).unwrap_or_default();
+        reader
+            .recv_timeout(remaining)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "CONNECTOR_FAILURE: Codex {name} pipe remained open past the 30 second timeout"
+                )
+            })?
+            .map_err(anyhow::Error::from)
+    };
+    let stdout = receive(stdout_reader, "stdout")?;
+    let stderr = receive(stderr_reader, "stderr")?;
+    anyhow::ensure!(
+        stdout.len() <= MAX_REMOTE_EVIDENCE_BYTES && stderr.len() <= MAX_REMOTE_EVIDENCE_BYTES,
+        "CONNECTOR_FAILURE: `codex cloud diff` exceeded the 16 MiB response-size limit"
+    );
+    if !status.success() {
+        let detail = excerpt_one_line(&String::from_utf8_lossy(&stderr));
+        let lower = detail.to_ascii_lowercase();
+        if lower.contains("login") || lower.contains("unauthorized") || lower.contains("expired") {
+            anyhow::bail!("AUTHENTICATION_EXPIRED: Codex CLI authentication was rejected");
+        }
+        if lower.contains("not found") || lower.contains("no task") {
+            anyhow::bail!("SESSION_NOT_FOUND: remote Codex task no longer exists");
+        }
+        anyhow::bail!("CONNECTOR_FAILURE: `codex cloud diff` failed ({status}): {detail}");
+    }
+    let diff = String::from_utf8(stdout)
+        .context("CONNECTOR_FAILURE: `codex cloud diff` returned non-UTF-8 output")?;
+    if diff.trim().is_empty() {
+        return Ok(RemoteSessionEvidence::CapabilityLimited {
+            code: "PROVIDER_CAPABILITY_LIMITED",
+            message: "Codex exposes no transcript API and this task has no available diff"
+                .to_string(),
+        });
+    }
+    let source_stamp = format!("diff:{:x}", Sha256::digest(diff.as_bytes()));
+    Ok(RemoteSessionEvidence::CodexDiff {
+        source_bytes: diff.len() as i64,
+        diff,
+        source_stamp,
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -426,6 +426,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "sessions",
     "session_presences",
     "session_hydration_checkpoints",
+    "session_identity_correlations",
     "session_relationships",
     "schema_migrations",
     "discovery_skips",
@@ -533,7 +534,11 @@ const REQUIRED_RELATIONSHIP_READ_INDEXES: &[&str] = &[
     "idx_session_relationships_parent",
     "idx_session_relationships_child",
 ];
-const REQUIRED_TRIGGERS: &[&str] = &["delete_session_presences", "delete_session_hydration_state"];
+const REQUIRED_TRIGGERS: &[&str] = &[
+    "delete_session_presences",
+    "delete_session_hydration_state",
+    "delete_session_identity_correlations",
+];
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_presences_local_backfill_v1",
     "session_relationships_v2",
@@ -797,6 +802,15 @@ CREATE TABLE IF NOT EXISTS session_hydration_checkpoints (
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (source, session_id, location)
 );
+CREATE TABLE IF NOT EXISTS session_identity_correlations (
+    source TEXT NOT NULL,
+    local_session_id TEXT NOT NULL,
+    remote_session_id TEXT NOT NULL,
+    relationship TEXT NOT NULL,
+    evidence_kind TEXT NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (source, local_session_id, relationship)
+);
 CREATE TRIGGER IF NOT EXISTS delete_session_presences
 AFTER DELETE ON sessions
 BEGIN
@@ -811,6 +825,12 @@ BEGIN
     DELETE FROM session_relationships
     WHERE source = OLD.source
       AND (parent_session_id = OLD.session_id OR child_session_id = OLD.session_id);
+END;
+CREATE TRIGGER IF NOT EXISTS delete_session_identity_correlations
+AFTER DELETE ON sessions
+BEGIN
+    DELETE FROM session_identity_correlations
+    WHERE source = OLD.source AND local_session_id = OLD.session_id;
 END;
 "#,
     )?;

@@ -11,7 +11,7 @@ import { join } from 'node:path';
 
 export const NATIVE_CONTRACT_VERSION = 7;
 export const SESSION_CATALOG_CONTRACT_VERSION = 3;
-export const SESSION_HYDRATION_CONTRACT_VERSION = 1;
+export const SESSION_HYDRATION_CONTRACT_VERSION = 2;
 export const SESSION_RELATIONSHIP_CONTRACT_VERSION = 1;
 export const SESSION_EVIDENCE_CONTRACT_VERSION = 1;
 
@@ -47,6 +47,10 @@ export class SessionSourceUnavailableError extends RelayHistoryError {}
 export class SessionSourceMismatchError extends RelayHistoryError {}
 export class HydrationUnsupportedError extends RelayHistoryError {}
 export class HydrationFailedError extends RelayHistoryError {}
+export class ConnectorNotConfiguredError extends RelayHistoryError {}
+export class AuthenticationExpiredError extends RelayHistoryError {}
+export class EvidencePartialError extends RelayHistoryError {}
+export class ConnectorFailureError extends RelayHistoryError {}
 
 export interface HistoryEntry {
   id: number;
@@ -194,8 +198,9 @@ export interface HydrateSessionResult {
   contractVersion: number;
   source: CatalogSource;
   sessionId: string;
-  status: 'hydrated' | 'updated' | 'unchanged';
-  discoveryState: 'full';
+  status: 'hydrated' | 'updated' | 'unchanged' | 'capability_limited';
+  capability: 'full' | 'partial' | 'shallow_only';
+  discoveryState: 'shallow' | 'full';
   presence: SessionLocation;
   indexedThrough: {
     sourceStamp: string | null;
@@ -205,6 +210,7 @@ export interface HydrateSessionResult {
     prompts: number;
     events: number;
     toolCalls: number;
+    fileEdits: number;
     relatedSessions: number;
   };
   relatedSessionIds: string[];
@@ -600,6 +606,18 @@ async function nativeCall<T>(call: (binding: NativeBinding) => Promise<T>): Prom
     }
     if (native.code === 'HYDRATION_FAILED') {
       throw new HydrationFailedError(native.message, native.code, { cause: error });
+    }
+    if (native.code === 'CONNECTOR_NOT_CONFIGURED') {
+      throw new ConnectorNotConfiguredError(native.message, native.code, { cause: error });
+    }
+    if (native.code === 'AUTHENTICATION_EXPIRED') {
+      throw new AuthenticationExpiredError(native.message, native.code, { cause: error });
+    }
+    if (native.code === 'EVIDENCE_PARTIAL') {
+      throw new EvidencePartialError(native.message, native.code, { cause: error });
+    }
+    if (native.code === 'CONNECTOR_FAILURE') {
+      throw new ConnectorFailureError(native.message, native.code, { cause: error });
     }
     throw new RelayHistoryError(native.message, native.code, { cause: error });
   }
@@ -1020,7 +1038,9 @@ export async function hydrateSession(options: HydrateSessionOptions): Promise<Hy
         'NATIVE_CONTRACT_MISMATCH',
       );
     }
-    if (!['hydrated', 'updated', 'unchanged'].includes(String(value.status)) || value.discoveryState !== 'full') {
+    if (!['hydrated', 'updated', 'unchanged', 'capability_limited'].includes(String(value.status))
+      || !['full', 'partial', 'shallow_only'].includes(String(value.capability))
+      || !['shallow', 'full'].includes(String(value.discoveryState))) {
       throw new NativeContractMismatchError(
         'ai-hist-native returned an invalid hydration result.',
         'NATIVE_CONTRACT_MISMATCH',
@@ -1033,7 +1053,8 @@ export async function hydrateSession(options: HydrateSessionOptions): Promise<Hy
       source: String(value.source) as CatalogSource,
       sessionId: String(value.sessionId),
       status: String(value.status) as HydrateSessionResult['status'],
-      discoveryState: 'full',
+      capability: String(value.capability) as HydrateSessionResult['capability'],
+      discoveryState: String(value.discoveryState) as HydrateSessionResult['discoveryState'],
       presence: value.presence === 'remote' ? 'remote' : 'local',
       indexedThrough: {
         sourceStamp: nullableString(indexed.sourceStamp),
@@ -1043,6 +1064,7 @@ export async function hydrateSession(options: HydrateSessionOptions): Promise<Hy
         prompts: Number(evidence.prompts),
         events: Number(evidence.events),
         toolCalls: Number(evidence.toolCalls),
+        fileEdits: Number(evidence.fileEdits),
         relatedSessions: Number(evidence.relatedSessions),
       },
       relatedSessionIds: Array.isArray(value.relatedSessionIds) ? value.relatedSessionIds.map(String) : [],

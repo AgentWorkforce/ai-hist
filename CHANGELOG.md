@@ -4,6 +4,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+- Add targeted remote hydration for Claude Code web sessions through the
+  provider's bounded teleport-evidence interface, and partial Codex cloud task
+  hydration through `codex cloud diff`. Hydration contract v2 reports honest
+  `full`, `partial`, and `shallow_only` capabilities, file-edit counts, and
+  stable connector/auth/missing/partial failure codes.
+- Relate a Claude remote session to its materialized local continuation only
+  when the local provider record contains the exact `remoteSessionId`; title or
+  repository similarity never creates a canonical relationship.
+
 ### Breaking
 
 - Add truthful OpenCode SQL work counters to discovery summaries. The catalog

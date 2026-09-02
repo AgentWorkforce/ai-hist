@@ -3,9 +3,11 @@
 use super::*;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::time::Instant;
 
-pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 1;
+pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 2;
 /// Bumped to 2 when Claude subagent transcripts that carry an `agentId`
 /// started being indexed under that child id: existing databases re-parse once
 /// and the earlier parent-attributed rows are healed in place.
@@ -30,6 +32,7 @@ pub struct HydrationEvidence {
     pub prompts: u64,
     pub events: u64,
     pub tool_calls: u64,
+    pub file_edits: u64,
     pub related_sessions: u64,
 }
 
@@ -48,6 +51,7 @@ pub struct HydrateSessionResult {
     pub source: String,
     pub session_id: String,
     pub status: String,
+    pub capability: String,
     pub discovery_state: String,
     pub presence: String,
     pub indexed_through: HydrationIndexedThrough,
@@ -95,8 +99,18 @@ fn hydrate_session_at_with_home(
 ) -> Result<HydrateSessionResult> {
     validate_options(options)?;
     let started = Instant::now();
+    // Acquisition and replacement are one per-session critical section. The
+    // provider call has to be inside it: otherwise an older response can wait
+    // behind a newer writer and then replace that newer evidence. A file lock
+    // covers both threads and independent RelayHistory processes.
+    let _remote_lock = (options.scope == SessionScope::Remote)
+        .then(|| acquire_remote_hydration_lock(db_path, options))
+        .transpose()?;
     let mut conn = open_db(db_path)?;
     let target = catalog_target(&conn, options)?;
+    if options.scope == SessionScope::Remote {
+        return hydrate_remote_session(&mut conn, options, home, started);
+    }
     let snapshot = source_snapshot(options, &target, home)?;
     let previous: Option<(Option<String>, i64, bool)> = conn
         .query_row(
@@ -189,6 +203,596 @@ fn hydrate_session_at_with_home(
     )
 }
 
+struct RemoteHydrationLock {
+    file: fs::File,
+}
+
+impl Drop for RemoteHydrationLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+fn acquire_remote_hydration_lock(
+    db_path: &Path,
+    options: &HydrateSessionOptions,
+) -> Result<RemoteHydrationLock> {
+    let absolute = if db_path.is_absolute() {
+        db_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(db_path)
+    };
+    let canonical_db = fs::canonicalize(&absolute).or_else(|_| {
+        let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
+        let parent = fs::canonicalize(parent)?;
+        Ok::<_, std::io::Error>(
+            parent.join(
+                absolute
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("history.db")),
+            ),
+        )
+    })?;
+    let lock_dir = canonical_db
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".relayhistory-hydration-locks");
+    fs::create_dir_all(&lock_dir)?;
+    let key = format!("{}\0{}", options.source, options.session_id);
+    let lock_path = lock_dir.join(format!("{:x}.lock", Sha256::digest(key.as_bytes())));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening hydration lock {}", lock_path.display()))?;
+    fs2::FileExt::lock_exclusive(&file)
+        .with_context(|| format!("locking hydration target {}", lock_path.display()))?;
+    Ok(RemoteHydrationLock { file })
+}
+
+fn hydrate_remote_session(
+    conn: &mut Connection,
+    options: &HydrateSessionOptions,
+    home: &Path,
+    started: Instant,
+) -> Result<HydrateSessionResult> {
+    if !matches!(options.source.as_str(), "claude" | "codex") {
+        return remote_limited_result(
+            conn,
+            options,
+            "CONNECTOR_NOT_CONFIGURED",
+            format!(
+                "no remote hydration connector exists for source '{}'",
+                options.source
+            ),
+            started,
+        );
+    }
+    let evidence =
+        crate::remote::acquire_remote_session_at(home, &options.source, &options.session_id)
+            .map_err(classify_remote_error)?;
+    match evidence {
+        crate::remote::RemoteSessionEvidence::CapabilityLimited { code, message } => {
+            remote_limited_result(conn, options, code, message, started)
+        }
+        crate::remote::RemoteSessionEvidence::ClaudeFull {
+            records,
+            source_stamp,
+            source_bytes,
+        } => hydrate_remote_claude(conn, options, records, source_stamp, source_bytes, started),
+        crate::remote::RemoteSessionEvidence::CodexDiff {
+            diff,
+            source_stamp,
+            source_bytes,
+        } => hydrate_remote_codex_diff(conn, options, &diff, source_stamp, source_bytes, started),
+    }
+}
+
+fn classify_remote_error(error: anyhow::Error) -> anyhow::Error {
+    let message = redact_remote_diagnostic(&format!("{error:#}"));
+    for code in [
+        "AUTHENTICATION_EXPIRED",
+        "SESSION_NOT_FOUND",
+        "EVIDENCE_PARTIAL",
+        "CONNECTOR_FAILURE",
+        "CONNECTOR_NOT_CONFIGURED",
+        "INVALID_ARGUMENT",
+    ] {
+        if message.starts_with(&format!("{code}:")) {
+            return anyhow::anyhow!(message);
+        }
+    }
+    hydration_error("CONNECTOR_FAILURE", message)
+}
+
+fn redact_remote_diagnostic(message: &str) -> String {
+    let mut redacted = Vec::new();
+    let parts = message.split_whitespace().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < parts.len() {
+        let part = parts[index];
+        let lower = part.to_ascii_lowercase();
+        let normalized = lower.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_');
+        let token_key = matches!(
+            normalized,
+            "access_token" | "accesstoken" | "refresh_token" | "refreshtoken"
+        );
+        let bearer = normalized == "bearer";
+        let authorization_bearer = normalized == "authorization"
+            && parts
+                .get(index + 1)
+                .is_some_and(|next| next.eq_ignore_ascii_case("bearer"));
+        let inline_secret = lower.contains("sk-ant-")
+            || [
+                "access_token",
+                "accesstoken",
+                "refresh_token",
+                "refreshtoken",
+            ]
+            .iter()
+            .any(|key| {
+                lower
+                    .find(key)
+                    .is_some_and(|start| lower[start + key.len()..].starts_with(['=', ':']))
+            });
+        if inline_secret || probable_secret(part) {
+            redacted.push("[REDACTED]");
+        } else if authorization_bearer {
+            redacted.push("[REDACTED]");
+            index += 2;
+        } else if bearer || token_key {
+            redacted.push("[REDACTED]");
+            index += 1;
+            if matches!(parts.get(index), Some(&"=") | Some(&":")) {
+                index += 1;
+            }
+        } else {
+            redacted.push(part);
+        }
+        index += 1;
+    }
+    redacted.join(" ")
+}
+
+fn probable_secret(part: &str) -> bool {
+    let value =
+        part.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch, '-' | '_' | '.'));
+    value.len() >= 24
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && value.bytes().any(|byte| byte.is_ascii_lowercase())
+        && value.bytes().any(|byte| byte.is_ascii_uppercase())
+        && value.bytes().any(|byte| byte.is_ascii_digit())
+}
+
+fn remote_limited_result(
+    conn: &mut Connection,
+    options: &HydrateSessionOptions,
+    code: &str,
+    message: String,
+    started: Instant,
+) -> Result<HydrateSessionResult> {
+    if options.source == "codex" && code == "PROVIDER_CAPABILITY_LIMITED" {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM file_edits WHERE source = 'codex' AND session_id = ? AND tool_name = 'codex cloud diff'",
+            [&options.session_id],
+        )?;
+        tx.execute(
+            "DELETE FROM session_hydration_checkpoints WHERE source = 'codex' AND session_id = ? AND location = 'remote'",
+            [&options.session_id],
+        )?;
+        tx.commit()?;
+    }
+    let related_session_ids = if options.include_related {
+        related_ids(conn, &options.source, &options.session_id)?
+    } else {
+        Vec::new()
+    };
+    let mut ids = vec![options.session_id.clone()];
+    ids.extend(related_session_ids.iter().cloned());
+    let evidence = evidence_counts(
+        conn,
+        &options.source,
+        &ids,
+        related_session_ids.len() as u64,
+    )?;
+    Ok(HydrateSessionResult {
+        contract_version: SESSION_HYDRATION_CONTRACT_VERSION,
+        source: options.source.clone(),
+        session_id: options.session_id.clone(),
+        status: "capability_limited".to_string(),
+        capability: "shallow_only".to_string(),
+        discovery_state: "shallow".to_string(),
+        presence: "remote".to_string(),
+        indexed_through: HydrationIndexedThrough::default(),
+        evidence,
+        related_session_ids,
+        diagnostics: vec![HydrationDiagnostic {
+            code: code.to_string(),
+            message: redact_remote_diagnostic(&message),
+            duration_ms: Some(started.elapsed().as_millis() as i64),
+            source_bytes: Some(0),
+            records_parsed: Some(0),
+        }],
+    })
+}
+
+fn hydrate_remote_claude(
+    conn: &mut Connection,
+    options: &HydrateSessionOptions,
+    mut records: Vec<Value>,
+    source_stamp: String,
+    source_bytes: i64,
+    started: Instant,
+) -> Result<HydrateSessionResult> {
+    let previous = hydration_checkpoint(conn, options, "remote")?;
+    if previous.as_ref().is_some_and(|checkpoint| {
+        checkpoint.source_stamp.as_deref() == Some(source_stamp.as_str())
+            && checkpoint.parser_version == HYDRATION_PARSER_VERSION
+    }) {
+        return build_remote_result(
+            conn,
+            options,
+            "unchanged",
+            "full",
+            "full",
+            source_stamp,
+            source_bytes,
+            records.len() as i64,
+            "REMOTE_EVIDENCE_FULL",
+            "all evidence exposed by Claude's teleport interface is indexed",
+            started,
+        );
+    }
+    for record in &mut records {
+        let object = record
+            .as_object_mut()
+            .context("CONNECTOR_FAILURE: Claude teleport evidence contains a non-object record")?;
+        let recorded_id = object
+            .get("sessionId")
+            .or_else(|| object.get("session_id"))
+            .and_then(Value::as_str);
+        match recorded_id {
+            Some(id) if id != options.session_id => anyhow::bail!(
+                "CONNECTOR_FAILURE: Claude teleport record identity does not match the requested session"
+            ),
+            None => {}
+            _ => {}
+        }
+        // The shared transcript parser consumes the provider's canonical
+        // camelCase field. Normalize the accepted snake_case wire variant.
+        object.insert(
+            "sessionId".to_string(),
+            Value::String(options.session_id.clone()),
+        );
+    }
+    let mut transcript = tempfile::NamedTempFile::new()?;
+    for record in &records {
+        serde_json::to_writer(&mut transcript, record)?;
+        transcript.write_all(b"\n")?;
+    }
+    transcript.flush()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let had_local_presence: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_presences WHERE source = ? AND session_id = ? AND location = 'local')",
+        params![options.source, options.session_id],
+        |row| row.get(0),
+    )?;
+    // A teleport response is a complete remote snapshot. Remove evidence that
+    // disappeared before inserting the new snapshot. When the canonical id
+    // also has local evidence, do not erase rows whose provenance cannot be
+    // distinguished from the remote copy.
+    if !had_local_presence {
+        for table in ["history", "session_events", "tool_calls", "file_edits"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE source = 'claude' AND session_id = ?"),
+                [&options.session_id],
+            )?;
+        }
+    }
+    ingest_claude_transcript(&tx, transcript.path())?;
+    if !had_local_presence {
+        tx.execute(
+            "DELETE FROM session_presences WHERE source = ? AND session_id = ? AND location = 'local'",
+            params![options.source, options.session_id],
+        )?;
+    }
+    tx.execute(
+        "UPDATE sessions SET discovery_state = 'full' WHERE source = ? AND session_id = ?",
+        params![options.source, options.session_id],
+    )?;
+    tx.execute(
+        "UPDATE session_presences SET discovery_state = 'full', source_stamp = ? \
+         WHERE source = ? AND session_id = ? AND location = 'remote'",
+        params![source_stamp, options.source, options.session_id],
+    )?;
+    write_hydration_checkpoint(
+        &tx,
+        options,
+        "remote",
+        &source_stamp,
+        source_bytes,
+        records.len() as i64,
+    )?;
+    tx.commit()?;
+    build_remote_result(
+        conn,
+        options,
+        if previous.is_some() {
+            "updated"
+        } else {
+            "hydrated"
+        },
+        "full",
+        "full",
+        source_stamp,
+        source_bytes,
+        records.len() as i64,
+        "REMOTE_EVIDENCE_FULL",
+        "all evidence exposed by Claude's teleport interface is indexed",
+        started,
+    )
+}
+
+fn hydrate_remote_codex_diff(
+    conn: &mut Connection,
+    options: &HydrateSessionOptions,
+    diff: &str,
+    source_stamp: String,
+    source_bytes: i64,
+    started: Instant,
+) -> Result<HydrateSessionResult> {
+    let previous = hydration_checkpoint(conn, options, "remote")?;
+    let unchanged = previous.as_ref().is_some_and(|checkpoint| {
+        checkpoint.source_stamp.as_deref() == Some(source_stamp.as_str())
+            && checkpoint.parser_version == HYDRATION_PARSER_VERSION
+    });
+    if !unchanged {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM file_edits WHERE source = 'codex' AND session_id = ? AND tool_name = 'codex cloud diff'",
+            [&options.session_id],
+        )?;
+        for (index, patch) in split_unified_diff(diff).into_iter().enumerate() {
+            let (added, removed) = count_unified_diff_lines(&patch.text);
+            tx.execute(
+                "INSERT INTO file_edits \
+                 (source, session_id, tool_use_id, file_path, tool_name, lines_added, lines_removed, structured_patch_json, ts_ms) \
+                 VALUES ('codex', ?, ?, ?, 'codex cloud diff', ?, ?, ?, ?) \
+                 ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
+                   file_path=excluded.file_path, lines_added=excluded.lines_added, lines_removed=excluded.lines_removed, \
+                   structured_patch_json=excluded.structured_patch_json, ts_ms=excluded.ts_ms",
+                params![
+                    options.session_id,
+                    format!("remote-diff:{index}"),
+                    patch.path,
+                    added,
+                    removed,
+                    serde_json::to_string(&serde_json::json!({"unified_diff": patch.text}))?,
+                    now_ms(),
+                ],
+            )?;
+        }
+        write_hydration_checkpoint(&tx, options, "remote", &source_stamp, source_bytes, 1)?;
+        tx.commit()?;
+    }
+    build_remote_result(
+        conn,
+        options,
+        if unchanged {
+            "unchanged"
+        } else if previous.is_some() {
+            "updated"
+        } else {
+            "hydrated"
+        },
+        "partial",
+        "shallow",
+        source_stamp,
+        source_bytes,
+        1,
+        "EVIDENCE_PARTIAL",
+        "Codex exposes the task diff but no supported transcript, tool-result, token, model, or agent-relationship export",
+        started,
+    )
+}
+
+struct UnifiedPatch {
+    path: String,
+    text: String,
+}
+
+fn split_unified_diff(diff: &str) -> Vec<UnifiedPatch> {
+    let mut patches = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut current = String::new();
+    for line in diff.lines() {
+        if let Some(path) = git_diff_destination_path(line) {
+            if let Some(path) = current_path.take() {
+                patches.push(UnifiedPatch {
+                    path,
+                    text: std::mem::take(&mut current),
+                });
+            }
+            current_path = Some(path);
+        }
+        if current_path.is_some() {
+            current.push_str(line);
+            current.push('\n');
+        }
+    }
+    if let Some(path) = current_path {
+        patches.push(UnifiedPatch {
+            path,
+            text: current,
+        });
+    }
+    if patches.is_empty() && !diff.trim().is_empty() {
+        patches.push(UnifiedPatch {
+            path: "(task diff)".to_string(),
+            text: diff.to_string(),
+        });
+    }
+    patches
+}
+
+fn git_diff_destination_path(line: &str) -> Option<String> {
+    let mut rest = line.strip_prefix("diff --git ")?;
+    let _source = take_git_path(&mut rest)?;
+    let destination = take_git_path(&mut rest)?;
+    destination.strip_prefix("b/").map(str::to_string)
+}
+
+fn take_git_path(input: &mut &str) -> Option<String> {
+    *input = input.trim_start();
+    if let Some(quoted) = input.strip_prefix('"') {
+        let mut bytes = Vec::new();
+        let raw = quoted.as_bytes();
+        let mut index = 0;
+        while index < raw.len() {
+            match raw[index] {
+                b'"' => {
+                    *input = &quoted[index + 1..];
+                    return Some(String::from_utf8_lossy(&bytes).into_owned());
+                }
+                b'\\' if index + 1 < raw.len() => {
+                    index += 1;
+                    match raw[index] {
+                        b'n' => bytes.push(b'\n'),
+                        b'r' => bytes.push(b'\r'),
+                        b't' => bytes.push(b'\t'),
+                        b'0'..=b'7' => {
+                            let mut value = raw[index] - b'0';
+                            for _ in 0..2 {
+                                if index + 1 < raw.len() && matches!(raw[index + 1], b'0'..=b'7') {
+                                    index += 1;
+                                    value =
+                                        value.saturating_mul(8).saturating_add(raw[index] - b'0');
+                                }
+                            }
+                            bytes.push(value);
+                        }
+                        escaped => bytes.push(escaped),
+                    }
+                }
+                byte => bytes.push(byte),
+            }
+            index += 1;
+        }
+        None
+    } else {
+        let end = input.find(char::is_whitespace).unwrap_or(input.len());
+        let token = input[..end].to_string();
+        *input = &input[end..];
+        Some(token)
+    }
+}
+
+struct HydrationCheckpoint {
+    source_stamp: Option<String>,
+    parser_version: i64,
+}
+
+fn hydration_checkpoint(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    location: &str,
+) -> Result<Option<HydrationCheckpoint>> {
+    Ok(conn
+        .query_row(
+            "SELECT source_stamp, parser_version FROM session_hydration_checkpoints WHERE source = ? AND session_id = ? AND location = ?",
+            params![options.source, options.session_id, location],
+            |row| Ok(HydrationCheckpoint { source_stamp: row.get(0)?, parser_version: row.get(1)? }),
+        )
+        .optional()?)
+}
+
+fn write_hydration_checkpoint(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    location: &str,
+    source_stamp: &str,
+    source_bytes: i64,
+    records_parsed: i64,
+) -> Result<()> {
+    let last_event_at_ms = max_event_time(conn, &options.source, &options.session_id)?;
+    conn.execute(
+        "INSERT INTO session_hydration_checkpoints \
+         (source, session_id, location, source_stamp, parser_version, last_event_at_ms, source_bytes, records_parsed, include_related, updated_ms) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(source, session_id, location) DO UPDATE SET \
+           source_stamp=excluded.source_stamp, parser_version=excluded.parser_version, last_event_at_ms=excluded.last_event_at_ms, \
+           source_bytes=excluded.source_bytes, records_parsed=excluded.records_parsed, include_related=excluded.include_related, updated_ms=excluded.updated_ms",
+        params![
+            options.source,
+            options.session_id,
+            location,
+            source_stamp,
+            HYDRATION_PARSER_VERSION,
+            last_event_at_ms,
+            source_bytes,
+            records_parsed,
+            options.include_related,
+            now_ms(),
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_remote_result(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    status: &str,
+    capability: &str,
+    discovery_state: &str,
+    source_stamp: String,
+    source_bytes: i64,
+    records_parsed: i64,
+    diagnostic_code: &str,
+    diagnostic_message: &str,
+    started: Instant,
+) -> Result<HydrateSessionResult> {
+    let related_session_ids = if options.include_related {
+        related_ids(conn, &options.source, &options.session_id)?
+    } else {
+        Vec::new()
+    };
+    let mut ids = vec![options.session_id.clone()];
+    ids.extend(related_session_ids.iter().cloned());
+    Ok(HydrateSessionResult {
+        contract_version: SESSION_HYDRATION_CONTRACT_VERSION,
+        source: options.source.clone(),
+        session_id: options.session_id.clone(),
+        status: status.to_string(),
+        capability: capability.to_string(),
+        discovery_state: discovery_state.to_string(),
+        presence: "remote".to_string(),
+        indexed_through: HydrationIndexedThrough {
+            source_stamp: Some(source_stamp),
+            last_event_at_ms: max_event_time(conn, &options.source, &options.session_id)?,
+        },
+        evidence: evidence_counts(
+            conn,
+            &options.source,
+            &ids,
+            related_session_ids.len() as u64,
+        )?,
+        related_session_ids,
+        diagnostics: vec![HydrationDiagnostic {
+            code: diagnostic_code.to_string(),
+            message: diagnostic_message.to_string(),
+            duration_ms: Some(started.elapsed().as_millis() as i64),
+            source_bytes: Some(source_bytes),
+            records_parsed: Some(records_parsed),
+        }],
+    })
+}
+
 fn validate_options(options: &HydrateSessionOptions) -> Result<()> {
     if options.session_id.trim().is_empty() {
         return Err(hydration_error(
@@ -205,23 +809,22 @@ fn validate_options(options: &HydrateSessionOptions) -> Result<()> {
             format!("unsupported catalog source '{}'", options.source),
         ));
     }
-    if options.scope == SessionScope::Remote {
-        return Err(hydration_error(
-            "HYDRATION_UNSUPPORTED",
-            "remote session hydration is not available: no remote provider connector is configured",
-        ));
-    }
     Ok(())
 }
 
 fn catalog_target(conn: &Connection, options: &HydrateSessionOptions) -> Result<CatalogTarget> {
+    let location = if options.scope == SessionScope::Remote {
+        "remote"
+    } else {
+        "local"
+    };
     let row = conn
         .query_row(
             "SELECT p.raw_locator, COALESCE(p.discovery_state, s.discovery_state) \
-             FROM sessions s LEFT JOIN session_presences p \
-               ON p.source = s.source AND p.session_id = s.session_id AND p.location = 'local' \
+             FROM sessions s JOIN session_presences p \
+               ON p.source = s.source AND p.session_id = s.session_id AND p.location = ? \
              WHERE s.source = ? AND s.session_id = ?",
-            params![options.source, options.session_id],
+            params![location, options.source, options.session_id],
             |row| {
                 Ok(CatalogTarget {
                     locator: row.get(0)?,
@@ -479,6 +1082,7 @@ fn ingest_claude(
         Some(&path.to_string_lossy()),
     )?;
     ingest_claude_transcript(conn, path)?;
+    record_claude_remote_relationship(conn, &meta)?;
     // The snapshot already walked and parsed these sidecars to stamp them, so
     // this pass indexes that evidence instead of finding it a second time.
     for evidence in subagents {
@@ -835,6 +1439,7 @@ fn build_result(
         source: options.source.clone(),
         session_id: options.session_id.clone(),
         status: status.to_string(),
+        capability: "full".to_string(),
         discovery_state: "full".to_string(),
         presence: "local".to_string(),
         indexed_through: HydrationIndexedThrough {
@@ -907,6 +1512,7 @@ fn evidence_counts(
         evidence.prompts += count_table(conn, "history", source, session_id)?;
         evidence.events += count_table(conn, "session_events", source, session_id)?;
         evidence.tool_calls += count_table(conn, "tool_calls", source, session_id)?;
+        evidence.file_edits += count_table(conn, "file_edits", source, session_id)?;
     }
     Ok(evidence)
 }
@@ -932,6 +1538,89 @@ fn max_event_time(conn: &Connection, source: &str, session_id: &str) -> Result<O
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn remote_diagnostics_redact_separated_inline_and_probable_secrets() {
+        let message = "Bearer secret-value access_token=inline refresh_token : next-value ALongMixedSecretValue123456";
+        let redacted = redact_remote_diagnostic(message);
+        assert_eq!(redacted, "[REDACTED] [REDACTED] [REDACTED] [REDACTED]");
+        assert!(!redacted.contains("secret"));
+        let invalid = classify_remote_error(anyhow::anyhow!(
+            "INVALID_ARGUMENT: remote Claude session id is malformed"
+        ));
+        assert!(invalid.to_string().starts_with("INVALID_ARGUMENT:"));
+        assert_eq!(
+            redact_remote_diagnostic("CONNECTOR_FAILURE: authorization failed for provider"),
+            "CONNECTOR_FAILURE: authorization failed for provider"
+        );
+        assert_eq!(
+            redact_remote_diagnostic("CONNECTOR_FAILURE: Authorization Bearer secret-value"),
+            "CONNECTOR_FAILURE: [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn remote_hydration_file_lock_serializes_the_same_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let request = HydrateSessionOptions {
+            source: "codex".into(),
+            session_id: "task_lock".into(),
+            scope: SessionScope::Remote,
+            include_related: false,
+        };
+        let first = acquire_remote_hydration_lock(&db, &request).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let second = acquire_remote_hydration_lock(&db, &request).unwrap();
+            sender.send(()).unwrap();
+            drop(second);
+        });
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+        drop(first);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_hydration_file_lock_canonicalizes_database_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let db = real_dir.join("history.db");
+        fs::write(&db, []).unwrap();
+        let alias_dir = dir.path().join("alias");
+        symlink(&real_dir, &alias_dir).unwrap();
+        let alias = alias_dir.join("history.db");
+        let request = HydrateSessionOptions {
+            source: "codex".into(),
+            session_id: "task_alias_lock".into(),
+            scope: SessionScope::Remote,
+            include_related: false,
+        };
+        let first = acquire_remote_hydration_lock(&db, &request).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let second = acquire_remote_hydration_lock(&alias, &request).unwrap();
+            sender.send(()).unwrap();
+            drop(second);
+        });
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+        drop(first);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        handle.join().unwrap();
+    }
 
     fn catalog_row(conn: &Connection, source: &str, session_id: &str, path: Option<&Path>) {
         conn.execute(
@@ -1957,5 +2646,360 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts, (1, 1));
+    }
+
+    fn remote_catalog_row(conn: &Connection, source: &str, session_id: &str) {
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, first_prompt, discovery_state) VALUES (?, ?, 'same title', 'shallow')",
+            params![source, session_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_presences (source, session_id, location, raw_locator, source_stamp, discovery_state) \
+             VALUES (?, ?, 'remote', ?, 'remote-listing', 'shallow')",
+            params![source, session_id, session_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn remote_capability_limit_is_a_structured_supported_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        remote_catalog_row(&conn, "cursor", "remote-cursor");
+        record_relationship(
+            &conn,
+            &ObservedRelationship {
+                source: "cursor",
+                parent_session_id: "remote-cursor",
+                child_session_id: Some("related-child"),
+                relationship: "delegated",
+                child_agent_type: None,
+                child_agent_name: None,
+                child_model: None,
+                spawn_depth: None,
+                evidence_kind: "test",
+                evidence_locator: None,
+                evidence_ref: None,
+                child_has_events: true,
+                spawned_at_ms: None,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('cursor', 'related-child', 1, 'assistant', 'text', 'child output', 'child-event')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let result = hydrate_session_at_with_home(
+            &db,
+            &HydrateSessionOptions {
+                source: "cursor".into(),
+                session_id: "remote-cursor".into(),
+                scope: SessionScope::Remote,
+                include_related: true,
+            },
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(result.status, "capability_limited");
+        assert_eq!(result.capability, "shallow_only");
+        assert_eq!(result.discovery_state, "shallow");
+        assert_eq!(result.presence, "remote");
+        assert_eq!(result.related_session_ids, vec!["related-child"]);
+        assert_eq!(result.evidence.events, 1);
+        assert_eq!(result.diagnostics[0].code, "CONNECTOR_NOT_CONFIGURED");
+    }
+
+    #[test]
+    fn claude_remote_full_evidence_is_atomic_idempotent_and_preserves_remote_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let mut conn = open_db(&db).unwrap();
+        remote_catalog_row(&conn, "claude", "session_01full");
+        let options = HydrateSessionOptions {
+            source: "claude".into(),
+            session_id: "session_01full".into(),
+            scope: SessionScope::Remote,
+            include_related: true,
+        };
+        let records = vec![
+            serde_json::json!({
+                "session_id": "session_01full", "uuid": "u1", "type": "user", "timestamp": 1,
+                "message": {"role": "user", "content": "remote prompt"}
+            }),
+            serde_json::json!({
+                "sessionId": "session_01full", "uuid": "a1", "type": "assistant", "timestamp": 2,
+                "message": {"role": "assistant", "model": "claude-test", "usage": {"input_tokens": 2},
+                    "content": [{"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"file_path": "/work/a"}}]}
+            }),
+        ];
+        let first = hydrate_remote_claude(
+            &mut conn,
+            &options,
+            records.clone(),
+            "teleport:one".into(),
+            100,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(first.status, "hydrated");
+        assert_eq!(first.capability, "full");
+        assert_eq!(first.evidence.prompts, 1);
+        assert_eq!(first.evidence.events, 2);
+        assert_eq!(first.evidence.tool_calls, 1);
+        let presences = conn
+            .prepare("SELECT location, discovery_state FROM session_presences WHERE source='claude' AND session_id='session_01full' ORDER BY location")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(presences, vec![("remote".into(), "full".into())]);
+
+        let repeated = hydrate_remote_claude(
+            &mut conn,
+            &options,
+            records.clone(),
+            "teleport:one".into(),
+            100,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(repeated.status, "unchanged");
+        assert_eq!(repeated.evidence.events, 2);
+
+        conn.execute(
+            "UPDATE session_hydration_checkpoints SET parser_version = 0 \
+             WHERE source = 'claude' AND session_id = 'session_01full' AND location = 'remote'",
+            [],
+        )
+        .unwrap();
+        let reparsed = hydrate_remote_claude(
+            &mut conn,
+            &options,
+            records.clone(),
+            "teleport:one".into(),
+            100,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(reparsed.status, "updated");
+
+        let reduced = hydrate_remote_claude(
+            &mut conn,
+            &options,
+            vec![records[0].clone()],
+            "teleport:two".into(),
+            50,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(reduced.evidence.events, 1);
+        assert_eq!(reduced.evidence.tool_calls, 0);
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
+            .unwrap();
+        let malformed = vec![serde_json::json!({
+            "sessionId": "session_different", "uuid": "bad", "type": "user", "timestamp": 3,
+            "message": {"role": "user", "content": "must roll back"}
+        })];
+        assert!(hydrate_remote_claude(
+            &mut conn,
+            &options,
+            malformed,
+            "teleport:bad".into(),
+            20,
+            Instant::now(),
+        )
+        .is_err());
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn codex_diff_hydration_is_idempotent_incremental_and_honestly_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let mut conn = open_db(&db).unwrap();
+        remote_catalog_row(&conn, "codex", "task_e_123");
+        let options = HydrateSessionOptions {
+            source: "codex".into(),
+            session_id: "task_e_123".into(),
+            scope: SessionScope::Remote,
+            include_related: true,
+        };
+        let diff =
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n old\n+new\n";
+        let first = hydrate_remote_codex_diff(
+            &mut conn,
+            &options,
+            diff,
+            "diff:one".into(),
+            diff.len() as i64,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(first.status, "hydrated");
+        assert_eq!(first.capability, "partial");
+        assert_eq!(first.discovery_state, "shallow");
+        assert_eq!(first.evidence.file_edits, 1);
+        assert_eq!(first.diagnostics[0].code, "EVIDENCE_PARTIAL");
+
+        let repeated = hydrate_remote_codex_diff(
+            &mut conn,
+            &options,
+            diff,
+            "diff:one".into(),
+            diff.len() as i64,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(repeated.status, "unchanged");
+        assert_eq!(repeated.evidence.file_edits, 1);
+
+        conn.execute(
+            "UPDATE session_hydration_checkpoints SET parser_version = 0 \
+             WHERE source = 'codex' AND session_id = 'task_e_123' AND location = 'remote'",
+            [],
+        )
+        .unwrap();
+        let reparsed = hydrate_remote_codex_diff(
+            &mut conn,
+            &options,
+            diff,
+            "diff:one".into(),
+            diff.len() as i64,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(reparsed.status, "updated");
+
+        let appended = format!(
+            "{diff}diff --git \"a/old name.txt\" \"b/new name.txt\"\n--- \"a/old name.txt\"\n+++ \"b/new name.txt\"\n@@ -0,0 +1 @@\n+added\n"
+        );
+        let updated = hydrate_remote_codex_diff(
+            &mut conn,
+            &options,
+            &appended,
+            "diff:two".into(),
+            appended.len() as i64,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(updated.status, "updated");
+        assert_eq!(updated.evidence.file_edits, 2);
+        let paths = conn
+            .prepare("SELECT file_path FROM file_edits WHERE source='codex' AND session_id='task_e_123' ORDER BY file_path")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(paths, vec!["a.txt", "new name.txt"]);
+
+        let limited = remote_limited_result(
+            &mut conn,
+            &options,
+            "PROVIDER_CAPABILITY_LIMITED",
+            "no diff".into(),
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(limited.evidence.file_edits, 0);
+        let checkpoints: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_hydration_checkpoints WHERE source='codex' AND session_id='task_e_123'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoints, 0);
+    }
+
+    #[test]
+    fn codex_diff_hydration_rolls_back_partial_file_edits_and_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let mut conn = open_db(&db).unwrap();
+        remote_catalog_row(&conn, "codex", "task_e_atomic");
+        conn.execute_batch(
+            "CREATE TRIGGER reject_second_remote_edit BEFORE INSERT ON file_edits \
+             WHEN NEW.file_path = 'b.txt' BEGIN SELECT RAISE(ABORT, 'injected remote edit failure'); END;",
+        )
+        .unwrap();
+        let options = HydrateSessionOptions {
+            source: "codex".into(),
+            session_id: "task_e_atomic".into(),
+            scope: SessionScope::Remote,
+            include_related: true,
+        };
+        let diff = "diff --git a/a.txt b/a.txt\n+one\ndiff --git a/b.txt b/b.txt\n+two\n";
+        assert!(hydrate_remote_codex_diff(
+            &mut conn,
+            &options,
+            diff,
+            "diff:atomic".into(),
+            diff.len() as i64,
+            Instant::now(),
+        )
+        .is_err());
+        let counts: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM file_edits WHERE session_id='task_e_atomic'), \
+                        (SELECT COUNT(*) FROM session_hydration_checkpoints WHERE session_id='task_e_atomic')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[test]
+    fn deterministic_claude_remote_id_correlates_but_title_similarity_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let transcript = dir.path().join(".claude/projects/app/local.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            "{\"sessionId\":\"local-1\",\"remoteSessionId\":\"session_01remote\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\"type\":\"user\",\"timestamp\":1,\"message\":{\"role\":\"user\",\"content\":\"same title\"}}\n",
+        )
+        .unwrap();
+        let similar = dir.path().join(".claude/projects/app/similar.jsonl");
+        fs::write(
+            &similar,
+            "{\"sessionId\":\"local-2\",\"uuid\":\"u2\",\"cwd\":\"/work/app\",\"type\":\"user\",\"timestamp\":2,\"message\":{\"role\":\"user\",\"content\":\"same title\"}}\n",
+        )
+        .unwrap();
+        let conn = open_db(&db).unwrap();
+        remote_catalog_row(&conn, "claude", "session_01remote");
+        catalog_row(&conn, "claude", "local-1", Some(&transcript));
+        catalog_row(&conn, "claude", "local-2", Some(&similar));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("claude", "local-1"), dir.path()).unwrap();
+        hydrate_session_at_with_home(&db, &options("claude", "local-2"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        let relationships = conn
+            .prepare("SELECT parent_session_id, child_session_id, relationship FROM session_relationships ORDER BY child_session_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            relationships,
+            vec![(
+                "session_01remote".into(),
+                "local-1".into(),
+                "materialized_local".into()
+            )]
+        );
     }
 }
