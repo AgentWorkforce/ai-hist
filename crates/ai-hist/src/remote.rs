@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 use ai_hist_core::{SessionLocation, SOURCE_CHOICES};
@@ -292,26 +292,17 @@ pub(crate) struct ClaudeHttpResponse {
 /// The HTTP side of the claude.ai session listing, abstracted so mapping and
 /// pagination are testable without a network.
 pub(crate) trait ClaudeSessionsTransport: Send + Sync {
-    fn get(&self, url: &str, bearer_token: &str) -> Result<ClaudeHttpResponse>;
-
     fn get_with_headers(
         &self,
         url: &str,
         bearer_token: &str,
         headers: &[(&str, &str)],
-    ) -> Result<ClaudeHttpResponse> {
-        let _ = headers;
-        self.get(url, bearer_token)
-    }
+    ) -> Result<ClaudeHttpResponse>;
 }
 
 struct UreqClaudeTransport;
 
 impl ClaudeSessionsTransport for UreqClaudeTransport {
-    fn get(&self, url: &str, bearer_token: &str) -> Result<ClaudeHttpResponse> {
-        self.get_with_headers(url, bearer_token, &[])
-    }
-
     fn get_with_headers(
         &self,
         url: &str,
@@ -369,7 +360,11 @@ pub(crate) fn acquire_remote_session_at(
             &claude_api_base_url(),
             &UreqClaudeTransport,
         ),
-        "codex" => acquire_codex_remote_session(session_id),
+        "codex" if codex_auth_path(home).is_file() => acquire_codex_remote_session(session_id),
+        "codex" => Ok(RemoteSessionEvidence::CapabilityLimited {
+            code: "CONNECTOR_NOT_CONFIGURED",
+            message: "codex-cloud is not configured; run `codex login`".to_string(),
+        }),
         _ => Ok(RemoteSessionEvidence::CapabilityLimited {
             code: "CONNECTOR_NOT_CONFIGURED",
             message: format!("no remote hydration connector exists for source '{source}'"),
@@ -392,7 +387,7 @@ fn acquire_claude_remote_session_at(
     }
     anyhow::ensure!(
         is_claude_web_session_id(session_id),
-        "remote Claude session id is malformed"
+        "INVALID_ARGUMENT: remote Claude session id is malformed"
     );
     require_https_or_loopback(base_url)?;
     let oauth = load_claude_oauth(&credentials_path)?;
@@ -408,7 +403,7 @@ fn acquire_claude_remote_session_at(
     // teleport-events. Both interfaces are private implementation contracts,
     // so parser failures are explicit rather than treated as empty evidence.
     let profile_url = format!("{base_url}/api/oauth/profile");
-    let profile = transport.get(&profile_url, &oauth.access_token)?;
+    let profile = transport.get_with_headers(&profile_url, &oauth.access_token, &[])?;
     match profile.status {
         200 => {}
         401 | 403 => anyhow::bail!(
@@ -692,7 +687,9 @@ impl ShallowSessionProvider for ClaudeWebProvider {
                 url.push_str("&cursor=");
                 url.push_str(&urlencode(cursor));
             }
-            let response = self.transport.get(&url, &oauth.access_token)?;
+            let response = self
+                .transport
+                .get_with_headers(&url, &oauth.access_token, &[])?;
             match response.status {
                 200 => {}
                 401 | 403 => anyhow::bail!(
@@ -768,6 +765,14 @@ fn acquire_codex_remote_session_with_command(
     session_id: &str,
     command: &OsStr,
 ) -> Result<RemoteSessionEvidence> {
+    acquire_codex_remote_session_with_command_timeout(session_id, command, REMOTE_COMMAND_TIMEOUT)
+}
+
+fn acquire_codex_remote_session_with_command_timeout(
+    session_id: &str,
+    command: &OsStr,
+    timeout: Duration,
+) -> Result<RemoteSessionEvidence> {
     if !session_id.starts_with("task_")
         || !session_id
             .bytes()
@@ -797,14 +802,26 @@ fn acquire_codex_remote_session_with_command(
         .take()
         .context("CONNECTOR_FAILURE: no Codex stderr pipe")?;
     let read_bounded = |mut stream: Box<dyn Read + Send>| {
+        let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
-            stream
-                .by_ref()
-                .take((MAX_REMOTE_EVIDENCE_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)?;
-            Ok::<Vec<u8>, std::io::Error>(bytes)
-        })
+            let mut buffer = [0u8; 64 * 1024];
+            let result = loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break Ok(bytes),
+                    Ok(read) => {
+                        // Retain only enough to detect the limit, but keep
+                        // draining so an oversized child cannot block on a
+                        // full pipe and masquerade as a command timeout.
+                        let remaining = (MAX_REMOTE_EVIDENCE_BYTES + 1).saturating_sub(bytes.len());
+                        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+                    }
+                    Err(error) => break Err(error),
+                }
+            };
+            let _ = sender.send(result);
+        });
+        receiver
     };
     let stdout_reader = read_bounded(Box::new(stdout));
     let stderr_reader = read_bounded(Box::new(stderr));
@@ -813,19 +830,26 @@ fn acquire_codex_remote_session_with_command(
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if started.elapsed() >= REMOTE_COMMAND_TIMEOUT {
+        if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
             anyhow::bail!("CONNECTOR_FAILURE: `codex cloud diff` exceeded the 30 second timeout");
         }
         std::thread::sleep(Duration::from_millis(25));
     };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("CONNECTOR_FAILURE: Codex stdout reader panicked"))??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("CONNECTOR_FAILURE: Codex stderr reader panicked"))??;
+    let receive = |reader: mpsc::Receiver<std::io::Result<Vec<u8>>>, name: &str| {
+        let remaining = timeout.checked_sub(started.elapsed()).unwrap_or_default();
+        reader
+            .recv_timeout(remaining)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "CONNECTOR_FAILURE: Codex {name} pipe remained open past the 30 second timeout"
+                )
+            })?
+            .map_err(anyhow::Error::from)
+    };
+    let stdout = receive(stdout_reader, "stdout")?;
+    let stderr = receive(stderr_reader, "stderr")?;
     anyhow::ensure!(
         stdout.len() <= MAX_REMOTE_EVIDENCE_BYTES && stderr.len() <= MAX_REMOTE_EVIDENCE_BYTES,
         "CONNECTOR_FAILURE: `codex cloud diff` exceeded the 16 MiB response-size limit"

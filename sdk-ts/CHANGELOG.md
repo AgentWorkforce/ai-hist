@@ -7,9 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Expose hydration contract v2 with `capability`, shallow/partial outcomes,
-  file-edit evidence counts, and stable remote connector error classes.
-
 ### Breaking
 
 - Advance the native-addon contract to 7 and the session-catalog contract to
@@ -33,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Surface bounded OpenCode provider-query and inspected-record counters through the typed SDK,
   CLI JSON, and MCP discovery result.
+- Expose hydration contract v2 with `capability`, shallow/partial outcomes,
+  file-edit evidence counts, and stable remote connector error classes.
+
 - Add delegation topology APIs: `getSessionRelationships()`,
   `getSessionTree()`, and `getSessionChildrenPage()`, plus the
   `sessionDescendants()` and `sessionEventsIncludingDescendants()` async

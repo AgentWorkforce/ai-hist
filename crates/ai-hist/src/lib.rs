@@ -159,6 +159,10 @@ fn sync_remote_connectors(db_path: &Path, scope: SessionScope) -> Result<bool> {
         limit: None,
     };
     let summary = discover_sessions(&conn, &options, |_| {})?;
+    // `all` ingests local transcripts before remote discovery. Correlate again
+    // after the remote presences land so a first local-first run records exact
+    // provider ids even when the local transcript is unchanged thereafter.
+    reconcile_claude_remote_relationships(&conn)?;
     for (source, provider) in &summary.providers {
         sync_note!(
             "  [remote:{source}] {} session(s): {} discovered, {} unchanged",
@@ -6561,13 +6565,17 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
                 .map(str::to_string);
         }
         if remote_session_id.is_none() {
-            remote_session_id = value
-                .get("remoteSessionId")
-                .or_else(|| value.get("remote_session_id"))
-                .or_else(|| value.pointer("/teleportedSessionInfo/sessionId"))
-                .and_then(Value::as_str)
-                .filter(|id| !id.trim().is_empty())
-                .map(str::to_string);
+            remote_session_id = [
+                value.get("remoteSessionId"),
+                value.get("remote_session_id"),
+                value.pointer("/teleportedSessionInfo/sessionId"),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|id| !id.is_empty())
+            .map(str::to_string);
         }
         if cwd.is_none() {
             cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
@@ -6616,6 +6624,22 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
         subagent: identified_records > 0 && sidechain_records == identified_records,
         agent_id,
     }))
+}
+
+fn reconcile_claude_remote_relationships(conn: &Connection) -> Result<()> {
+    let paths = conn
+        .prepare(
+            "SELECT raw_locator FROM session_presences \
+             WHERE source = 'claude' AND location = 'local' AND raw_locator IS NOT NULL",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for path in paths {
+        if let Some(meta) = scan_claude_session_file(Path::new(&path))? {
+            record_claude_remote_relationship(conn, &meta)?;
+        }
+    }
+    Ok(())
 }
 
 fn record_claude_remote_relationship(conn: &Connection, meta: &ClaudeSessionMeta) -> Result<()> {
@@ -8371,11 +8395,12 @@ mod tests {
         doctor_report, export_history, file_stamp, git_commit_time_ms, git_stdout, import_history,
         ingest_claude_transcript, is_sqlite_contention, link_git_commit, load_sync_state,
         parse_trajectory_file, paths_overlap, prepare_sync_and_push_db,
-        process_status_with_programs, save_sync_state, search_all, service_command_args,
-        shell_single_quote, source_database_path, strip_url_credentials,
-        sync_claude_session_metadata, sync_exclusive, sync_local_at, sync_opencode_exclusive,
-        sync_relaycast, try_acquire_sync_lock, wal_contention_line, write_contention_diagnostic,
-        xml_escape, SearchRole, SyncSourceReport, PUSH_SERVICE, WAL_WARN_BYTES,
+        process_status_with_programs, reconcile_claude_remote_relationships, save_sync_state,
+        search_all, service_command_args, shell_single_quote, source_database_path,
+        strip_url_credentials, sync_claude_session_metadata, sync_exclusive, sync_local_at,
+        sync_opencode_exclusive, sync_relaycast, try_acquire_sync_lock, wal_contention_line,
+        write_contention_diagnostic, xml_escape, SearchRole, SyncSourceReport, PUSH_SERVICE,
+        WAL_WARN_BYTES,
     };
     use ai_hist_core::{
         init_db, insert_history, open_db, prompt_hash, HistoryEntry, QueryFilter,
@@ -9971,6 +9996,62 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn local_first_sync_reconciles_a_later_remote_presence_by_exact_trimmed_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join(".claude/projects/app/local.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"sessionId":"local-materialized","remoteSessionId":7,"remote_session_id":"  session_01remote  ","uuid":"u1","type":"user","timestamp":1,"message":{"role":"user","content":"hello"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_relationships", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(before, 0);
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, discovery_state) \
+             VALUES ('claude', 'session_01remote', 'shallow')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_presences \
+             (source, session_id, location, raw_locator, discovery_state) \
+             VALUES ('claude', 'session_01remote', 'remote', 'session_01remote', 'shallow')",
+            [],
+        )
+        .unwrap();
+
+        reconcile_claude_remote_relationships(&conn).unwrap();
+        let relationship: (String, String, String) = conn
+            .query_row(
+                "SELECT parent_session_id, child_session_id, relationship \
+                 FROM session_relationships WHERE evidence_kind='claude_remote_session_id'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            relationship,
+            (
+                "session_01remote".into(),
+                "local-materialized".into(),
+                "materialized_local".into()
+            )
+        );
     }
 
     #[test]

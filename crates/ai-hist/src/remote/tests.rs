@@ -75,9 +75,15 @@ impl Drop for ClearedCredentialsOverride {
 // ---------------------------------------------------------------------------
 
 /// Serves a fixed sequence of responses and records each requested URL.
+struct TransportCall {
+    url: String,
+    bearer_token: String,
+    headers: Vec<(String, String)>,
+}
+
 struct ScriptedTransport {
     responses: Vec<(u16, String)>,
-    calls: Mutex<Vec<(String, String)>>,
+    calls: Mutex<Vec<TransportCall>>,
     next: AtomicUsize,
 }
 
@@ -92,11 +98,20 @@ impl ScriptedTransport {
 }
 
 impl ClaudeSessionsTransport for Arc<ScriptedTransport> {
-    fn get(&self, url: &str, bearer_token: &str) -> Result<ClaudeHttpResponse> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push((url.to_string(), bearer_token.to_string()));
+    fn get_with_headers(
+        &self,
+        url: &str,
+        bearer_token: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<ClaudeHttpResponse> {
+        self.calls.lock().unwrap().push(TransportCall {
+            url: url.to_string(),
+            bearer_token: bearer_token.to_string(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+        });
         let index = self.next.fetch_add(1, Ordering::Relaxed);
         let (status, body) = self
             .responses
@@ -194,6 +209,7 @@ fn claude_mapping_skips_bridges_and_malformed_ids() {
 
 #[test]
 fn claude_enumeration_pages_until_the_cursor_ends() {
+    let _credentials = without_credentials_override();
     let home = tempfile::tempdir().unwrap();
     let transport = Arc::new(ScriptedTransport::new(vec![
         (
@@ -218,13 +234,16 @@ fn claude_enumeration_pages_until_the_cursor_ends() {
     assert_eq!(candidates.len(), 2);
     let calls = transport.calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
-    assert!(calls[0].0.ends_with("/v1/code/sessions?limit=100"));
-    assert!(calls[1].0.contains("cursor=cursor%20with%20spaces"));
-    assert!(calls.iter().all(|(_, token)| token == "sk-ant-oat01-test"));
+    assert!(calls[0].url.ends_with("/v1/code/sessions?limit=100"));
+    assert!(calls[1].url.contains("cursor=cursor%20with%20spaces"));
+    assert!(calls
+        .iter()
+        .all(|call| call.bearer_token == "sk-ant-oat01-test"));
 }
 
 #[test]
 fn claude_enumeration_respects_the_row_limit() {
+    let _credentials = without_credentials_override();
     let home = tempfile::tempdir().unwrap();
     let transport = Arc::new(ScriptedTransport::new(vec![(
         200,
@@ -244,11 +263,12 @@ fn claude_enumeration_respects_the_row_limit() {
     assert_eq!(candidates.len(), 2);
     let calls = transport.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
-    assert!(calls[0].0.ends_with("?limit=2"));
+    assert!(calls[0].url.ends_with("?limit=2"));
 }
 
 #[test]
 fn claude_enumeration_reports_a_rejected_token() {
+    let _credentials = without_credentials_override();
     let home = tempfile::tempdir().unwrap();
     let transport = Arc::new(ScriptedTransport::new(vec![(401, "{}".to_string())]));
     let provider = claude_provider(home.path(), &transport, None);
@@ -260,6 +280,7 @@ fn claude_enumeration_reports_a_rejected_token() {
 
 #[test]
 fn claude_enumeration_reports_an_expired_token_without_a_request() {
+    let _credentials = without_credentials_override();
     let home = tempfile::tempdir().unwrap();
     let transport = Arc::new(ScriptedTransport::new(vec![]));
     let provider = ClaudeWebProvider::new(
@@ -292,6 +313,7 @@ fn claude_transport_refuses_plaintext_off_loopback() {
 
 #[test]
 fn claude_targeted_evidence_hydrates_one_session_across_pages() {
+    let _credentials = without_credentials_override();
     let home = tempfile::tempdir().unwrap();
     write_claude_credentials(home.path(), FAR_FUTURE_MS);
     let transport = Arc::new(ScriptedTransport::new(vec![
@@ -339,16 +361,24 @@ fn claude_targeted_evidence_hydrates_one_session_across_pages() {
     assert!(source_bytes > 0);
     let calls = transport.calls.lock().unwrap();
     assert_eq!(calls.len(), 3);
-    assert!(calls[0].0.ends_with("/api/oauth/profile"));
+    assert!(calls[0].url.ends_with("/api/oauth/profile"));
     assert!(calls[1]
-        .0
+        .url
         .contains("session_01abc/teleport-events?limit=1000"));
-    assert!(calls[2].0.contains("cursor=next%20page"));
-    assert!(calls.iter().all(|(_, token)| token == "sk-ant-oat01-test"));
+    assert!(calls[2].url.contains("cursor=next%20page"));
+    assert!(calls
+        .iter()
+        .all(|call| call.bearer_token == "sk-ant-oat01-test"));
+    assert_eq!(
+        calls[1].headers,
+        vec![("x-organization-uuid".to_string(), "org-test".to_string())]
+    );
+    assert_eq!(calls[2].headers, calls[1].headers);
 }
 
 #[test]
 fn claude_targeted_evidence_distinguishes_auth_missing_and_malformed_records() {
+    let _credentials = without_credentials_override();
     let home = tempfile::tempdir().unwrap();
     let unconfigured = acquire_claude_remote_session_at(
         home.path(),
@@ -401,6 +431,7 @@ fn claude_targeted_evidence_distinguishes_auth_missing_and_malformed_records() {
 
 #[test]
 fn claude_targeted_evidence_rejects_redirects_and_is_page_bounded() {
+    let _credentials = without_credentials_override();
     let home = tempfile::tempdir().unwrap();
     write_claude_credentials(home.path(), FAR_FUTURE_MS);
     let redirect = Arc::new(ScriptedTransport::new(vec![(
@@ -432,6 +463,45 @@ fn claude_targeted_evidence_rejects_redirects_and_is_page_bounded() {
     .to_string();
     assert!(error.starts_with("EVIDENCE_PARTIAL:"), "{error}");
     assert_eq!(bounded.calls.lock().unwrap().len(), MAX_LIST_PAGES + 1);
+}
+
+#[test]
+fn real_claude_transport_never_follows_a_redirect_with_credentials() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let _credentials = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    write_claude_credentials(home.path(), FAR_FUTURE_MS);
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    target.set_nonblocking(true).unwrap();
+    let target_url = format!("http://{}", target.local_addr().unwrap());
+    let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_url = format!("http://{}", origin.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = origin.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+    });
+    let error = acquire_claude_remote_session_at(
+        home.path(),
+        "session_01abc",
+        &origin_url,
+        &UreqClaudeTransport,
+    )
+    .unwrap_err()
+    .to_string();
+    server.join().unwrap();
+    assert!(error.contains("HTTP 302"), "{error}");
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        matches!(target.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
 }
 
 #[cfg(unix)]
@@ -475,6 +545,63 @@ fn codex_targeted_evidence_uses_the_cli_diff_and_reports_an_empty_diff_honestly(
             ..
         }
     ));
+}
+
+#[test]
+fn codex_targeted_evidence_requires_the_supplied_homes_login() {
+    let home = tempfile::tempdir().unwrap();
+    let evidence = acquire_remote_session_at(home.path(), "codex", "task_fixture").unwrap();
+    assert!(matches!(
+        evidence,
+        RemoteSessionEvidence::CapabilityLimited {
+            code: "CONNECTOR_NOT_CONFIGURED",
+            ..
+        }
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_output_limit_drains_the_pipe_and_reports_size_not_timeout() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let command = dir.path().join("codex-oversized");
+    std::fs::write(&command, "#!/bin/sh\nhead -c 16777217 /dev/zero\n").unwrap();
+    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let error = acquire_codex_remote_session_with_command_timeout(
+        "task_fixture",
+        command.as_os_str(),
+        Duration::from_secs(5),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("16 MiB response-size limit"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_inherited_pipe_is_bounded_after_the_direct_child_exits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let command = dir.path().join("codex-inherited-pipe");
+    std::fs::write(
+        &command,
+        "#!/usr/bin/env python3\nimport os, time\nif os.fork() == 0:\n    time.sleep(2)\nelse:\n    os._exit(0)\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let started = Instant::now();
+    let error = acquire_codex_remote_session_with_command_timeout(
+        "task_fixture",
+        command.as_os_str(),
+        Duration::from_millis(500),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(error.contains("pipe remained open"), "{error}");
 }
 
 // ---------------------------------------------------------------------------

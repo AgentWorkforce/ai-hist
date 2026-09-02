@@ -77,7 +77,8 @@ tool-result, token/model, or parent/child export. Remote hydration therefore
 runs bounded `codex cloud diff TASK_ID`, stores per-file patches in
 `file_edits`, and returns `capability: "partial"` with
 `discoveryState: "shallow"`. A task without an available diff returns
-`capability_limited`. RelayHistory does not call private Codex service APIs.
+status `capability_limited` with `capability: "shallow_only"`. RelayHistory
+does not call private Codex service APIs.
 
 Both paths cap responses at 16 MiB and execution at 30 seconds where a child
 process is involved. Claude pagination is capped at 100 pages of 1,000 records.
