@@ -47,6 +47,12 @@ pub struct SyncCursor {
     /// Highest `file_edits.id` whose session's `filesTouched` has been published.
     #[serde(default)]
     pub file_edit_id: i64,
+    /// Highest `session_events.id` whose session's conversation turns have been
+    /// published. Independent of `capture_version`: a cursor file written before turns
+    /// existed defaults to 0 and publishes the whole transcript backlog, without
+    /// forcing another convergence replay.
+    #[serde(default)]
+    pub session_event_id: i64,
     /// Mapper generation. Missing from pre-neighborhood-memory cursor files (serde
     /// default 0). Those rewind history/trajectory watermarks once so existing
     /// rows are re-upserted with `projectId` / `filesTouched`.
@@ -62,6 +68,7 @@ impl Default for SyncCursor {
             trajectory_updated_ms: 0,
             commit_link_id: 0,
             file_edit_id: 0,
+            session_event_id: 0,
             capture_version: Self::CAPTURE_VERSION,
         }
     }
@@ -86,6 +93,11 @@ impl SyncCursor {
                 trajectory_updated_ms: other.trajectory_updated_ms,
                 commit_link_id: self.commit_link_id.max(other.commit_link_id),
                 file_edit_id: other.file_edit_id,
+                // Deliberately NOT rewound. `capture_version` is the convergence
+                // mapper's generation; the transcript is a separate stream with its
+                // own watermark. Rewinding it here would republish the whole turns
+                // backlog every time the convergence mapper changes.
+                session_event_id: self.session_event_id.max(other.session_event_id),
             };
         }
         if self.capture_version > other.capture_version {
@@ -102,6 +114,7 @@ impl SyncCursor {
             trajectory_updated_ms,
             commit_link_id: self.commit_link_id.max(other.commit_link_id),
             file_edit_id: self.file_edit_id.max(other.file_edit_id),
+            session_event_id: self.session_event_id.max(other.session_event_id),
             capture_version: self.capture_version,
         }
     }
@@ -117,6 +130,9 @@ impl SyncCursor {
             trajectory_updated_ms: 0,
             commit_link_id: self.commit_link_id,
             file_edit_id: 0,
+            // Carried, not reset: the convergence backfill has nothing to do with the
+            // transcript stream, and restarting it would re-send every turn.
+            session_event_id: self.session_event_id,
         }
     }
 
@@ -157,6 +173,7 @@ pub fn build_outbox_batch(
     let mut records = Vec::new();
     let mut next = cursor.clone();
     let mut remotes: HashMap<String, Option<String>> = HashMap::new();
+    let mut branches: HashMap<String, Option<String>> = HashMap::new();
     let mut file_cache: HashMap<(String, String), Vec<String>> = HashMap::new();
     let mut published_sessions: HashSet<(String, String)> = HashSet::new();
 
@@ -199,7 +216,13 @@ pub fn build_outbox_batch(
             if let Some(sid) = &entry.session_id {
                 published_sessions.insert((entry.source.clone(), sid.clone()));
             }
-            records.push(map_history_entry_with(&entry, git_remote.as_deref(), files));
+            let branch = session_branch_for_entry(conn, &entry, &mut branches);
+            records.push(map_history_entry_with(
+                &entry,
+                git_remote.as_deref(),
+                files,
+                branch.as_deref(),
+            ));
         }
     }
 
@@ -364,7 +387,13 @@ pub fn build_outbox_batch(
             };
             let git_remote = git_remote_for_entry(conn, &entry, &mut remotes);
             let files = session_files(conn, &mut file_cache, Some(&entry.source), &hit.session_id)?;
-            records.push(map_history_entry_with(&entry, git_remote.as_deref(), files));
+            let branch = session_branch_for_entry(conn, &entry, &mut branches);
+            records.push(map_history_entry_with(
+                &entry,
+                git_remote.as_deref(),
+                files,
+                branch.as_deref(),
+            ));
             published_sessions.insert((hit.source, hit.session_id));
         }
     }
@@ -427,6 +456,32 @@ fn latest_history_for_session(
         })
     })?;
     Ok(rows.next().transpose()?)
+}
+
+/// The git branch a session was working on, cached per `(source, session_id)`.
+///
+/// Read from the local `sessions` row rather than from the working tree: the branch that
+/// matters is the one checked out when the prompt was typed, and the tree has almost
+/// certainly moved on by the time a push runs.
+fn session_branch_for_entry(
+    conn: &Connection,
+    entry: &HistoryEntry,
+    branches: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    let sid = entry.session_id.as_deref()?;
+    let key = format!("{}\u{1}{sid}", entry.source);
+    branches
+        .entry(key)
+        .or_insert_with(|| {
+            conn.query_row(
+                "SELECT git_branch FROM sessions WHERE source = ?1 AND session_id = ?2",
+                rusqlite::params![&entry.source, sid],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        })
+        .clone()
 }
 
 fn git_remote_for_entry(

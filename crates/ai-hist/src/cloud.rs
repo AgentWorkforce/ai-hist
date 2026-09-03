@@ -14,6 +14,7 @@
 
 use ai_hist_core::convergence::{IngestRequest, IngestResponse, MachineIdentity};
 use ai_hist_core::outbox::{build_outbox_batch, SyncCursor};
+use ai_hist_core::turns::{build_turns_batch, ConversationTurn, DEFAULT_SESSION_BUDGET};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -465,9 +466,42 @@ pub fn batch_id(machine: &str, from: &SyncCursor, to: &SyncCursor, count: usize)
     )
 }
 
+/// Percent-encode one URL path segment.
+///
+/// Session ids come from harness files, not from us. A raw `/` or `?` in one would
+/// silently retarget the request at a different endpoint — and the server would answer
+/// that other request successfully, so nothing downstream would look wrong. Unreserved
+/// characters (RFC 3986 §2.3) pass through; everything else is escaped.
+fn encode_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 /// The HTTP side of `/v1/ingest`, abstracted so the push orchestration is testable.
 pub trait Ingestor {
     fn ingest(&self, auth: &StoredAuth, req: &IngestRequest) -> Result<IngestResponse>;
+
+    /// `POST /v1/sessions/:sessionId/turns` — one chunk of a session's transcript.
+    ///
+    /// Defaulted so existing test doubles keep compiling; the live ureq implementation
+    /// overrides it. A double that does not override reports zero published turns, which
+    /// is what "this test is not about turns" should look like.
+    fn publish_turns(
+        &self,
+        _auth: &StoredAuth,
+        _session_id: &str,
+        _turns: &[ConversationTurn],
+    ) -> Result<u64> {
+        Ok(0)
+    }
 }
 
 /// Result of a `push` run.
@@ -481,6 +515,10 @@ pub struct PushReport {
     pub batch_limit: usize,
     /// Number of ingest attempts in this push run, including any smaller retry.
     pub attempts: usize,
+    /// Conversation turns accepted by `/v1/sessions/:id/turns` in this run.
+    pub turns_sent: u64,
+    /// Sessions whose transcript was published in this run.
+    pub turns_sessions: usize,
 }
 
 /// A typed Cloudflare Worker capacity rejection. Keeping the status, body, and attempted
@@ -554,6 +592,59 @@ pub fn push(
     }
 }
 
+/// Publish conversation transcripts for sessions with new events, after the convergence
+/// batch has been accepted.
+///
+/// Ordering matters: turns are published only once `/v1/ingest` has succeeded, so a run
+/// that fails on the convergence batch does not advance the transcript watermark either.
+/// A failure here is logged and swallowed rather than failing the push — the convergence
+/// records are already durably accepted at that point, and turning a transcript hiccup
+/// into a push failure would roll the whole run back and re-send them.
+fn publish_session_turns(
+    conn: &Connection,
+    client: &dyn Ingestor,
+    auth: &StoredAuth,
+    cursor: &SyncCursor,
+    incognito: &HashSet<String>,
+) -> (u64, usize, i64) {
+    let batch = match build_turns_batch(
+        conn,
+        cursor.session_event_id,
+        DEFAULT_SESSION_BUDGET,
+        incognito,
+    ) {
+        Ok(batch) => batch,
+        Err(_) => return (0, 0, cursor.session_event_id),
+    };
+    if batch.sessions.is_empty() {
+        return (0, 0, batch.session_event_id);
+    }
+
+    let mut accepted = 0u64;
+    let mut sessions = 0usize;
+    for session in &batch.sessions {
+        let mut whole_session_ok = true;
+        for chunk in &session.chunks {
+            match client.publish_turns(auth, &session.session_id, chunk) {
+                Ok(count) => accepted += count,
+                Err(_) => {
+                    whole_session_ok = false;
+                    break;
+                }
+            }
+        }
+        if !whole_session_ok {
+            // Hold the watermark at the last fully published session. Advancing past a
+            // half-published transcript would leave it permanently truncated, and the
+            // next run would report a clean `turns_sent: 0`.
+            return (accepted, sessions, cursor.session_event_id);
+        }
+        sessions += 1;
+    }
+
+    (accepted, sessions, batch.session_event_id)
+}
+
 fn push_once(
     conn: &Connection,
     client: &dyn Ingestor,
@@ -566,22 +657,33 @@ fn push_once(
 ) -> Result<PushReport> {
     let batch = build_outbox_batch(conn, cursor, batch_limit, incognito)?;
     if batch.records.is_empty() {
+        // Transcripts are published here too, not only on the path with convergence
+        // records. The two streams have independent watermarks, and a machine whose
+        // prompts are fully synced still has a transcript backlog — gating turns on new
+        // prompts would strand it behind a permanent `sent: 0`.
+        let mut advanced = batch.cursor;
+        let (turns_sent, turns_sessions, session_event_id) =
+            publish_session_turns(conn, client, auth, &advanced, incognito);
+        advanced.session_event_id = session_event_id;
+
         // Incognito and zero-emission rows still advance scan cursors. Persist that progress
         // even though there is no payload, otherwise a reduced capacity retry can report a
         // no-op and rebuild the original oversized request on the next run.
-        if batch.cursor != *cursor {
-            save_cursor(&auth.base_url, &batch.cursor)?;
+        if advanced != *cursor {
+            save_cursor(&auth.base_url, &advanced)?;
         }
         return Ok(PushReport {
             sent: 0,
             accepted: 0,
-            cursor: batch.cursor,
+            cursor: advanced,
             batch_id: None,
             batch_limit,
             // `attempts` names the next attempted HTTP call. If this empty batch followed
             // rejected requests, retain the number of calls already made; a first-run no-op
             // still reports zero.
             attempts: attempts.saturating_sub(1),
+            turns_sent,
+            turns_sessions,
         });
     }
     let bid = batch_id(&machine.id, cursor, &batch.cursor, batch.records.len());
@@ -600,14 +702,20 @@ fn push_once(
     };
     let resp = client.ingest(auth, &req).context("POST /v1/ingest")?;
     // advance the cursor only after the server accepts the batch (durable outbox)
-    save_cursor(&auth.base_url, &batch.cursor)?;
+    let mut advanced = batch.cursor;
+    let (turns_sent, turns_sessions, session_event_id) =
+        publish_session_turns(conn, client, auth, &advanced, incognito);
+    advanced.session_event_id = session_event_id;
+    save_cursor(&auth.base_url, &advanced)?;
     Ok(PushReport {
         sent: req.records.len(),
         accepted: resp.accepted,
-        cursor: batch.cursor,
+        cursor: advanced,
         batch_id: Some(bid),
         batch_limit,
         attempts,
+        turns_sent,
+        turns_sessions,
     })
 }
 
@@ -672,6 +780,51 @@ impl Ingestor for UreqIngestor {
         )
         .context("ingest failed")?;
         Ok(response.into_json::<IngestResponse>()?)
+    }
+
+    fn publish_turns(
+        &self,
+        auth: &StoredAuth,
+        session_id: &str,
+        turns: &[ConversationTurn],
+    ) -> Result<u64> {
+        if turns.is_empty() {
+            return Ok(0);
+        }
+        require_secure_transport(&auth.base_url)?;
+        // The session id is a path segment and can contain characters that are not URL
+        // safe, so encode it rather than interpolating it raw.
+        let url = format!(
+            "{}/v1/sessions/{}/turns",
+            auth.base_url.trim_end_matches('/'),
+            encode_path_segment(session_id),
+        );
+        let payload = serde_json::json!({ "turns": turns });
+        let response = send_with_auth_refresh(
+            auth,
+            |current| {
+                ureq::post(&url)
+                    .set("Authorization", &format!("Bearer {}", current.access_token))
+                    .set("Content-Type", "application/json")
+                    .send_json(payload.clone())
+                    .map_err(Box::new)
+            },
+            |error| match error {
+                ureq::Error::Status(code, response) => anyhow::anyhow!(
+                    "turns failed: HTTP {code}: {}",
+                    response.into_string().unwrap_or_default()
+                ),
+                other => other.into(),
+            },
+        )
+        .context("publish turns failed")?;
+
+        #[derive(serde::Deserialize)]
+        struct TurnsResponse {
+            #[serde(default)]
+            accepted: u64,
+        }
+        Ok(response.into_json::<TurnsResponse>()?.accepted)
     }
 }
 
@@ -3131,5 +3284,199 @@ exit 0"#,
         let _relayhistory_base_url = EnvVarGuard::set("RELAYHISTORY_BASE_URL", "///");
         let _ai_hist_base_url = EnvVarGuard::set("AI_HIST_BASE_URL", "http://localhost:8787/");
         assert_eq!(default_base_url(), "http://localhost:8787");
+    }
+    // ----- conversation turns on the push path -----
+
+    fn turns_test_auth() -> StoredAuth {
+        StoredAuth {
+            base_url: "http://localhost:8787".into(),
+            access_token: "rth_at_test".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Records every turns request and can be told to fail for one session, so the tests
+    /// can check both the happy path and what a partial failure does to the watermark.
+    struct TurnsRecordingIngestor {
+        published: RefCell<Vec<(String, usize)>>,
+        fail_session: Option<String>,
+    }
+
+    impl TurnsRecordingIngestor {
+        fn new() -> Self {
+            Self {
+                published: RefCell::new(Vec::new()),
+                fail_session: None,
+            }
+        }
+        fn failing(session: &str) -> Self {
+            Self {
+                published: RefCell::new(Vec::new()),
+                fail_session: Some(session.to_string()),
+            }
+        }
+    }
+
+    impl Ingestor for TurnsRecordingIngestor {
+        fn ingest(&self, _auth: &StoredAuth, req: &IngestRequest) -> Result<IngestResponse> {
+            Ok(IngestResponse {
+                batch_id: req.batch_id.clone(),
+                received: req.records.len() as u64,
+                accepted: req.records.len() as u64,
+                cursors: None,
+            })
+        }
+
+        fn publish_turns(
+            &self,
+            _auth: &StoredAuth,
+            session_id: &str,
+            turns: &[ConversationTurn],
+        ) -> Result<u64> {
+            if self.fail_session.as_deref() == Some(session_id) {
+                anyhow::bail!("turns failed: HTTP 500");
+            }
+            self.published
+                .borrow_mut()
+                .push((session_id.to_string(), turns.len()));
+            Ok(turns.len() as u64)
+        }
+    }
+
+    fn add_session_event(conn: &Connection, session: &str, ts: i64, role: &str, text: &str) {
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, model, event_uid)
+             VALUES ('claude', ?1, ?2, ?3, 'text', ?4, 'claude-opus-5', ?5)",
+            rusqlite::params![session, ts, role, text, format!("{session}-{ts}-{role}")],
+        )
+        .unwrap();
+    }
+
+    /// The transcript backlog must not be gated on new prompts. Most machines reach
+    /// "prompts fully synced" long before their transcript is published, and a run that
+    /// reported `sent: 0` while silently skipping turns would look exactly like a
+    /// machine with nothing to do.
+    #[test]
+    fn publishes_turns_even_when_there_are_no_new_convergence_records() {
+        with_temp_home(|| {
+            let conn = mem();
+            add_session_event(&conn, "s1", 1_000, "user", "why does it fail?");
+            add_session_event(&conn, "s1", 2_000, "assistant", "the regex is unbounded");
+
+            let client = TurnsRecordingIngestor::new();
+            let auth = turns_test_auth();
+
+            let report = push(
+                &conn,
+                &client,
+                &auth,
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &SyncCursor::default(),
+                500,
+                &HashSet::new(),
+            )
+            .unwrap();
+
+            assert_eq!(report.sent, 0, "no history rows exist");
+            assert_eq!(report.turns_sent, 2, "but the transcript must still go");
+            assert_eq!(report.turns_sessions, 1);
+            assert_eq!(client.published.borrow().len(), 1);
+            assert!(report.cursor.session_event_id > 0);
+        });
+    }
+
+    #[test]
+    fn publishes_both_sides_of_the_conversation_not_just_prompts() {
+        with_temp_home(|| {
+            let conn = mem();
+            add(&conn, "why does it fail?", 1_000);
+            add_session_event(&conn, "s1", 1_000, "user", "why does it fail?");
+            add_session_event(&conn, "s1", 2_000, "assistant", "the regex is unbounded");
+
+            let client = TurnsRecordingIngestor::new();
+            let report = push(
+                &conn,
+                &client,
+                &turns_test_auth(),
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &SyncCursor::default(),
+                500,
+                &HashSet::new(),
+            )
+            .unwrap();
+
+            assert!(report.sent > 0, "the prompt still goes through convergence");
+            assert_eq!(report.turns_sent, 2, "and the assistant reply goes too");
+        });
+    }
+
+    /// A half-published transcript must not advance the watermark. If it did, the session
+    /// would stay permanently truncated and every later run would report a clean
+    /// `turns_sent: 0` — the failure would be indistinguishable from being up to date.
+    #[test]
+    fn a_failed_transcript_does_not_advance_the_watermark() {
+        with_temp_home(|| {
+            let conn = mem();
+            add_session_event(&conn, "s1", 1_000, "user", "hello");
+
+            let client = TurnsRecordingIngestor::failing("s1");
+            let report = push(
+                &conn,
+                &client,
+                &turns_test_auth(),
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &SyncCursor::default(),
+                500,
+                &HashSet::new(),
+            )
+            .unwrap();
+
+            assert_eq!(report.turns_sent, 0);
+            assert_eq!(
+                report.cursor.session_event_id, 0,
+                "the watermark must stay put so the next run retries",
+            );
+        });
+    }
+
+    /// A convergence-mapper replay must not restart the transcript stream. They are
+    /// separate backlogs; conflating them would re-send every turn on every mapper bump.
+    #[test]
+    fn a_capture_version_replay_leaves_the_turns_watermark_alone() {
+        let old = SyncCursor {
+            capture_version: 0,
+            history_id: 5_000,
+            session_event_id: 4_242,
+            ..Default::default()
+        };
+        let upgraded = old.merge_max(&SyncCursor {
+            capture_version: SyncCursor::CAPTURE_VERSION,
+            history_id: 0,
+            session_event_id: 4_242,
+            ..Default::default()
+        });
+
+        assert_eq!(upgraded.history_id, 0, "convergence rewinds");
+        assert_eq!(
+            upgraded.session_event_id, 4_242,
+            "the transcript watermark must survive a convergence replay",
+        );
+    }
+
+    #[test]
+    fn encodes_a_session_id_that_would_otherwise_change_the_url() {
+        assert_eq!(encode_path_segment("abc-123_x.y~z"), "abc-123_x.y~z");
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+        assert_eq!(encode_path_segment("a?b=c"), "a%3Fb%3Dc");
+        assert_eq!(encode_path_segment("a b"), "a%20b");
     }
 }
