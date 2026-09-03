@@ -7,9 +7,9 @@
 //! does sync rusqlite reads, so it is fully unit-testable without a server.
 //!
 //! Cursor model (mirrors burn's `archive_state` watermark): monotonic `history.id`,
-//! `trajectories.rowid` plus a `trajectories.updated_ms` watermark so rows revised after
-//! first sync re-push (the server upsert is already safe), and `session_commit_links.id`
-//! for `session_outcome` envelopes.
+//! a trajectories keyset `(updated_ms, rowid)` so rows revised after first sync re-push
+//! without skipping equal-timestamp boundaries (the server upsert is already safe),
+//! and `session_commit_links.id` for `session_outcome` envelopes.
 
 use crate::convergence::{
     map_history_entry_with, map_session_outcome, map_trajectory, normalize_home_path,
@@ -33,11 +33,11 @@ pub struct SyncCursor {
     /// Highest `history.id` included in a synced batch.
     #[serde(default)]
     pub history_id: i64,
-    /// Highest `trajectories.rowid` included in a synced batch.
+    /// `trajectories.rowid` of the last row emitted in keyset order.
     #[serde(default)]
     pub trajectory_rowid: i64,
-    /// Highest `trajectories.updated_ms` included in a synced batch. Catches rows that
-    /// were revised after their rowid first crossed the cursor.
+    /// `trajectories.updated_ms` of the last row emitted in keyset order. Together
+    /// with `trajectory_rowid` this is a total continuation key, not an independent max.
     #[serde(default)]
     pub trajectory_updated_ms: i64,
     /// Highest `session_commit_links.id` included in a synced batch.
@@ -46,15 +46,28 @@ pub struct SyncCursor {
 }
 
 impl SyncCursor {
-    /// Advance each watermark independently so a stale writer cannot rewind one
-    /// by publishing an older value of another.
+    /// Advance watermarks so a stale writer cannot rewind one. History and
+    /// commit-link ids are independent maxima. Trajectories use a single keyset
+    /// position `(updated_ms, rowid)` — taking those two fields independently
+    /// skips equal-timestamp rows when `LIMIT` splits a batch.
     pub fn merge_max(&self, other: &Self) -> Self {
+        let (trajectory_updated_ms, trajectory_rowid) = if other.trajectory_key_after(self) {
+            (other.trajectory_updated_ms, other.trajectory_rowid)
+        } else {
+            (self.trajectory_updated_ms, self.trajectory_rowid)
+        };
         Self {
             history_id: self.history_id.max(other.history_id),
-            trajectory_rowid: self.trajectory_rowid.max(other.trajectory_rowid),
-            trajectory_updated_ms: self.trajectory_updated_ms.max(other.trajectory_updated_ms),
+            trajectory_rowid,
+            trajectory_updated_ms,
             commit_link_id: self.commit_link_id.max(other.commit_link_id),
         }
+    }
+
+    fn trajectory_key_after(&self, other: &Self) -> bool {
+        self.trajectory_updated_ms > other.trajectory_updated_ms
+            || (self.trajectory_updated_ms == other.trajectory_updated_ms
+                && self.trajectory_rowid > other.trajectory_rowid)
     }
 }
 
@@ -129,18 +142,17 @@ pub fn build_outbox_batch(
         }
     }
 
-    // --- trajectories (decisions/retro) — rowid + updated_ms watermarks ---
-    let updated_watermark = trajectory_updated_watermark(conn, cursor)?;
-    next.trajectory_updated_ms = next.trajectory_updated_ms.max(updated_watermark);
+    // --- trajectories (decisions/retro) — keyset on (updated_ms, rowid) ---
     {
         let mut stmt = conn.prepare(
             "SELECT rowid, id, persona_id, project_id, task_title, task_description, status, \
              decisions_json, retrospective_json, timestamp_ms, updated_ms, path \
-             FROM trajectories WHERE rowid > ?1 OR updated_ms > ?2 \
+             FROM trajectories \
+             WHERE updated_ms > ?1 OR (updated_ms = ?1 AND rowid > ?2) \
              ORDER BY updated_ms ASC, rowid ASC LIMIT ?3",
         )?;
         let raw = stmt.query_map(
-            rusqlite::params![cursor.trajectory_rowid, updated_watermark, limit],
+            rusqlite::params![cursor.trajectory_updated_ms, cursor.trajectory_rowid, limit],
             |r| {
                 Ok(TrajRowOwned {
                     rowid: r.get(0)?,
@@ -161,8 +173,8 @@ pub fn build_outbox_batch(
         for row in raw {
             let t = row?;
             if incognito.contains(&t.id) {
-                next.trajectory_rowid = next.trajectory_rowid.max(t.rowid);
-                next.trajectory_updated_ms = next.trajectory_updated_ms.max(t.updated_ms);
+                next.trajectory_rowid = t.rowid;
+                next.trajectory_updated_ms = t.updated_ms;
                 continue;
             }
             let mut mapped = map_trajectory(&TrajectoryRow {
@@ -187,8 +199,8 @@ pub fn build_outbox_batch(
             for env in &mut mapped {
                 env.files_touched = files.clone();
             }
-            next.trajectory_rowid = next.trajectory_rowid.max(t.rowid);
-            next.trajectory_updated_ms = next.trajectory_updated_ms.max(t.updated_ms);
+            next.trajectory_rowid = t.rowid;
+            next.trajectory_updated_ms = t.updated_ms;
             records.extend(mapped);
         }
     }
@@ -288,19 +300,6 @@ struct CommitLinkOwned {
     numstat_json: Option<String>,
     evidence_json: Option<String>,
     created_at_ms: i64,
-}
-
-/// Old cursors (pre-watermark) have `trajectory_updated_ms = 0`. Seed from already-synced
-/// rows so the first push after upgrade does not replay every trajectory.
-fn trajectory_updated_watermark(conn: &Connection, cursor: &SyncCursor) -> Result<i64> {
-    if cursor.trajectory_updated_ms > 0 || cursor.trajectory_rowid <= 0 {
-        return Ok(cursor.trajectory_updated_ms);
-    }
-    Ok(conn.query_row(
-        "SELECT COALESCE(MAX(updated_ms), 0) FROM trajectories WHERE rowid <= ?1",
-        [cursor.trajectory_rowid],
-        |r| r.get(0),
-    )?)
 }
 
 fn git_remote_for_entry(
@@ -502,11 +501,24 @@ mod tests {
         updated_ms: i64,
         path: Option<&str>,
     ) {
+        add_trajectory_rowid(conn, None, id, decisions, retro, updated_ms, path);
+    }
+
+    fn add_trajectory_rowid(
+        conn: &Connection,
+        rowid: Option<i64>,
+        id: &str,
+        decisions: &str,
+        retro: &str,
+        updated_ms: i64,
+        path: Option<&str>,
+    ) {
         conn.execute(
-            "INSERT INTO trajectories (id, version, persona_id, project_id, task_title, \
+            "INSERT INTO trajectories (rowid, id, version, persona_id, project_id, task_title, \
              task_description, status, decisions_json, retrospective_json, search_text, path, \
-             updated_ms, timestamp_ms) VALUES (?,1,?,?,?,?,?,?,?,?,?,?,?)",
+             updated_ms, timestamp_ms) VALUES (?, ?,1,?,?,?,?,?,?,?,?,?,?,?)",
             rusqlite::params![
+                rowid,
                 id,
                 "planner",
                 "proj",
@@ -888,6 +900,103 @@ mod tests {
 
         let empty = build_outbox_batch(&conn, &batch.cursor, 100, &none).unwrap();
         assert!(!empty.records.iter().any(|r| r.kind == "session_outcome"));
+    }
+
+    #[test]
+    fn equal_timestamp_keyset_does_not_skip_rows() {
+        // Reviewer example: (rowid, updated_ms) = (3,1), (1,2), (2,2) with LIMIT 2.
+        // Independent max(rowid)/max(updated_ms) advances to (3, 2) and permanently
+        // drops (2, 2). Keyset continuation from the last emitted pair does not.
+        let conn = mem();
+        add_trajectory_rowid(
+            &conn,
+            Some(3),
+            "t3",
+            "[]",
+            r#"{"summary":"rowid-3"}"#,
+            1,
+            None,
+        );
+        add_trajectory_rowid(
+            &conn,
+            Some(1),
+            "t1",
+            "[]",
+            r#"{"summary":"rowid-1"}"#,
+            2,
+            None,
+        );
+        add_trajectory_rowid(
+            &conn,
+            Some(2),
+            "t2",
+            "[]",
+            r#"{"summary":"rowid-2"}"#,
+            2,
+            None,
+        );
+        let none = HashSet::new();
+        let first = build_outbox_batch(&conn, &SyncCursor::default(), 2, &none).unwrap();
+        let first_ids: Vec<_> = first
+            .records
+            .iter()
+            .filter(|r| r.kind == "reflection")
+            .map(|r| r.session_id.as_str())
+            .collect();
+        assert_eq!(first_ids, vec!["t3", "t1"]);
+        assert_eq!(first.cursor.trajectory_updated_ms, 2);
+        assert_eq!(first.cursor.trajectory_rowid, 1);
+
+        let second = build_outbox_batch(&conn, &first.cursor, 2, &none).unwrap();
+        let second_ids: Vec<_> = second
+            .records
+            .iter()
+            .filter(|r| r.kind == "reflection")
+            .map(|r| r.session_id.as_str())
+            .collect();
+        assert_eq!(
+            second_ids,
+            vec!["t2"],
+            "equal-timestamp row after LIMIT split must appear in the next batch"
+        );
+        assert_eq!(second.cursor.trajectory_updated_ms, 2);
+        assert_eq!(second.cursor.trajectory_rowid, 2);
+    }
+
+    #[test]
+    fn legacy_zero_updated_ms_watermark_replays_amended_trajectory() {
+        // Old client pushed rowid 1 with no updated_ms field (deserializes as 0).
+        // The row was then amended. Seeding from MAX(updated_ms) would set the
+        // watermark to 50 and permanently exclude it; keep the stored 0.
+        let conn = mem();
+        add_trajectory_at(
+            &conn,
+            "traj-1",
+            "[]",
+            r#"{"summary":"amended after old push"}"#,
+            50,
+            None,
+        );
+        let old = SyncCursor {
+            history_id: 0,
+            trajectory_rowid: 1,
+            trajectory_updated_ms: 0,
+            commit_link_id: 0,
+        };
+        let none = HashSet::new();
+        let batch = build_outbox_batch(&conn, &old, 100, &none).unwrap();
+        assert!(
+            batch
+                .records
+                .iter()
+                .any(|r| r.content.contains("amended after old push")),
+            "amended trajectory must replay from a zero updated_ms watermark: {:?}",
+            batch
+                .records
+                .iter()
+                .map(|r| r.content.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

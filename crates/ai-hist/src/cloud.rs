@@ -1809,7 +1809,8 @@ mod tests {
                 },
             )
             .unwrap();
-            // Even a later stale writer cannot rewind either watermark.
+            // Even a later stale writer cannot rewind history/commit ids, or the
+            // trajectory keyset position (updated_ms, rowid) as a single pair.
             save_cursor(
                 base_url,
                 &SyncCursor {
@@ -1824,7 +1825,7 @@ mod tests {
                 load_cursor(base_url).unwrap(),
                 SyncCursor {
                     history_id: 100,
-                    trajectory_rowid: 100,
+                    trajectory_rowid: 1,
                     trajectory_updated_ms: 50,
                     commit_link_id: 20,
                 }
@@ -1858,7 +1859,7 @@ mod tests {
                 load_cursor(base_url).unwrap(),
                 SyncCursor {
                     history_id: 125,
-                    trajectory_rowid: 125,
+                    trajectory_rowid: 1,
                     trajectory_updated_ms: 50,
                     commit_link_id: 20,
                 }
