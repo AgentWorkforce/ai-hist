@@ -9,7 +9,8 @@
 //! Cursor model (mirrors burn's `archive_state` watermark): monotonic `history.id`,
 //! a trajectories keyset `(updated_ms, rowid)` so rows revised after first sync re-push
 //! without skipping equal-timestamp boundaries (the server upsert is already safe),
-//! and `session_commit_links.id` for `session_outcome` envelopes.
+//! `session_commit_links.id` for `session_outcome` envelopes, and `file_edits.id` so a
+//! session whose edits grow after its last prompt envelope republishes `filesTouched`.
 
 use crate::convergence::{
     map_history_entry_with, map_session_outcome, map_trajectory, normalize_home_path,
@@ -43,6 +44,9 @@ pub struct SyncCursor {
     /// Highest `session_commit_links.id` included in a synced batch.
     #[serde(default)]
     pub commit_link_id: i64,
+    /// Highest `file_edits.id` whose session's `filesTouched` has been published.
+    #[serde(default)]
+    pub file_edit_id: i64,
     /// Mapper generation. Missing from pre-neighborhood-memory cursor files (serde
     /// default 0). Those rewind history/trajectory watermarks once so existing
     /// rows are re-upserted with `projectId` / `filesTouched`.
@@ -57,6 +61,7 @@ impl Default for SyncCursor {
             trajectory_rowid: 0,
             trajectory_updated_ms: 0,
             commit_link_id: 0,
+            file_edit_id: 0,
             capture_version: Self::CAPTURE_VERSION,
         }
     }
@@ -80,6 +85,7 @@ impl SyncCursor {
                 trajectory_rowid: other.trajectory_rowid,
                 trajectory_updated_ms: other.trajectory_updated_ms,
                 commit_link_id: self.commit_link_id.max(other.commit_link_id),
+                file_edit_id: other.file_edit_id,
             };
         }
         if self.capture_version > other.capture_version {
@@ -95,6 +101,7 @@ impl SyncCursor {
             trajectory_rowid,
             trajectory_updated_ms,
             commit_link_id: self.commit_link_id.max(other.commit_link_id),
+            file_edit_id: self.file_edit_id.max(other.file_edit_id),
             capture_version: self.capture_version,
         }
     }
@@ -109,6 +116,7 @@ impl SyncCursor {
             trajectory_rowid: 0,
             trajectory_updated_ms: 0,
             commit_link_id: self.commit_link_id,
+            file_edit_id: 0,
         }
     }
 
@@ -150,6 +158,7 @@ pub fn build_outbox_batch(
     let mut next = cursor.clone();
     let mut remotes: HashMap<String, Option<String>> = HashMap::new();
     let mut file_cache: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut published_sessions: HashSet<(String, String)> = HashSet::new();
 
     // --- history (prompts) — append-only, watermark on id ---
     {
@@ -187,6 +196,9 @@ pub fn build_outbox_batch(
                 Some(sid) => session_files(conn, &mut file_cache, Some(&entry.source), sid)?,
                 None => Vec::new(),
             };
+            if let Some(sid) = &entry.session_id {
+                published_sessions.insert((entry.source.clone(), sid.clone()));
+            }
             records.push(map_history_entry_with(&entry, git_remote.as_deref(), files));
         }
     }
@@ -314,6 +326,49 @@ pub fn build_outbox_batch(
         }
     }
 
+    // --- file_edits that grew after the last prompt envelope for a session ---
+    {
+        struct FileEditWatermark {
+            source: String,
+            session_id: String,
+            max_id: i64,
+        }
+        let mut stmt = conn.prepare(
+            "SELECT source, session_id, MAX(id) AS max_id \
+             FROM file_edits WHERE id > ?1 \
+             GROUP BY source, session_id \
+             ORDER BY max_id ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map([cursor.file_edit_id, limit], |r| {
+            Ok(FileEditWatermark {
+                source: r.get(0)?,
+                session_id: r.get(1)?,
+                max_id: r.get(2)?,
+            })
+        })?;
+        for row in rows {
+            let hit = row?;
+            if records.len() >= MAX_RECORDS {
+                break;
+            }
+            next.file_edit_id = next.file_edit_id.max(hit.max_id);
+            if incognito.contains(&hit.session_id) {
+                continue;
+            }
+            if published_sessions.contains(&(hit.source.clone(), hit.session_id.clone())) {
+                continue;
+            }
+            let Some(entry) = latest_history_for_session(conn, &hit.source, &hit.session_id)?
+            else {
+                continue;
+            };
+            let git_remote = git_remote_for_entry(conn, &entry, &mut remotes);
+            let files = session_files(conn, &mut file_cache, Some(&entry.source), &hit.session_id)?;
+            records.push(map_history_entry_with(&entry, git_remote.as_deref(), files));
+            published_sessions.insert((hit.source, hit.session_id));
+        }
+    }
+
     Ok(OutboxBatch {
         records,
         cursor: next,
@@ -349,6 +404,29 @@ struct CommitLinkOwned {
     numstat_json: Option<String>,
     evidence_json: Option<String>,
     created_at_ms: i64,
+}
+
+fn latest_history_for_session(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<Option<HistoryEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, source, session_id, project, prompt, prompt_hash, timestamp_ms \
+         FROM history WHERE source = ?1 AND session_id = ?2 ORDER BY id DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(rusqlite::params![source, session_id], |r| {
+        Ok(HistoryEntry {
+            id: r.get(0)?,
+            source: r.get(1)?,
+            session_id: r.get(2)?,
+            project: r.get(3)?,
+            prompt: r.get(4)?,
+            prompt_hash: r.get(5)?,
+            timestamp_ms: r.get(6)?,
+        })
+    })?;
+    Ok(rows.next().transpose()?)
 }
 
 fn git_remote_for_entry(
@@ -737,6 +815,7 @@ mod tests {
             serde_json::from_str(r#"{"history_id":7,"trajectory_rowid":3}"#).unwrap();
         assert_eq!(old.trajectory_updated_ms, 0);
         assert_eq!(old.commit_link_id, 0);
+        assert_eq!(old.file_edit_id, 0);
         assert_eq!(old.capture_version, 0);
     }
 
@@ -1094,6 +1173,67 @@ mod tests {
                 .map(|r| r.content.as_str())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn file_edits_after_last_prompt_republish_files_touched() {
+        let conn = mem();
+        add_history_project(
+            &conn,
+            "s-late",
+            Some("/Users/me/Projects/relayhistory"),
+            "start the session",
+            1,
+        );
+        let none = HashSet::new();
+        let first = build_outbox_batch(&conn, &SyncCursor::default(), 100, &none).unwrap();
+        let prompt = first.records.iter().find(|r| r.kind == "prompt").unwrap();
+        assert!(prompt.files_touched.is_empty());
+
+        add_file_edit(
+            &conn,
+            "s-late",
+            "/Users/me/Projects/relayhistory/src/outbox.rs",
+            "Edit",
+        );
+        let second = build_outbox_batch(&conn, &first.cursor, 100, &none).unwrap();
+        let replayed: Vec<_> = second
+            .records
+            .iter()
+            .filter(|r| r.kind == "prompt")
+            .collect();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].content, "start the session");
+        assert!(replayed[0]
+            .files_touched
+            .iter()
+            .any(|f| f.ends_with("src/outbox.rs")));
+        assert!(second.cursor.file_edit_id > first.cursor.file_edit_id);
+
+        let third = build_outbox_batch(&conn, &second.cursor, 100, &none).unwrap();
+        assert!(!third.records.iter().any(|r| r.kind == "prompt"));
+    }
+
+    #[test]
+    fn new_prompt_with_new_file_edits_does_not_double_emit() {
+        let conn = mem();
+        add_history(&conn, "s1", "first", 1);
+        let none = HashSet::new();
+        let first = build_outbox_batch(&conn, &SyncCursor::default(), 100, &none).unwrap();
+        add_file_edit(&conn, "s1", "src/a.rs", "Edit");
+        add_history(&conn, "s1", "second", 2);
+        let second = build_outbox_batch(&conn, &first.cursor, 100, &none).unwrap();
+        let prompts: Vec<_> = second
+            .records
+            .iter()
+            .filter(|r| r.kind == "prompt")
+            .collect();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].content, "second");
+        assert!(prompts[0]
+            .files_touched
+            .iter()
+            .any(|f| f.ends_with("src/a.rs")));
     }
 
     #[test]
