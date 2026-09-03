@@ -448,15 +448,17 @@ pub fn batch_id(machine: &str, from: &SyncCursor, to: &SyncCursor, count: usize)
     format!(
         "b_{}",
         ai_hist_core::prompt_hash(&format!(
-            "{machine}:{}:{}:{}:{}:{}:{}:{}:{}:{count}",
+            "{machine}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{count}",
             from.history_id,
             from.trajectory_rowid,
             from.trajectory_updated_ms,
             from.commit_link_id,
+            from.capture_version,
             to.history_id,
             to.trajectory_rowid,
             to.trajectory_updated_ms,
-            to.commit_link_id
+            to.commit_link_id,
+            to.capture_version
         ))
     )
 }
@@ -589,6 +591,7 @@ fn push_once(
             "trajectory_rowid": batch.cursor.trajectory_rowid,
             "trajectory_updated_ms": batch.cursor.trajectory_updated_ms,
             "commit_link_id": batch.cursor.commit_link_id,
+            "capture_version": batch.cursor.capture_version,
         })),
         records: batch.records,
     };
@@ -1806,6 +1809,7 @@ mod tests {
                     trajectory_rowid: 1,
                     trajectory_updated_ms: 50,
                     commit_link_id: 2,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1818,6 +1822,7 @@ mod tests {
                     trajectory_rowid: 100,
                     trajectory_updated_ms: 5,
                     commit_link_id: 20,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1828,6 +1833,7 @@ mod tests {
                     trajectory_rowid: 1,
                     trajectory_updated_ms: 50,
                     commit_link_id: 20,
+                    ..Default::default()
                 }
             );
 
@@ -1862,6 +1868,7 @@ mod tests {
                     trajectory_rowid: 1,
                     trajectory_updated_ms: 50,
                     commit_link_id: 20,
+                    ..Default::default()
                 }
             );
         });

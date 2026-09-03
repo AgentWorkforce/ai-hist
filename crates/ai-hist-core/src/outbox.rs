@@ -28,7 +28,7 @@ use std::path::Path;
 /// Resume watermarks for incremental cloud sync (the local cursor store). Persisted by the
 /// binding layer (single cursor store) and advanced to the server-confirmed values after a
 /// successful `/v1/ingest`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncCursor {
     /// Highest `history.id` included in a synced batch.
     #[serde(default)]
@@ -43,14 +43,48 @@ pub struct SyncCursor {
     /// Highest `session_commit_links.id` included in a synced batch.
     #[serde(default)]
     pub commit_link_id: i64,
+    /// Mapper generation. Missing from pre-neighborhood-memory cursor files (serde
+    /// default 0). Those rewind history/trajectory watermarks once so existing
+    /// rows are re-upserted with `projectId` / `filesTouched`.
+    #[serde(default)]
+    pub capture_version: i64,
+}
+
+impl Default for SyncCursor {
+    fn default() -> Self {
+        Self {
+            history_id: 0,
+            trajectory_rowid: 0,
+            trajectory_updated_ms: 0,
+            commit_link_id: 0,
+            capture_version: Self::CAPTURE_VERSION,
+        }
+    }
 }
 
 impl SyncCursor {
+    /// Neighborhood-memory capture mapper. Bump when an upgraded client must
+    /// re-upsert already-synced rows with newly populated fields.
+    pub const CAPTURE_VERSION: i64 = 1;
+
     /// Advance watermarks so a stale writer cannot rewind one. History and
     /// commit-link ids are independent maxima. Trajectories use a single keyset
     /// position `(updated_ms, rowid)` — taking those two fields independently
-    /// skips equal-timestamp rows when `LIMIT` splits a batch.
+    /// skips equal-timestamp rows when `LIMIT` splits a batch. A higher
+    /// `capture_version` may rewind history/trajectory positions to backfill.
     pub fn merge_max(&self, other: &Self) -> Self {
+        if other.capture_version > self.capture_version {
+            return Self {
+                capture_version: other.capture_version,
+                history_id: other.history_id,
+                trajectory_rowid: other.trajectory_rowid,
+                trajectory_updated_ms: other.trajectory_updated_ms,
+                commit_link_id: self.commit_link_id.max(other.commit_link_id),
+            };
+        }
+        if self.capture_version > other.capture_version {
+            return self.clone();
+        }
         let (trajectory_updated_ms, trajectory_rowid) = if other.trajectory_key_after(self) {
             (other.trajectory_updated_ms, other.trajectory_rowid)
         } else {
@@ -61,6 +95,20 @@ impl SyncCursor {
             trajectory_rowid,
             trajectory_updated_ms,
             commit_link_id: self.commit_link_id.max(other.commit_link_id),
+            capture_version: self.capture_version,
+        }
+    }
+
+    fn migrated(&self) -> Self {
+        if self.capture_version >= Self::CAPTURE_VERSION {
+            return self.clone();
+        }
+        Self {
+            capture_version: Self::CAPTURE_VERSION,
+            history_id: 0,
+            trajectory_rowid: 0,
+            trajectory_updated_ms: 0,
+            commit_link_id: self.commit_link_id,
         }
     }
 
@@ -97,6 +145,7 @@ pub fn build_outbox_batch(
     // reflections), so the batch must be bounded on EMITTED records, not rows scanned, or a
     // handful of roll-ups blows past the cap and the push 400s.
     const MAX_RECORDS: usize = 900;
+    let cursor = cursor.migrated();
     let mut records = Vec::new();
     let mut next = cursor.clone();
     let mut remotes: HashMap<String, Option<String>> = HashMap::new();
@@ -680,6 +729,7 @@ mod tests {
             trajectory_rowid: 3,
             trajectory_updated_ms: 99,
             commit_link_id: 4,
+            ..Default::default()
         };
         let s = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<SyncCursor>(&s).unwrap(), c);
@@ -687,6 +737,7 @@ mod tests {
             serde_json::from_str(r#"{"history_id":7,"trajectory_rowid":3}"#).unwrap();
         assert_eq!(old.trajectory_updated_ms, 0);
         assert_eq!(old.commit_link_id, 0);
+        assert_eq!(old.capture_version, 0);
     }
 
     #[test]
@@ -903,6 +954,53 @@ mod tests {
     }
 
     #[test]
+    fn upgraded_cursor_replays_previously_synced_prompts() {
+        let conn = mem();
+        add_history_project(
+            &conn,
+            "s-old",
+            Some("/Users/me/Projects/relayhistory"),
+            "already pushed without projectId",
+            1,
+        );
+        let old: SyncCursor =
+            serde_json::from_str(r#"{"history_id":1,"trajectory_rowid":0}"#).unwrap();
+        assert_eq!(old.capture_version, 0);
+        assert_eq!(old.history_id, 1);
+        let none = HashSet::new();
+        let batch = build_outbox_batch(&conn, &old, 100, &none).unwrap();
+        let prompt = batch
+            .records
+            .iter()
+            .find(|r| r.kind == "prompt")
+            .expect("historical prompt must be re-upserted once");
+        assert_eq!(prompt.content, "already pushed without projectId");
+        assert_eq!(prompt.project_id.as_deref(), Some("relayhistory"));
+        assert_eq!(batch.cursor.capture_version, SyncCursor::CAPTURE_VERSION);
+        assert_eq!(batch.cursor.history_id, 1);
+
+        let empty = build_outbox_batch(&conn, &batch.cursor, 100, &none).unwrap();
+        assert!(!empty.records.iter().any(|r| r.kind == "prompt"));
+    }
+
+    #[test]
+    fn capture_version_upgrade_rewinds_history_in_merge_max() {
+        let old = SyncCursor {
+            history_id: 99,
+            capture_version: 0,
+            ..Default::default()
+        };
+        let upgraded = old.migrated();
+        assert_eq!(upgraded.history_id, 0);
+        assert_eq!(upgraded.capture_version, SyncCursor::CAPTURE_VERSION);
+        let merged = old.merge_max(&upgraded);
+        assert_eq!(merged.history_id, 0);
+        assert_eq!(merged.capture_version, SyncCursor::CAPTURE_VERSION);
+        let stale = upgraded.merge_max(&old);
+        assert_eq!(stale, upgraded);
+    }
+
+    #[test]
     fn equal_timestamp_keyset_does_not_skip_rows() {
         // Reviewer example: (rowid, updated_ms) = (3,1), (1,2), (2,2) with LIMIT 2.
         // Independent max(rowid)/max(updated_ms) advances to (3, 2) and permanently
@@ -978,10 +1076,9 @@ mod tests {
             None,
         );
         let old = SyncCursor {
-            history_id: 0,
             trajectory_rowid: 1,
             trajectory_updated_ms: 0,
-            commit_link_id: 0,
+            ..Default::default()
         };
         let none = HashSet::new();
         let batch = build_outbox_batch(&conn, &old, 100, &none).unwrap();
