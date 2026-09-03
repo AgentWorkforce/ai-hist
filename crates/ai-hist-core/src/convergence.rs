@@ -248,14 +248,42 @@ const KIND_FINDING: &str = "finding";
 /// even when the row carries no session id. `projectId` is always a slug (or
 /// [`UNKNOWN_PROJECT`]), never `None`.
 pub fn map_history_entry(entry: &HistoryEntry) -> ConvergenceEnvelope {
-    map_history_entry_with(entry, None, Vec::new())
+    map_history_entry_with(entry, None, Vec::new(), None)
 }
 
-/// Like [`map_history_entry`], with a git-remote fallback and `filesTouched`.
+/// The `taskRef` a prompt belongs to, as `{system:"git", id:"<project>@<branch>"}`.
+///
+/// A branch is the closest thing to a unit of work that exists while the work is being
+/// done — a PR number does not exist yet when the session runs, and a commit sha does not
+/// exist until the end. Keying on `<project>@<branch>` lets a PR (or a person) ask for
+/// every session behind a branch after the fact.
+///
+/// Returns `None` rather than a placeholder when the branch is unknown or detached: the
+/// server stores `{}` for absent, and a synthetic ref would make unrelated sessions
+/// collide under one task.
+pub fn git_task_ref(project_id: &str, branch: Option<&str>) -> Option<serde_json::Value> {
+    let branch = branch.map(str::trim).filter(|b| {
+        // A detached HEAD is not a task, and neither is an empty string.
+        !b.is_empty() && *b != "HEAD" && *b != "(detached)"
+    })?;
+    if project_id.is_empty() || project_id == UNKNOWN_PROJECT {
+        return None;
+    }
+    Some(serde_json::json!({
+        "system": "git",
+        "id": format!("{project_id}@{branch}"),
+    }))
+}
+
+/// Like [`map_history_entry`], with a git-remote fallback, `filesTouched` and the branch
+/// the session was on.
+/// Like [`map_history_entry`], with a git-remote fallback, `filesTouched`, and the
+/// branch the session was on.
 pub fn map_history_entry_with(
     entry: &HistoryEntry,
     git_remote: Option<&str>,
     files_touched: Vec<String>,
+    git_branch: Option<&str>,
 ) -> ConvergenceEnvelope {
     let session_id = entry
         .session_id
@@ -283,7 +311,10 @@ pub fn map_history_entry_with(
         task_title: None,
         task_description: None,
         task_status: None,
-        task_ref: None,
+        task_ref: git_task_ref(
+            &resolve_project_id(entry.project.as_deref(), git_remote),
+            git_branch,
+        ),
         record: None,
         files_touched: normalize_files_touched(files_touched),
         commit_sha: None,
@@ -1682,5 +1713,46 @@ mod tests {
         assert!(v["confidence"].is_null());
         // projectId is always present (never NULL)
         assert_eq!(v["projectId"], UNKNOWN_PROJECT);
+    }
+    #[test]
+    fn task_ref_names_the_branch_the_work_happened_on() {
+        let value = git_task_ref("AgentWorkforce/relayhistory", Some("feat/turns")).unwrap();
+        assert_eq!(value["system"], "git");
+        assert_eq!(value["id"], "AgentWorkforce/relayhistory@feat/turns");
+    }
+
+    /// A synthetic ref would make unrelated sessions collide under one task, which is
+    /// worse than no ref at all — the server stores `{}` for absent and the filter simply
+    /// does not match.
+    #[test]
+    fn task_ref_is_absent_rather_than_synthetic_when_there_is_no_real_branch() {
+        assert!(git_task_ref("owner/repo", None).is_none());
+        assert!(git_task_ref("owner/repo", Some("")).is_none());
+        assert!(git_task_ref("owner/repo", Some("   ")).is_none());
+        // A detached HEAD is a position, not a unit of work.
+        assert!(git_task_ref("owner/repo", Some("HEAD")).is_none());
+        // An unknown project would group every unattributable session together.
+        assert!(git_task_ref(UNKNOWN_PROJECT, Some("main")).is_none());
+    }
+
+    #[test]
+    fn prompt_envelopes_carry_the_task_ref() {
+        let entry = HistoryEntry {
+            id: 1,
+            source: "claude".into(),
+            session_id: Some("s1".into()),
+            project: Some("AgentWorkforce/relayhistory".into()),
+            prompt: "why".into(),
+            prompt_hash: Some("h".into()),
+            timestamp_ms: 1_700_000_000_000,
+        };
+        let env = map_history_entry_with(&entry, None, Vec::new(), Some("fix/scrub"));
+        let task_ref = env
+            .task_ref
+            .expect("branch known, so a taskRef is expected");
+        assert_eq!(task_ref["id"], "AgentWorkforce/relayhistory@fix/scrub");
+
+        let without = map_history_entry_with(&entry, None, Vec::new(), None);
+        assert!(without.task_ref.is_none());
     }
 }
