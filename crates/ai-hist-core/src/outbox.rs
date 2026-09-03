@@ -15,7 +15,10 @@ use crate::convergence::{
     map_history_entry_with, map_session_outcome, map_trajectory, normalize_home_path,
     resolve_project_id, ConvergenceEnvelope, SessionCommitLink, TrajectoryRow, UNKNOWN_PROJECT,
 };
-use crate::HistoryEntry;
+use crate::{
+    session_file_edits, session_file_edits_page, HistoryEntry, SessionEvidenceCursor,
+    SessionFileEdit,
+};
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -40,6 +43,19 @@ pub struct SyncCursor {
     /// Highest `session_commit_links.id` included in a synced batch.
     #[serde(default)]
     pub commit_link_id: i64,
+}
+
+impl SyncCursor {
+    /// Advance each watermark independently so a stale writer cannot rewind one
+    /// by publishing an older value of another.
+    pub fn merge_max(&self, other: &Self) -> Self {
+        Self {
+            history_id: self.history_id.max(other.history_id),
+            trajectory_rowid: self.trajectory_rowid.max(other.trajectory_rowid),
+            trajectory_updated_ms: self.trajectory_updated_ms.max(other.trajectory_updated_ms),
+            commit_link_id: self.commit_link_id.max(other.commit_link_id),
+        }
+    }
 }
 
 /// The next outbox batch: the envelopes to POST and the cursor they advance to.
@@ -371,30 +387,39 @@ fn session_files(
     if let Some(hit) = cache.get(&key) {
         return Ok(hit.clone());
     }
-    let files = if let Some(source) = source {
-        let mut stmt = conn.prepare(
-            "SELECT file_path FROM file_edits WHERE source = ?1 AND session_id = ?2 ORDER BY id ASC",
-        )?;
-        let rows: rusqlite::Result<Vec<String>> = stmt
-            .query_map(rusqlite::params![source, session_id], |r| r.get(0))?
-            .collect();
-        rows?
-    } else {
-        let mut stmt =
-            conn.prepare("SELECT file_path FROM file_edits WHERE session_id = ?1 ORDER BY id ASC")?;
-        let rows: rusqlite::Result<Vec<String>> =
-            stmt.query_map([session_id], |r| r.get(0))?.collect();
-        rows?
+    let edits = match source {
+        Some(source) => collect_session_file_edits(conn, source, session_id)?,
+        None => session_file_edits(conn, session_id, None)?,
     };
     let mut deduped = Vec::new();
-    for file in files {
-        let trimmed = file.trim();
+    for edit in edits {
+        let trimmed = edit.file_path.trim();
         if !trimmed.is_empty() && !deduped.iter().any(|existing| existing == trimmed) {
             deduped.push(trimmed.to_string());
         }
     }
     cache.insert(key, deduped.clone());
     Ok(deduped)
+}
+
+/// Page through [`session_file_edits_page`] until the session is exhausted.
+fn collect_session_file_edits(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<Vec<SessionFileEdit>> {
+    let mut all = Vec::new();
+    let mut after: Option<SessionEvidenceCursor> = None;
+    loop {
+        let page = session_file_edits_page(conn, source, session_id, 1_000, after.as_ref())?;
+        let next = page.next_cursor;
+        all.extend(page.file_edits);
+        match next {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
+    Ok(all)
 }
 
 fn trajectory_files(

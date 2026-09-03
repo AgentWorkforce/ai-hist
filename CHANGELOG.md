@@ -4,6 +4,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+- Populate `projectId` on every cloud-sync envelope (repo slug from
+  `history.project` or the session cwd's git remote; the explicit string
+  `unknown` when neither is known). Emit `filesTouched` from
+  `session_file_edits` / `session_file_edits_page`, `session_outcome`
+  envelopes from `session_commit_links`, and re-push revised trajectories
+  through an `updated_ms` watermark on the sync cursor.
+
 - Add targeted remote hydration for Claude Code web sessions through the
   provider's bounded teleport-evidence interface, and partial Codex cloud task
   hydration through `codex cloud diff`. Hydration contract v2 reports honest
