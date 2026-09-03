@@ -169,7 +169,7 @@ fn normalize_project_id(raw: &str) -> String {
     }
     if is_filesystem_path(raw) {
         let slug = last_path_component(raw);
-        return if slug.is_empty() {
+        return if slug.is_empty() || slug == "." || slug == ".." {
             UNKNOWN_PROJECT.to_string()
         } else {
             slug
@@ -182,6 +182,12 @@ fn is_filesystem_path(s: &str) -> bool {
     let bytes = s.as_bytes();
     s.starts_with('/')
         || s.starts_with('~')
+        || s == "."
+        || s == ".."
+        || s.starts_with("./")
+        || s.starts_with("../")
+        || s.starts_with(".\\")
+        || s.starts_with("..\\")
         || s.starts_with("\\\\")
         || (bytes.len() >= 3
             && bytes[0].is_ascii_alphabetic()
@@ -1439,6 +1445,16 @@ mod tests {
             resolve_project_id(Some(r"C:\Users\alice\Projects\my-app"), None),
             "my-app"
         );
+        // relative path forms → last component, never a path on the wire
+        assert_eq!(resolve_project_id(Some("./repo"), None), "repo");
+        assert_eq!(
+            resolve_project_id(Some("../relayhistory"), None),
+            "relayhistory"
+        );
+        assert_eq!(resolve_project_id(Some("./foo/bar"), None), "bar");
+        assert_eq!(resolve_project_id(Some(r".\repo"), None), "repo");
+        assert_eq!(resolve_project_id(Some("."), None), UNKNOWN_PROJECT);
+        assert_eq!(resolve_project_id(Some(".."), None), UNKNOWN_PROJECT);
         // git-remote project → owner/repo slug
         assert_eq!(
             resolve_project_id(None, Some("git@github.com:AgentWorkforce/relayhistory.git")),
