@@ -197,7 +197,7 @@ pub fn build_outbox_batch(
     {
         let mut stmt = conn.prepare(
             "SELECT id, source, session_id, repo, branch, commit_sha, match_method, confidence, \
-             files_json, numstat_json, created_at_ms \
+             files_json, numstat_json, evidence_json, created_at_ms \
              FROM session_commit_links WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
         )?;
         let rows = stmt.query_map([cursor.commit_link_id, limit], |r| {
@@ -212,7 +212,8 @@ pub fn build_outbox_batch(
                 confidence: r.get(7)?,
                 files_json: r.get(8)?,
                 numstat_json: r.get(9)?,
-                created_at_ms: r.get(10)?,
+                evidence_json: r.get(10)?,
+                created_at_ms: r.get(11)?,
             })
         })?;
         for row in rows {
@@ -243,6 +244,7 @@ pub fn build_outbox_batch(
                     confidence: link.confidence,
                     files_json: link.files_json.as_deref(),
                     numstat_json: link.numstat_json.as_deref(),
+                    evidence_json: link.evidence_json.as_deref(),
                     created_at_ms: link.created_at_ms,
                 },
                 &project_id,
@@ -284,6 +286,7 @@ struct CommitLinkOwned {
     confidence: f64,
     files_json: Option<String>,
     numstat_json: Option<String>,
+    evidence_json: Option<String>,
     created_at_ms: i64,
 }
 
@@ -531,18 +534,29 @@ mod tests {
     }
 
     fn add_commit_link(conn: &Connection, session: &str, sha: &str, method: &str) {
+        add_commit_link_evidence(conn, session, sha, method, None);
+    }
+
+    fn add_commit_link_evidence(
+        conn: &Connection,
+        session: &str,
+        sha: &str,
+        method: &str,
+        evidence_json: Option<&str>,
+    ) {
         conn.execute(
             "INSERT INTO session_commit_links \
              (source, session_id, repo, branch, commit_sha, match_method, confidence, \
-              files_json, numstat_json, created_at_ms) \
+              files_json, numstat_json, evidence_json, created_at_ms) \
              VALUES ('claude', ?, '/Users/khaliqgant/Projects/relayhistory', 'main', ?, ?, 0.9, \
-                     ?, ?, 1_782_036_000_000)",
+                     ?, ?, ?, 1_782_036_000_000)",
             rusqlite::params![
                 session,
                 sha,
                 method,
                 r#"["src/lib.rs"]"#,
                 r#"[{"path":"src/lib.rs","additions":2,"deletions":0}]"#,
+                evidence_json,
             ],
         )
         .unwrap();
@@ -874,5 +888,65 @@ mod tests {
 
         let empty = build_outbox_batch(&conn, &batch.cursor, 100, &none).unwrap();
         assert!(!empty.records.iter().any(|r| r.kind == "session_outcome"));
+    }
+
+    #[test]
+    fn session_outcome_shipped_at_comes_from_evidence_commit_time() {
+        let conn = mem();
+        add_history_project(
+            &conn,
+            "s-ship",
+            Some("/Users/me/Projects/relayhistory"),
+            "land it",
+            1,
+        );
+        add_commit_link_evidence(
+            &conn,
+            "s-ship",
+            "deadbeef",
+            "cwd",
+            Some(r#"{"commit_time_ms":1000}"#),
+        );
+        let none = HashSet::new();
+        let batch = build_outbox_batch(&conn, &SyncCursor::default(), 100, &none).unwrap();
+        let outcome = batch
+            .records
+            .iter()
+            .find(|r| r.kind == "session_outcome")
+            .unwrap();
+        assert_eq!(
+            outcome.shipped_at.as_deref(),
+            Some("1970-01-01T00:00:01.000Z")
+        );
+        assert_eq!(outcome.ts, "2026-06-21T10:00:00.000Z");
+    }
+
+    #[test]
+    fn session_outcome_event_ids_differ_when_match_method_differs() {
+        let conn = mem();
+        add_history_project(
+            &conn,
+            "s-dup",
+            Some("/Users/me/Projects/relayhistory"),
+            "same commit two ways",
+            1,
+        );
+        add_commit_link(&conn, "s-dup", "abc123def", "cwd");
+        add_commit_link(&conn, "s-dup", "abc123def", "cwd+branch");
+        let none = HashSet::new();
+        let batch = build_outbox_batch(&conn, &SyncCursor::default(), 100, &none).unwrap();
+        let ids: Vec<_> = batch
+            .records
+            .iter()
+            .filter(|r| r.kind == "session_outcome")
+            .map(|r| r.event_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "session_outcome:claude:s-dup:abc123def:cwd",
+                "session_outcome:claude:s-dup:abc123def:cwd+branch",
+            ]
+        );
     }
 }

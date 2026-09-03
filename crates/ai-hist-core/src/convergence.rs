@@ -307,6 +307,7 @@ pub struct SessionCommitLink<'a> {
     pub confidence: f64,
     pub files_json: Option<&'a str>,
     pub numstat_json: Option<&'a str>,
+    pub evidence_json: Option<&'a str>,
     pub created_at_ms: i64,
 }
 
@@ -320,13 +321,18 @@ pub fn map_session_outcome(
 ) -> ConvergenceEnvelope {
     let sha = link.commit_sha.trim();
     let method = link.match_method.trim();
+    let source = link.source.trim();
+    let shipped_ms = commit_time_ms(link.evidence_json).unwrap_or(link.created_at_ms);
     ConvergenceEnvelope {
         v: 1,
         kind: "session_outcome".to_string(),
-        source: link.source.to_string(),
+        source: source.to_string(),
         lens: Some("history".to_string()),
         session_id: link.session_id.to_string(),
-        event_id: format!("session_outcome:{}:{sha}", link.session_id),
+        event_id: format!(
+            "session_outcome:{source}:{}:{sha}:{method}",
+            link.session_id
+        ),
         ts: epoch_ms_to_iso(link.created_at_ms),
         event_type: "session_outcome".to_string(),
         content: format!("session linked to commit {sha} via {method}"),
@@ -347,8 +353,17 @@ pub fn map_session_outcome(
         match_method: Some(method.to_string()),
         numstat: wrap_numstat(link.numstat_json),
         files: parse_files_json(link.files_json),
-        shipped_at: Some(epoch_ms_to_iso(link.created_at_ms)),
+        shipped_at: Some(epoch_ms_to_iso(shipped_ms)),
     }
+}
+
+/// Commit time from `session_commit_links.evidence_json`, when the hook stored it.
+fn commit_time_ms(evidence_json: Option<&str>) -> Option<i64> {
+    let parsed: Value = serde_json::from_str(nonempty(evidence_json)?).ok()?;
+    parsed
+        .get("commit_time_ms")
+        .and_then(Value::as_i64)
+        .filter(|ms| *ms > 0)
 }
 
 fn normalize_files_touched(files: Vec<String>) -> Vec<String> {
@@ -1507,6 +1522,7 @@ mod tests {
                 confidence: 0.91,
                 files_json: Some(r#"["src/lib.rs","src/main.rs"]"#),
                 numstat_json: Some(r#"[{"path":"src/lib.rs","additions":3,"deletions":1}]"#),
+                evidence_json: None,
                 created_at_ms: 1_782_036_000_000,
             },
             "relayhistory",
@@ -1515,7 +1531,10 @@ mod tests {
         assert_eq!(env.kind, "session_outcome");
         assert_eq!(env.source, "claude");
         assert_eq!(env.session_id, "s1");
-        assert_eq!(env.event_id, "session_outcome:s1:abc123def");
+        assert_eq!(
+            env.event_id,
+            "session_outcome:claude:s1:abc123def:cwd+branch"
+        );
         assert_eq!(env.project_id.as_deref(), Some("relayhistory"));
         assert_eq!(env.commit_sha.as_deref(), Some("abc123def"));
         assert_eq!(env.match_method.as_deref(), Some("cwd+branch"));
@@ -1536,6 +1555,74 @@ mod tests {
         assert_eq!(v["files"][0], "src/lib.rs");
         assert_eq!(v["numstat"]["files"][0]["path"], "src/lib.rs");
         assert_eq!(v["repo"], "/Users/~/Projects/relayhistory");
+        assert_eq!(v["shippedAt"], "2026-06-21T10:00:00.000Z");
+    }
+
+    #[test]
+    fn session_outcome_shipped_at_uses_commit_time_not_link_time() {
+        let env = map_session_outcome(
+            &SessionCommitLink {
+                source: "claude",
+                session_id: "s1",
+                repo: Some("/tmp/repo"),
+                branch: Some("main"),
+                commit_sha: "abc123def",
+                match_method: "cwd",
+                confidence: 0.9,
+                files_json: None,
+                numstat_json: None,
+                evidence_json: Some(r#"{"commit_time_ms":1000}"#),
+                created_at_ms: 1_782_036_000_000,
+            },
+            "repo",
+            Vec::new(),
+        );
+        assert_eq!(env.shipped_at.as_deref(), Some("1970-01-01T00:00:01.000Z"));
+        assert_eq!(env.ts, "2026-06-21T10:00:00.000Z");
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["shippedAt"], "1970-01-01T00:00:01.000Z");
+        assert_ne!(v["shippedAt"], v["ts"]);
+    }
+
+    #[test]
+    fn session_outcome_event_id_includes_source_and_match_method() {
+        let a = map_session_outcome(
+            &SessionCommitLink {
+                source: "claude",
+                session_id: "s1",
+                repo: None,
+                branch: None,
+                commit_sha: "abc123def",
+                match_method: "cwd",
+                confidence: 0.5,
+                files_json: None,
+                numstat_json: None,
+                evidence_json: None,
+                created_at_ms: 1,
+            },
+            "repo",
+            Vec::new(),
+        );
+        let b = map_session_outcome(
+            &SessionCommitLink {
+                source: "claude",
+                session_id: "s1",
+                repo: None,
+                branch: None,
+                commit_sha: "abc123def",
+                match_method: "cwd+branch",
+                confidence: 0.9,
+                files_json: None,
+                numstat_json: None,
+                evidence_json: None,
+                created_at_ms: 2,
+            },
+            "repo",
+            Vec::new(),
+        );
+        assert_eq!(a.event_id, "session_outcome:claude:s1:abc123def:cwd");
+        assert_eq!(b.event_id, "session_outcome:claude:s1:abc123def:cwd+branch");
+        assert_ne!(a.event_id, b.event_id);
     }
 
     #[test]
