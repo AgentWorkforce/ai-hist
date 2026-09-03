@@ -6,17 +6,21 @@
 //! binding layer (the `ai-hist` binary) per the no-async-in-core rule — this module only
 //! does sync rusqlite reads, so it is fully unit-testable without a server.
 //!
-//! Cursor model (mirrors burn's `archive_state` watermark): monotonic `history.id` and
-//! `trajectories.rowid`. NOTE (v1 limitation): trajectory rows that are *updated* after
-//! first sync are not re-pushed by rowid alone — the server upsert makes a re-push safe,
-//! but catching updates would need an `updated_ms` watermark (deferred).
+//! Cursor model (mirrors burn's `archive_state` watermark): monotonic `history.id`,
+//! `trajectories.rowid` plus a `trajectories.updated_ms` watermark so rows revised after
+//! first sync re-push (the server upsert is already safe), and `session_commit_links.id`
+//! for `session_outcome` envelopes.
 
-use crate::convergence::{map_history_entry, map_trajectory, ConvergenceEnvelope, TrajectoryRow};
+use crate::convergence::{
+    map_history_entry_with, map_session_outcome, map_trajectory, normalize_home_path,
+    resolve_project_id, ConvergenceEnvelope, SessionCommitLink, TrajectoryRow, UNKNOWN_PROJECT,
+};
 use crate::HistoryEntry;
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 /// Resume watermarks for incremental cloud sync (the local cursor store). Persisted by the
 /// binding layer (single cursor store) and advanced to the server-confirmed values after a
@@ -29,6 +33,13 @@ pub struct SyncCursor {
     /// Highest `trajectories.rowid` included in a synced batch.
     #[serde(default)]
     pub trajectory_rowid: i64,
+    /// Highest `trajectories.updated_ms` included in a synced batch. Catches rows that
+    /// were revised after their rowid first crossed the cursor.
+    #[serde(default)]
+    pub trajectory_updated_ms: i64,
+    /// Highest `session_commit_links.id` included in a synced batch.
+    #[serde(default)]
+    pub commit_link_id: i64,
 }
 
 /// The next outbox batch: the envelopes to POST and the cursor they advance to.
@@ -59,6 +70,8 @@ pub fn build_outbox_batch(
     const MAX_RECORDS: usize = 900;
     let mut records = Vec::new();
     let mut next = cursor.clone();
+    let mut remotes: HashMap<String, Option<String>> = HashMap::new();
+    let mut file_cache: HashMap<(String, String), Vec<String>> = HashMap::new();
 
     // --- history (prompts) — append-only, watermark on id ---
     {
@@ -91,38 +104,52 @@ pub fn build_outbox_batch(
                     continue;
                 }
             }
-            records.push(map_history_entry(&entry));
+            let git_remote = git_remote_for_entry(conn, &entry, &mut remotes);
+            let files = match &entry.session_id {
+                Some(sid) => session_files(conn, &mut file_cache, Some(&entry.source), sid)?,
+                None => Vec::new(),
+            };
+            records.push(map_history_entry_with(&entry, git_remote.as_deref(), files));
         }
     }
 
-    // --- trajectories (decisions/retro) — watermark on rowid ---
+    // --- trajectories (decisions/retro) — rowid + updated_ms watermarks ---
+    let updated_watermark = trajectory_updated_watermark(conn, cursor)?;
+    next.trajectory_updated_ms = next.trajectory_updated_ms.max(updated_watermark);
     {
         let mut stmt = conn.prepare(
             "SELECT rowid, id, persona_id, project_id, task_title, task_description, status, \
-             decisions_json, retrospective_json, timestamp_ms \
-             FROM trajectories WHERE rowid > ?1 ORDER BY rowid ASC LIMIT ?2",
+             decisions_json, retrospective_json, timestamp_ms, updated_ms, path \
+             FROM trajectories WHERE rowid > ?1 OR updated_ms > ?2 \
+             ORDER BY updated_ms ASC, rowid ASC LIMIT ?3",
         )?;
-        let raw = stmt.query_map([cursor.trajectory_rowid, limit], |r| {
-            Ok(TrajRowOwned {
-                rowid: r.get(0)?,
-                id: r.get(1)?,
-                persona_id: r.get(2)?,
-                project_id: r.get(3)?,
-                task_title: r.get(4)?,
-                task_description: r.get(5)?,
-                status: r.get(6)?,
-                decisions_json: r.get(7)?,
-                retrospective_json: r.get(8)?,
-                timestamp_ms: r.get(9)?,
-            })
-        })?;
+        let raw = stmt.query_map(
+            rusqlite::params![cursor.trajectory_rowid, updated_watermark, limit],
+            |r| {
+                Ok(TrajRowOwned {
+                    rowid: r.get(0)?,
+                    id: r.get(1)?,
+                    persona_id: r.get(2)?,
+                    project_id: r.get(3)?,
+                    task_title: r.get(4)?,
+                    task_description: r.get(5)?,
+                    status: r.get(6)?,
+                    decisions_json: r.get(7)?,
+                    retrospective_json: r.get(8)?,
+                    timestamp_ms: r.get(9)?,
+                    updated_ms: r.get(10)?,
+                    path: r.get(11)?,
+                })
+            },
+        )?;
         for row in raw {
             let t = row?;
             if incognito.contains(&t.id) {
                 next.trajectory_rowid = next.trajectory_rowid.max(t.rowid);
+                next.trajectory_updated_ms = next.trajectory_updated_ms.max(t.updated_ms);
                 continue;
             }
-            let mapped = map_trajectory(&TrajectoryRow {
+            let mut mapped = map_trajectory(&TrajectoryRow {
                 id: &t.id,
                 persona_id: t.persona_id.as_deref(),
                 project_id: t.project_id.as_deref(),
@@ -140,8 +167,71 @@ pub fn build_outbox_batch(
             if !records.is_empty() && records.len() + mapped.len() > MAX_RECORDS {
                 break;
             }
+            let files = trajectory_files(conn, &mut file_cache, &t.id, t.path.as_deref())?;
+            for env in &mut mapped {
+                env.files_touched = files.clone();
+            }
             next.trajectory_rowid = next.trajectory_rowid.max(t.rowid);
+            next.trajectory_updated_ms = next.trajectory_updated_ms.max(t.updated_ms);
             records.extend(mapped);
+        }
+    }
+
+    // --- session_commit_links → kind=session_outcome (one envelope per link row) ---
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, source, session_id, repo, branch, commit_sha, match_method, confidence, \
+             files_json, numstat_json, created_at_ms \
+             FROM session_commit_links WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map([cursor.commit_link_id, limit], |r| {
+            Ok(CommitLinkOwned {
+                id: r.get(0)?,
+                source: r.get(1)?,
+                session_id: r.get(2)?,
+                repo: r.get(3)?,
+                branch: r.get(4)?,
+                commit_sha: r.get(5)?,
+                match_method: r.get(6)?,
+                confidence: r.get(7)?,
+                files_json: r.get(8)?,
+                numstat_json: r.get(9)?,
+                created_at_ms: r.get(10)?,
+            })
+        })?;
+        for row in rows {
+            let link = row?;
+            if records.len() >= MAX_RECORDS {
+                break;
+            }
+            next.commit_link_id = next.commit_link_id.max(link.id);
+            if incognito.contains(&link.session_id) {
+                continue;
+            }
+            let files = session_files(conn, &mut file_cache, Some(&link.source), &link.session_id)?;
+            let project_id = session_project_id(
+                conn,
+                &link.source,
+                &link.session_id,
+                link.repo.as_deref(),
+                &mut remotes,
+            );
+            records.push(map_session_outcome(
+                &SessionCommitLink {
+                    source: &link.source,
+                    session_id: &link.session_id,
+                    repo: link.repo.as_deref(),
+                    branch: link.branch.as_deref(),
+                    commit_sha: &link.commit_sha,
+                    match_method: &link.match_method,
+                    confidence: link.confidence,
+                    files_json: link.files_json.as_deref(),
+                    numstat_json: link.numstat_json.as_deref(),
+                    created_at_ms: link.created_at_ms,
+                },
+                &project_id,
+                files,
+            ));
         }
     }
 
@@ -163,6 +253,176 @@ struct TrajRowOwned {
     decisions_json: String,
     retrospective_json: String,
     timestamp_ms: i64,
+    updated_ms: i64,
+    path: Option<String>,
+}
+
+struct CommitLinkOwned {
+    id: i64,
+    source: String,
+    session_id: String,
+    repo: Option<String>,
+    branch: Option<String>,
+    commit_sha: String,
+    match_method: String,
+    confidence: f64,
+    files_json: Option<String>,
+    numstat_json: Option<String>,
+    created_at_ms: i64,
+}
+
+/// Old cursors (pre-watermark) have `trajectory_updated_ms = 0`. Seed from already-synced
+/// rows so the first push after upgrade does not replay every trajectory.
+fn trajectory_updated_watermark(conn: &Connection, cursor: &SyncCursor) -> Result<i64> {
+    if cursor.trajectory_updated_ms > 0 || cursor.trajectory_rowid <= 0 {
+        return Ok(cursor.trajectory_updated_ms);
+    }
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(updated_ms), 0) FROM trajectories WHERE rowid <= ?1",
+        [cursor.trajectory_rowid],
+        |r| r.get(0),
+    )?)
+}
+
+fn git_remote_for_entry(
+    conn: &Connection,
+    entry: &HistoryEntry,
+    remotes: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    if entry
+        .project
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+    {
+        return None;
+    }
+    let sid = entry.session_id.as_deref()?;
+    let cwd = session_cwd(conn, &entry.source, sid)?;
+    remotes
+        .entry(cwd.clone())
+        .or_insert_with(|| git_origin_url(&cwd))
+        .clone()
+}
+
+fn session_cwd(conn: &Connection, source: &str, session_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT cwd FROM sessions WHERE source = ?1 AND session_id = ?2",
+        rusqlite::params![source, session_id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+}
+
+fn git_origin_url(cwd: &str) -> Option<String> {
+    if !Path::new(cwd).is_dir() {
+        return None;
+    }
+    let out = std::process::Command::new("git")
+        .args(["-C", cwd, "remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!url.is_empty()).then_some(url)
+}
+
+fn session_project_id(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    repo: Option<&str>,
+    remotes: &mut HashMap<String, Option<String>>,
+) -> String {
+    let project: Option<String> = conn
+        .query_row(
+            "SELECT project FROM history WHERE source = ?1 AND session_id = ?2 \
+             AND project IS NOT NULL AND trim(project) != '' LIMIT 1",
+            rusqlite::params![source, session_id],
+            |r| r.get(0),
+        )
+        .ok();
+    let remote = session_cwd(conn, source, session_id).and_then(|cwd| {
+        remotes
+            .entry(cwd.clone())
+            .or_insert_with(|| git_origin_url(&cwd))
+            .clone()
+    });
+    let resolved = resolve_project_id(project.as_deref(), remote.as_deref());
+    if resolved != UNKNOWN_PROJECT {
+        resolved
+    } else {
+        resolve_project_id(repo, None)
+    }
+}
+
+fn session_files(
+    conn: &Connection,
+    cache: &mut HashMap<(String, String), Vec<String>>,
+    source: Option<&str>,
+    session_id: &str,
+) -> Result<Vec<String>> {
+    let key = (source.unwrap_or("*").to_string(), session_id.to_string());
+    if let Some(hit) = cache.get(&key) {
+        return Ok(hit.clone());
+    }
+    let files = if let Some(source) = source {
+        let mut stmt = conn.prepare(
+            "SELECT file_path FROM file_edits WHERE source = ?1 AND session_id = ?2 ORDER BY id ASC",
+        )?;
+        let rows: rusqlite::Result<Vec<String>> = stmt
+            .query_map(rusqlite::params![source, session_id], |r| r.get(0))?
+            .collect();
+        rows?
+    } else {
+        let mut stmt =
+            conn.prepare("SELECT file_path FROM file_edits WHERE session_id = ?1 ORDER BY id ASC")?;
+        let rows: rusqlite::Result<Vec<String>> =
+            stmt.query_map([session_id], |r| r.get(0))?.collect();
+        rows?
+    };
+    let mut deduped = Vec::new();
+    for file in files {
+        let trimmed = file.trim();
+        if !trimmed.is_empty() && !deduped.iter().any(|existing| existing == trimmed) {
+            deduped.push(trimmed.to_string());
+        }
+    }
+    cache.insert(key, deduped.clone());
+    Ok(deduped)
+}
+
+fn trajectory_files(
+    conn: &Connection,
+    cache: &mut HashMap<(String, String), Vec<String>>,
+    trajectory_id: &str,
+    path: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut files = session_files(conn, cache, None, trajectory_id)?;
+    if let Some(origin) = path.and_then(learn_origin_session) {
+        for file in session_files(conn, cache, None, origin)? {
+            if !files.iter().any(|existing| existing == &file) {
+                files.push(file);
+            }
+        }
+    }
+    Ok(files
+        .into_iter()
+        .map(|f| normalize_home_path(f.trim()))
+        .filter(|f| !f.is_empty())
+        .collect())
+}
+
+fn learn_origin_session(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("learn://")?;
+    rest.split_once('/')
+        .map(|(_, session)| session)
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -177,13 +437,23 @@ mod tests {
     }
 
     fn add_history(conn: &Connection, session: &str, prompt: &str, ts: i64) {
+        add_history_project(conn, session, None, prompt, ts);
+    }
+
+    fn add_history_project(
+        conn: &Connection,
+        session: &str,
+        project: Option<&str>,
+        prompt: &str,
+        ts: i64,
+    ) {
         insert_history(
             conn,
             &HistoryEntry {
                 id: 0,
                 source: "claude".into(),
                 session_id: Some(session.into()),
-                project: None,
+                project: project.map(str::to_string),
                 prompt: prompt.into(),
                 prompt_hash: Some(crate::prompt_hash(prompt)),
                 timestamp_ms: ts,
@@ -193,10 +463,21 @@ mod tests {
     }
 
     fn add_trajectory(conn: &Connection, id: &str, decisions: &str, retro: &str) {
+        add_trajectory_at(conn, id, decisions, retro, 1, None);
+    }
+
+    fn add_trajectory_at(
+        conn: &Connection,
+        id: &str,
+        decisions: &str,
+        retro: &str,
+        updated_ms: i64,
+        path: Option<&str>,
+    ) {
         conn.execute(
             "INSERT INTO trajectories (id, version, persona_id, project_id, task_title, \
              task_description, status, decisions_json, retrospective_json, search_text, path, \
-             updated_ms, timestamp_ms) VALUES (?,1,?,?,?,?,?,?,?,?,NULL,?,?)",
+             updated_ms, timestamp_ms) VALUES (?,1,?,?,?,?,?,?,?,?,?,?,?)",
             rusqlite::params![
                 id,
                 "planner",
@@ -207,11 +488,56 @@ mod tests {
                 decisions,
                 retro,
                 "search",
-                1,
+                path,
+                updated_ms,
                 1_782_036_000_000i64
             ],
         )
         .unwrap();
+    }
+
+    fn add_file_edit(conn: &Connection, session: &str, path: &str, tool: &str) {
+        conn.execute(
+            "INSERT INTO file_edits (source, session_id, tool_use_id, file_path, tool_name) \
+             VALUES ('claude', ?, ?, ?, ?)",
+            rusqlite::params![session, format!("tool_{path}"), path, tool],
+        )
+        .unwrap();
+    }
+
+    fn add_commit_link(conn: &Connection, session: &str, sha: &str, method: &str) {
+        conn.execute(
+            "INSERT INTO session_commit_links \
+             (source, session_id, repo, branch, commit_sha, match_method, confidence, \
+              files_json, numstat_json, created_at_ms) \
+             VALUES ('claude', ?, '/Users/khaliqgant/Projects/relayhistory', 'main', ?, ?, 0.9, \
+                     ?, ?, 1_782_036_000_000)",
+            rusqlite::params![
+                session,
+                sha,
+                method,
+                r#"["src/lib.rs"]"#,
+                r#"[{"path":"src/lib.rs","additions":2,"deletions":0}]"#,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn init_git_repo(origin: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "git init failed");
+        let add = std::process::Command::new("git")
+            .args(["remote", "add", "origin", origin])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "git remote add failed");
+        dir
     }
 
     #[test]
@@ -301,8 +627,227 @@ mod tests {
         let c = SyncCursor {
             history_id: 7,
             trajectory_rowid: 3,
+            trajectory_updated_ms: 99,
+            commit_link_id: 4,
         };
         let s = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<SyncCursor>(&s).unwrap(), c);
+        let old: SyncCursor =
+            serde_json::from_str(r#"{"history_id":7,"trajectory_rowid":3}"#).unwrap();
+        assert_eq!(old.trajectory_updated_ms, 0);
+        assert_eq!(old.commit_link_id, 0);
+    }
+
+    #[test]
+    fn outbox_batch_project_id_is_never_null() {
+        let conn = mem();
+        add_history_project(
+            &conn,
+            "s-path",
+            Some("/Users/khaliqgant/Projects/relayhistory"),
+            "path project prompt",
+            1,
+        );
+        add_history(&conn, "s-unknown", "no project", 2);
+        add_trajectory(
+            &conn,
+            "traj-1",
+            r#"[{"chosen":"Formik"}]"#,
+            r#"{"summary":"shipped"}"#,
+        );
+        add_commit_link(&conn, "s-path", "abc111", "cwd");
+        let none = HashSet::new();
+        let batch = build_outbox_batch(&conn, &SyncCursor::default(), 100, &none).unwrap();
+        assert!(!batch.records.is_empty());
+        assert!(batch.records.iter().all(|r| r.project_id.is_some()));
+        assert!(batch
+            .records
+            .iter()
+            .all(|r| r.project_id.as_deref() != Some("")));
+        let path_prompt = batch
+            .records
+            .iter()
+            .find(|r| r.kind == "prompt" && r.session_id == "s-path")
+            .unwrap();
+        assert_eq!(path_prompt.project_id.as_deref(), Some("relayhistory"));
+        let unknown_prompt = batch
+            .records
+            .iter()
+            .find(|r| r.kind == "prompt" && r.session_id == "s-unknown")
+            .unwrap();
+        assert_eq!(unknown_prompt.project_id.as_deref(), Some(UNKNOWN_PROJECT));
+        assert!(batch.records.iter().any(|r| r.kind == "session_outcome"));
+    }
+
+    #[test]
+    fn git_remote_of_session_cwd_becomes_repo_slug() {
+        let repo = init_git_repo("git@github.com:AgentWorkforce/relayhistory.git");
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd, parser_version) VALUES (?, 'claude', ?, 1)",
+            rusqlite::params!["s-git", repo.path().display().to_string()],
+        )
+        .unwrap();
+        add_history(&conn, "s-git", "work in the cloned repo", 1);
+        let none = HashSet::new();
+        let batch = build_outbox_batch(&conn, &SyncCursor::default(), 100, &none).unwrap();
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.records[0].kind, "prompt");
+        assert_eq!(
+            batch.records[0].project_id.as_deref(),
+            Some("AgentWorkforce/relayhistory")
+        );
+        let v = serde_json::to_value(&batch.records[0]).unwrap();
+        assert_eq!(v["projectId"], "AgentWorkforce/relayhistory");
+        assert!(!v["projectId"].is_null());
+    }
+
+    #[test]
+    fn files_touched_on_session_and_trajectory_envelopes() {
+        let conn = mem();
+        add_history_project(
+            &conn,
+            "s1",
+            Some("/Users/me/Projects/relayhistory"),
+            "edit the mapper",
+            1,
+        );
+        add_file_edit(
+            &conn,
+            "s1",
+            "/Users/me/Projects/relayhistory/src/outbox.rs",
+            "Edit",
+        );
+        add_file_edit(
+            &conn,
+            "s1",
+            "crates/ai-hist-core/src/convergence.rs",
+            "Write",
+        );
+        add_trajectory_at(
+            &conn,
+            "learn_abc",
+            r#"[{"chosen":"slug the project"}]"#,
+            r#"{"summary":"shipped"}"#,
+            5,
+            Some("learn://claude/s1"),
+        );
+        let none = HashSet::new();
+        let batch = build_outbox_batch(&conn, &SyncCursor::default(), 100, &none).unwrap();
+        let prompts: Vec<_> = batch
+            .records
+            .iter()
+            .filter(|r| r.kind == "prompt")
+            .collect();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0]
+            .files_touched
+            .iter()
+            .any(|f| f.ends_with("src/outbox.rs")));
+        assert!(prompts[0]
+            .files_touched
+            .iter()
+            .any(|f| f.ends_with("crates/ai-hist-core/src/convergence.rs")));
+        let traj: Vec<_> = batch
+            .records
+            .iter()
+            .filter(|r| r.lens.as_deref() == Some("trajectories"))
+            .collect();
+        assert!(!traj.is_empty());
+        assert!(traj
+            .iter()
+            .all(|r| r.files_touched == prompts[0].files_touched));
+        let v = serde_json::to_value(prompts[0]).unwrap();
+        assert!(v["filesTouched"].as_array().unwrap().len() >= 2);
+    }
+
+    #[test]
+    fn revised_trajectory_is_re_pushed_via_updated_ms_watermark() {
+        let conn = mem();
+        add_trajectory(
+            &conn,
+            "traj-1",
+            r#"[{"chosen":"Formik"}]"#,
+            r#"{"summary":"first draft"}"#,
+        );
+        let none = HashSet::new();
+        let first = build_outbox_batch(&conn, &SyncCursor::default(), 100, &none).unwrap();
+        assert!(first
+            .records
+            .iter()
+            .any(|r| r.content.contains("first draft")));
+        assert!(first.cursor.trajectory_rowid >= 1);
+        assert!(first.cursor.trajectory_updated_ms >= 1);
+
+        let empty = build_outbox_batch(&conn, &first.cursor, 100, &none).unwrap();
+        assert!(empty
+            .records
+            .iter()
+            .all(|r| r.lens.as_deref() != Some("trajectories")));
+
+        conn.execute(
+            "UPDATE trajectories SET retrospective_json = ?, updated_ms = ? WHERE id = ?",
+            rusqlite::params![r#"{"summary":"amended after the run"}"#, 50i64, "traj-1"],
+        )
+        .unwrap();
+        let second = build_outbox_batch(&conn, &first.cursor, 100, &none).unwrap();
+        assert!(
+            second
+                .records
+                .iter()
+                .any(|r| r.kind == "reflection" && r.content.contains("amended after the run")),
+            "revised trajectory must appear in the next batch: {:?}",
+            second
+                .records
+                .iter()
+                .map(|r| (r.kind.as_str(), r.content.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(second.cursor.trajectory_updated_ms >= 50);
+    }
+
+    #[test]
+    fn n_linked_commits_yield_n_session_outcome_envelopes() {
+        let conn = mem();
+        add_history_project(
+            &conn,
+            "s-n",
+            Some("/Users/me/Projects/relayhistory"),
+            "land the fix",
+            1,
+        );
+        for i in 1..=3 {
+            add_commit_link(&conn, "s-n", &format!("sha{i:03}"), "cwd+branch");
+        }
+        let none = HashSet::new();
+        let batch = build_outbox_batch(&conn, &SyncCursor::default(), 100, &none).unwrap();
+        let outcomes: Vec<_> = batch
+            .records
+            .iter()
+            .filter(|r| r.kind == "session_outcome")
+            .collect();
+        assert_eq!(outcomes.len(), 3);
+        let shas: Vec<_> = outcomes
+            .iter()
+            .map(|r| r.commit_sha.clone().unwrap())
+            .collect();
+        assert_eq!(shas, vec!["sha001", "sha002", "sha003"]);
+        assert!(outcomes
+            .iter()
+            .all(|r| r.match_method.as_deref() == Some("cwd+branch")));
+        assert!(outcomes
+            .iter()
+            .all(|r| r.project_id.as_deref() == Some("relayhistory")));
+        assert!(outcomes.iter().all(|r| r.confidence == Some(0.9)));
+        let v = serde_json::to_value(outcomes[0]).unwrap();
+        assert_eq!(v["kind"], "session_outcome");
+        assert_eq!(v["commitSha"], "sha001");
+        assert_eq!(v["matchMethod"], "cwd+branch");
+        assert_eq!(v["numstat"]["files"][0]["path"], "src/lib.rs");
+        assert_eq!(v["files"][0], "src/lib.rs");
+        assert_eq!(batch.cursor.commit_link_id, 3);
+
+        let empty = build_outbox_batch(&conn, &batch.cursor, 100, &none).unwrap();
+        assert!(!empty.records.iter().any(|r| r.kind == "session_outcome"));
     }
 }

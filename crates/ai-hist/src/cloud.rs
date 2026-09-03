@@ -451,8 +451,15 @@ pub fn batch_id(machine: &str, from: &SyncCursor, to: &SyncCursor, count: usize)
     format!(
         "b_{}",
         ai_hist_core::prompt_hash(&format!(
-            "{machine}:{}:{}:{}:{}:{count}",
-            from.history_id, from.trajectory_rowid, to.history_id, to.trajectory_rowid
+            "{machine}:{}:{}:{}:{}:{}:{}:{}:{}:{count}",
+            from.history_id,
+            from.trajectory_rowid,
+            from.trajectory_updated_ms,
+            from.commit_link_id,
+            to.history_id,
+            to.trajectory_rowid,
+            to.trajectory_updated_ms,
+            to.commit_link_id
         ))
     )
 }
@@ -583,6 +590,8 @@ fn push_once(
         cursors: Some(serde_json::json!({
             "history_id": batch.cursor.history_id,
             "trajectory_rowid": batch.cursor.trajectory_rowid,
+            "trajectory_updated_ms": batch.cursor.trajectory_updated_ms,
+            "commit_link_id": batch.cursor.commit_link_id,
         })),
         records: batch.records,
     };
@@ -2025,6 +2034,7 @@ mod tests {
         let to = SyncCursor {
             history_id: 5,
             trajectory_rowid: 2,
+            ..Default::default()
         };
         assert_eq!(batch_id("m1", &from, &to, 7), batch_id("m1", &from, &to, 7));
         assert_ne!(batch_id("m1", &from, &to, 7), batch_id("m1", &from, &to, 8));
@@ -2046,6 +2056,7 @@ mod tests {
             let c = SyncCursor {
                 history_id: 9,
                 trajectory_rowid: 4,
+                ..Default::default()
             };
             save_cursor(&auth.base_url, &c).unwrap();
             assert_eq!(load_cursor(&auth.base_url).unwrap(), c);

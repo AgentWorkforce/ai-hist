@@ -116,6 +116,117 @@ pub struct ConvergenceEnvelope {
     /// (confidence) are not shadow-stored here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record: Option<Value>,
+    /// Structural file-overlap signal (WS-1 optional). Populated from `file_edits`.
+    #[serde(rename = "filesTouched", skip_serializing_if = "Vec::is_empty")]
+    pub files_touched: Vec<String>,
+    /// `kind=session_outcome` fields — the cloud ingest path already accepts these.
+    #[serde(rename = "commitSha", skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(rename = "matchMethod", skip_serializing_if = "Option::is_none")]
+    pub match_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub numstat: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<Value>,
+    #[serde(rename = "shippedAt", skip_serializing_if = "Option::is_none")]
+    pub shipped_at: Option<String>,
+}
+
+/// Explicit project id when nothing resolvable is known. Never omitted (`None`) on
+/// the wire — the cloud Pair filter drops NULL/empty `projectId` once capture lands.
+pub const UNKNOWN_PROJECT: &str = "unknown";
+
+/// Canonical project id for the cloud `project_aliases` table: a repo slug
+/// (`owner/repo` or a short name), never a filesystem path.
+///
+/// `project` (from `history.project` / `trajectories.project_id`) wins; `git_remote`
+/// is the session-cwd fallback. Empty / unparseable → [`UNKNOWN_PROJECT`].
+pub fn resolve_project_id(project: Option<&str>, git_remote: Option<&str>) -> String {
+    if let Some(project) = nonempty(project) {
+        return normalize_project_id(project);
+    }
+    if let Some(remote) = nonempty(git_remote) {
+        return normalize_project_id(remote);
+    }
+    UNKNOWN_PROJECT.to_string()
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn normalize_project_id(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return UNKNOWN_PROJECT.to_string();
+    }
+    if let Some(slug) = slug_from_git_remote(raw) {
+        return slug;
+    }
+    if is_filesystem_path(raw) {
+        let slug = last_path_component(raw);
+        return if slug.is_empty() {
+            UNKNOWN_PROJECT.to_string()
+        } else {
+            slug
+        };
+    }
+    raw.trim_end_matches('/').to_string()
+}
+
+fn is_filesystem_path(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    s.starts_with('/')
+        || s.starts_with('~')
+        || s.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/'))
+}
+
+fn last_path_component(s: &str) -> String {
+    s.replace('\\', "/")
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// `git@host:owner/repo.git` / `https://host/owner/repo.git` → `owner/repo`.
+fn slug_from_git_remote(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let path = if let Some(rest) = s.strip_prefix("git@") {
+        rest.split_once(':')?.1.to_string()
+    } else if s.contains("://") {
+        let after_scheme = s.split_once("://")?.1;
+        let host_and_path = after_scheme
+            .rsplit_once('@')
+            .map(|(_, host)| host)
+            .unwrap_or(after_scheme);
+        let (_, path) = host_and_path.split_once('/')?;
+        path.to_string()
+    } else if s.contains('@') && s.contains(':') && !s.contains("://") {
+        s.split_once(':')?.1.to_string()
+    } else {
+        return None;
+    };
+    let mut path = path;
+    if let Some(cut) = path.find(['?', '#']) {
+        path.truncate(cut);
+    }
+    let path = path.trim_start_matches('/').trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
 }
 
 /// Canonical retrospective `kind`s (ratified WS-1 ADR). The eventId prefix equals the
@@ -128,8 +239,18 @@ const KIND_FINDING: &str = "finding";
 /// Map a `HistoryEntry` prompt row into a `prompt` convergence event.
 ///
 /// eventId is deterministic from `(timestamp_ms, prompt_hash)` so re-syncs are idempotent
-/// even when the row carries no session id.
+/// even when the row carries no session id. `projectId` is always a slug (or
+/// [`UNKNOWN_PROJECT`]), never `None`.
 pub fn map_history_entry(entry: &HistoryEntry) -> ConvergenceEnvelope {
+    map_history_entry_with(entry, None, Vec::new())
+}
+
+/// Like [`map_history_entry`], with a git-remote fallback and `filesTouched`.
+pub fn map_history_entry_with(
+    entry: &HistoryEntry,
+    git_remote: Option<&str>,
+    files_touched: Vec<String>,
+) -> ConvergenceEnvelope {
     let session_id = entry
         .session_id
         .clone()
@@ -152,12 +273,118 @@ pub fn map_history_entry(entry: &HistoryEntry) -> ConvergenceEnvelope {
         confidence: None,
         tags: Vec::new(),
         actor_name: None,
-        project_id: None,
+        project_id: Some(resolve_project_id(entry.project.as_deref(), git_remote)),
         task_title: None,
         task_description: None,
         task_status: None,
         task_ref: None,
         record: None,
+        files_touched: normalize_files_touched(files_touched),
+        commit_sha: None,
+        repo: None,
+        branch: None,
+        match_method: None,
+        numstat: None,
+        files: None,
+        shipped_at: None,
+    }
+}
+
+/// A `session_commit_links` row, mapped to a `kind=session_outcome` envelope.
+pub struct SessionCommitLink<'a> {
+    pub source: &'a str,
+    pub session_id: &'a str,
+    pub repo: Option<&'a str>,
+    pub branch: Option<&'a str>,
+    pub commit_sha: &'a str,
+    pub match_method: &'a str,
+    pub confidence: f64,
+    pub files_json: Option<&'a str>,
+    pub numstat_json: Option<&'a str>,
+    pub created_at_ms: i64,
+}
+
+/// One envelope per linked commit. Shape matches cloud `OutcomeEnvelope`
+/// (`commitSha`, `matchMethod`, `numstat`, `files`) plus WS-1 `projectId` /
+/// `filesTouched`.
+pub fn map_session_outcome(
+    link: &SessionCommitLink<'_>,
+    project_id: &str,
+    files_touched: Vec<String>,
+) -> ConvergenceEnvelope {
+    let sha = link.commit_sha.trim();
+    let method = link.match_method.trim();
+    ConvergenceEnvelope {
+        v: 1,
+        kind: "session_outcome".to_string(),
+        source: link.source.to_string(),
+        lens: Some("history".to_string()),
+        session_id: link.session_id.to_string(),
+        event_id: format!("session_outcome:{}:{sha}", link.session_id),
+        ts: epoch_ms_to_iso(link.created_at_ms),
+        event_type: "session_outcome".to_string(),
+        content: format!("session linked to commit {sha} via {method}"),
+        significance: None,
+        confidence: Some(link.confidence),
+        tags: Vec::new(),
+        actor_name: None,
+        project_id: Some(resolve_project_id(Some(project_id), None)),
+        task_title: None,
+        task_description: None,
+        task_status: None,
+        task_ref: None,
+        record: None,
+        files_touched: normalize_files_touched(files_touched),
+        commit_sha: Some(sha.to_string()),
+        repo: nonempty(link.repo).map(normalize_home_path),
+        branch: nonempty(link.branch).map(str::to_string),
+        match_method: Some(method.to_string()),
+        numstat: wrap_numstat(link.numstat_json),
+        files: parse_files_json(link.files_json),
+        shipped_at: Some(epoch_ms_to_iso(link.created_at_ms)),
+    }
+}
+
+fn normalize_files_touched(files: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for file in files {
+        let normalized = normalize_home_path(file.trim());
+        if !normalized.is_empty() && !out.iter().any(|existing| existing == &normalized) {
+            out.push(normalized);
+        }
+    }
+    out
+}
+
+fn wrap_numstat(raw: Option<&str>) -> Option<Value> {
+    let parsed: Value = serde_json::from_str(nonempty(raw)?).ok()?;
+    match parsed {
+        Value::Array(_) => Some(json!({ "files": parsed })),
+        Value::Object(_) => Some(parsed),
+        _ => None,
+    }
+}
+
+fn parse_files_json(raw: Option<&str>) -> Option<Value> {
+    let parsed: Value = serde_json::from_str(nonempty(raw)?).ok()?;
+    match parsed {
+        Value::Array(items) => Some(Value::Array(
+            items.into_iter().map(normalize_file_value).collect(),
+        )),
+        _ => None,
+    }
+}
+
+fn normalize_file_value(value: Value) -> Value {
+    match value {
+        Value::String(path) => Value::String(normalize_home_path(&path)),
+        Value::Object(mut map) => {
+            if let Some(Value::String(path)) = map.get("path").cloned() {
+                map.insert("path".into(), json!(normalize_home_path(&path)));
+            }
+            Value::Object(map)
+        }
+        other => other,
     }
 }
 
@@ -226,7 +453,7 @@ pub fn map_trajectory(row: &TrajectoryRow<'_>) -> Vec<ConvergenceEnvelope> {
     let task_title = owned(row.task_title);
     let task_description = owned(row.task_description);
     let task_status = owned(row.status);
-    let project_id = owned(row.project_id);
+    let project_id = Some(resolve_project_id(row.project_id, None));
     // taskRef: bounded cross-lens correlation seed (None until ai-hist persists task.source).
     let task_ref_json = row
         .task_ref
@@ -277,6 +504,14 @@ pub fn map_trajectory(row: &TrajectoryRow<'_>) -> Vec<ConvergenceEnvelope> {
                 task_status: task_status.clone(),
                 task_ref: task_ref_json.clone(),
                 record: decision_record(d), // chosen/alternatives only
+                files_touched: Vec::new(),
+                commit_sha: None,
+                repo: None,
+                branch: None,
+                match_method: None,
+                numstat: None,
+                files: None,
+                shipped_at: None,
             });
         }
     }
@@ -311,6 +546,14 @@ pub fn map_trajectory(row: &TrajectoryRow<'_>) -> Vec<ConvergenceEnvelope> {
                     task_status: task_status.clone(),
                     task_ref: task_ref_json.clone(),
                     record: None,
+                    files_touched: Vec::new(),
+                    commit_sha: None,
+                    repo: None,
+                    branch: None,
+                    match_method: None,
+                    numstat: None,
+                    files: None,
+                    shipped_at: None,
                 });
             };
 
@@ -417,6 +660,14 @@ fn compacted_event(
         task_status: task_status.map(str::to_string),
         task_ref: task_ref.cloned(),
         record,
+        files_touched: Vec::new(),
+        commit_sha: None,
+        repo: None,
+        branch: None,
+        match_method: None,
+        numstat: None,
+        files: None,
+        shipped_at: None,
     })
 }
 
@@ -1173,6 +1424,102 @@ mod tests {
         assert_eq!(env.event_id, "prompt:1782036000000:abc123");
         assert_eq!(env.ts, "2026-06-21T10:00:00.000Z");
         assert_eq!(env.content, "fix the auth bug");
+        assert_eq!(env.project_id.as_deref(), Some("p"));
+        assert!(env.project_id.is_some());
+    }
+
+    #[test]
+    fn project_id_mapping_path_git_remote_and_unknown() {
+        // path project → last component, never a filesystem path on the wire
+        assert_eq!(
+            resolve_project_id(Some("/Users/khaliqgant/Projects/relayhistory"), None),
+            "relayhistory"
+        );
+        assert_eq!(
+            resolve_project_id(Some(r"C:\Users\alice\Projects\my-app"), None),
+            "my-app"
+        );
+        // git-remote project → owner/repo slug
+        assert_eq!(
+            resolve_project_id(None, Some("git@github.com:AgentWorkforce/relayhistory.git")),
+            "AgentWorkforce/relayhistory"
+        );
+        assert_eq!(
+            resolve_project_id(
+                None,
+                Some("https://github.com/AgentWorkforce/relayhistory.git")
+            ),
+            "AgentWorkforce/relayhistory"
+        );
+        // unknown → explicit "unknown", never NULL
+        assert_eq!(resolve_project_id(None, None), UNKNOWN_PROJECT);
+        assert_eq!(resolve_project_id(Some("  "), Some("")), UNKNOWN_PROJECT);
+        let unknown = map_history_entry(&HistoryEntry {
+            id: 1,
+            source: "claude".into(),
+            session_id: Some("s".into()),
+            project: None,
+            prompt: "hi".into(),
+            prompt_hash: Some("h".into()),
+            timestamp_ms: 0,
+        });
+        assert_eq!(unknown.kind, "prompt");
+        assert_eq!(unknown.project_id.as_deref(), Some(UNKNOWN_PROJECT));
+        let v = serde_json::to_value(&unknown).unwrap();
+        assert_eq!(v["projectId"], UNKNOWN_PROJECT);
+        assert!(!v["projectId"].is_null());
+        // history.project wins over git remote
+        assert_eq!(
+            resolve_project_id(
+                Some("/tmp/other-app"),
+                Some("git@github.com:AgentWorkforce/relayhistory.git")
+            ),
+            "other-app"
+        );
+    }
+
+    #[test]
+    fn session_outcome_envelope_shape() {
+        let env = map_session_outcome(
+            &SessionCommitLink {
+                source: "claude",
+                session_id: "s1",
+                repo: Some("/Users/khaliqgant/Projects/relayhistory"),
+                branch: Some("feat/x"),
+                commit_sha: "abc123def",
+                match_method: "cwd+branch",
+                confidence: 0.91,
+                files_json: Some(r#"["src/lib.rs","src/main.rs"]"#),
+                numstat_json: Some(r#"[{"path":"src/lib.rs","additions":3,"deletions":1}]"#),
+                created_at_ms: 1_782_036_000_000,
+            },
+            "relayhistory",
+            vec!["/Users/khaliqgant/Projects/relayhistory/src/lib.rs".into()],
+        );
+        assert_eq!(env.kind, "session_outcome");
+        assert_eq!(env.source, "claude");
+        assert_eq!(env.session_id, "s1");
+        assert_eq!(env.event_id, "session_outcome:s1:abc123def");
+        assert_eq!(env.project_id.as_deref(), Some("relayhistory"));
+        assert_eq!(env.commit_sha.as_deref(), Some("abc123def"));
+        assert_eq!(env.match_method.as_deref(), Some("cwd+branch"));
+        assert_eq!(env.confidence, Some(0.91));
+        assert_eq!(
+            env.files_touched,
+            vec!["/Users/~/Projects/relayhistory/src/lib.rs"]
+        );
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["kind"], "session_outcome");
+        assert_eq!(v["commitSha"], "abc123def");
+        assert_eq!(v["matchMethod"], "cwd+branch");
+        assert_eq!(v["projectId"], "relayhistory");
+        assert_eq!(
+            v["filesTouched"][0],
+            "/Users/~/Projects/relayhistory/src/lib.rs"
+        );
+        assert_eq!(v["files"][0], "src/lib.rs");
+        assert_eq!(v["numstat"]["files"][0]["path"], "src/lib.rs");
+        assert_eq!(v["repo"], "/Users/~/Projects/relayhistory");
     }
 
     #[test]
@@ -1230,5 +1577,7 @@ mod tests {
         // confidence emitted as null (not skipped)
         assert!(v.get("confidence").is_some());
         assert!(v["confidence"].is_null());
+        // projectId is always present (never NULL)
+        assert_eq!(v["projectId"], UNKNOWN_PROJECT);
     }
 }
