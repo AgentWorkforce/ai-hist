@@ -352,10 +352,7 @@ pub fn load_cursor(base_url: &str) -> Result<SyncCursor> {
 pub fn save_cursor(base_url: &str, cursor: &SyncCursor) -> Result<()> {
     let _cursor_lock = acquire_cursor_lock(base_url)?;
     let current = load_cursor(base_url)?;
-    let merged = SyncCursor {
-        history_id: current.history_id.max(cursor.history_id),
-        trajectory_rowid: current.trajectory_rowid.max(cursor.trajectory_rowid),
-    };
+    let merged = current.merge_max(cursor);
     write_private(
         &cursor_path(base_url)?,
         &serde_json::to_string_pretty(&merged)?,
@@ -451,8 +448,19 @@ pub fn batch_id(machine: &str, from: &SyncCursor, to: &SyncCursor, count: usize)
     format!(
         "b_{}",
         ai_hist_core::prompt_hash(&format!(
-            "{machine}:{}:{}:{}:{}:{count}",
-            from.history_id, from.trajectory_rowid, to.history_id, to.trajectory_rowid
+            "{machine}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{count}",
+            from.history_id,
+            from.trajectory_rowid,
+            from.trajectory_updated_ms,
+            from.commit_link_id,
+            from.file_edit_id,
+            from.capture_version,
+            to.history_id,
+            to.trajectory_rowid,
+            to.trajectory_updated_ms,
+            to.commit_link_id,
+            to.file_edit_id,
+            to.capture_version
         ))
     )
 }
@@ -583,6 +591,10 @@ fn push_once(
         cursors: Some(serde_json::json!({
             "history_id": batch.cursor.history_id,
             "trajectory_rowid": batch.cursor.trajectory_rowid,
+            "trajectory_updated_ms": batch.cursor.trajectory_updated_ms,
+            "commit_link_id": batch.cursor.commit_link_id,
+            "file_edit_id": batch.cursor.file_edit_id,
+            "capture_version": batch.cursor.capture_version,
         })),
         records: batch.records,
     };
@@ -1798,15 +1810,22 @@ mod tests {
                 &SyncCursor {
                     history_id: 100,
                     trajectory_rowid: 1,
+                    trajectory_updated_ms: 50,
+                    commit_link_id: 2,
+                    ..Default::default()
                 },
             )
             .unwrap();
-            // Even a later stale writer cannot rewind either watermark.
+            // Even a later stale writer cannot rewind history/commit ids, or the
+            // trajectory keyset position (updated_ms, rowid) as a single pair.
             save_cursor(
                 base_url,
                 &SyncCursor {
                     history_id: 1,
                     trajectory_rowid: 100,
+                    trajectory_updated_ms: 5,
+                    commit_link_id: 20,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1814,7 +1833,10 @@ mod tests {
                 load_cursor(base_url).unwrap(),
                 SyncCursor {
                     history_id: 100,
-                    trajectory_rowid: 100,
+                    trajectory_rowid: 1,
+                    trajectory_updated_ms: 50,
+                    commit_link_id: 20,
+                    ..Default::default()
                 }
             );
 
@@ -1826,11 +1848,13 @@ mod tests {
                             SyncCursor {
                                 history_id: 100 + revision,
                                 trajectory_rowid: 1,
+                                ..Default::default()
                             }
                         } else {
                             SyncCursor {
                                 history_id: 1,
                                 trajectory_rowid: 100 + revision,
+                                ..Default::default()
                             }
                         };
                         save_cursor("http://localhost:8787", &cursor).unwrap();
@@ -1844,7 +1868,10 @@ mod tests {
                 load_cursor(base_url).unwrap(),
                 SyncCursor {
                     history_id: 125,
-                    trajectory_rowid: 125,
+                    trajectory_rowid: 1,
+                    trajectory_updated_ms: 50,
+                    commit_link_id: 20,
+                    ..Default::default()
                 }
             );
         });
@@ -2025,6 +2052,7 @@ mod tests {
         let to = SyncCursor {
             history_id: 5,
             trajectory_rowid: 2,
+            ..Default::default()
         };
         assert_eq!(batch_id("m1", &from, &to, 7), batch_id("m1", &from, &to, 7));
         assert_ne!(batch_id("m1", &from, &to, 7), batch_id("m1", &from, &to, 8));
@@ -2046,6 +2074,7 @@ mod tests {
             let c = SyncCursor {
                 history_id: 9,
                 trajectory_rowid: 4,
+                ..Default::default()
             };
             save_cursor(&auth.base_url, &c).unwrap();
             assert_eq!(load_cursor(&auth.base_url).unwrap(), c);
@@ -2299,6 +2328,7 @@ mod tests {
             let cursor = SyncCursor {
                 history_id: 17,
                 trajectory_rowid: 3,
+                ..Default::default()
             };
             save_cursor(&auth.base_url, &cursor).unwrap();
 
@@ -2346,6 +2376,7 @@ mod tests {
             let legacy_cursor = SyncCursor {
                 history_id: 900,
                 trajectory_rowid: 42,
+                ..Default::default()
             };
             write_private(
                 &legacy_cursor_path(),
@@ -2386,10 +2417,12 @@ mod tests {
             let prod_cursor = SyncCursor {
                 history_id: 101,
                 trajectory_rowid: 7,
+                ..Default::default()
             };
             let dev_cursor = SyncCursor {
                 history_id: 9,
                 trajectory_rowid: 2,
+                ..Default::default()
             };
 
             save_auth(&prod).unwrap();
