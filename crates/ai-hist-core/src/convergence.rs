@@ -143,14 +143,48 @@ pub const UNKNOWN_PROJECT: &str = "unknown";
 /// Canonical project id for the cloud `project_aliases` table: a repo slug
 /// (`owner/repo` or a short name), never a filesystem path.
 ///
-/// `project` (from `history.project` / `trajectories.project_id`) wins; `git_remote`
-/// is the session-cwd fallback. Empty / unparseable → [`UNKNOWN_PROJECT`].
+/// Precedence, in order:
+///
+/// 1. an EXPLICIT `project` that is not a filesystem path — a deliberate label
+///    (`trajectories.project_id`) always wins, because a human chose it
+/// 2. the session's `git_remote`, which yields `owner/repo`
+/// 3. the `project` path's last component
+/// 4. [`UNKNOWN_PROJECT`]
+///
+/// A path used to win outright, and that is what fragmented the store. In practice
+/// `project` is the harness's cwd, so the remote was resolved on every call and then
+/// discarded, and `normalize_project_id` reduced the path to its last segment. Every
+/// worktree and every subdirectory of one repo therefore became its own project:
+/// `relayfile`, `relayfile-6e8d1a5c`, `relayfile-fork`, `relayfile-dev-collab` — and
+/// an agent working in `cloud/packages/web` filed its work under `web`. On
+/// 2026-09-04 the production store held 45,394 distinct ids for a few dozen repos,
+/// 142 of them for `cloud` alone, while only 128 events out of 274,264 carried the
+/// `owner/repo` form that `GET /v1/sessions?project=` is queried with.
+///
+/// The remote is the one identifier that is stable across worktrees, checkouts and
+/// subdirectories, so it now outranks a path. It does NOT outrank an explicit label:
+/// overriding a deliberately chosen project id with the repo it happens to live in
+/// would lose information rather than canonicalise it.
 pub fn resolve_project_id(project: Option<&str>, git_remote: Option<&str>) -> String {
-    if let Some(project) = nonempty(project) {
-        return normalize_project_id(project);
+    let project = nonempty(project);
+
+    // An explicit, non-path label is a deliberate choice — keep it.
+    if let Some(project) = project {
+        if !is_filesystem_path(project) {
+            return normalize_project_id(project);
+        }
     }
+
+    // Otherwise prefer the remote, which is stable across worktrees and subdirectories.
     if let Some(remote) = nonempty(git_remote) {
-        return normalize_project_id(remote);
+        let resolved = normalize_project_id(remote);
+        if resolved != UNKNOWN_PROJECT {
+            return resolved;
+        }
+    }
+
+    if let Some(project) = project {
+        return normalize_project_id(project);
     }
     UNKNOWN_PROJECT.to_string()
 }
@@ -1530,10 +1564,23 @@ mod tests {
         let v = serde_json::to_value(&unknown).unwrap();
         assert_eq!(v["projectId"], UNKNOWN_PROJECT);
         assert!(!v["projectId"].is_null());
-        // history.project wins over git remote
+        // The git remote wins over a cwd PATH. This inverted a previous assertion
+        // ("history.project wins over git remote"), deliberately: a path is the
+        // harness's working directory, so preferring it made every worktree and
+        // subdirectory its own project and left the store with 45,394 distinct ids
+        // for a few dozen repos.
         assert_eq!(
             resolve_project_id(
                 Some("/tmp/other-app"),
+                Some("git@github.com:AgentWorkforce/relayhistory.git")
+            ),
+            "AgentWorkforce/relayhistory"
+        );
+        // An explicit, non-path label still wins — that half of the old contract
+        // survives, because a chosen id carries intent a repo name does not.
+        assert_eq!(
+            resolve_project_id(
+                Some("other-app"),
                 Some("git@github.com:AgentWorkforce/relayhistory.git")
             ),
             "other-app"
@@ -1754,5 +1801,93 @@ mod tests {
 
         let without = map_history_entry_with(&entry, None, Vec::new(), None);
         assert!(without.task_ref.is_none());
+    }
+
+    /// The production store held 45,394 distinct project ids for a few dozen repos
+    /// because the harness cwd outranked the git remote and was then reduced to its
+    /// last path segment. These pin the precedence that fixes it.
+    mod project_id_precedence {
+        use super::super::{resolve_project_id, UNKNOWN_PROJECT};
+
+        const REMOTE: &str = "git@github.com:AgentWorkforce/relayfile.git";
+
+        #[test]
+        fn a_worktree_path_resolves_to_the_repo_not_the_directory() {
+            // The bug: `relayfile-live-review-vhs`, `relayfile-6e8d1a5c` and
+            // `relayfile-fork` were three different projects to every consumer.
+            for cwd in [
+                "/Users/k/Projects/AgentWorkforce/relayfile",
+                "/Users/k/Projects/AgentWorkforce/relayfile-6e8d1a5c",
+                "/Users/k/Projects/AgentWorkforce/relayfile-live-review-vhs",
+                "/Users/k/Projects/AgentWorkforce/relayfile-fork",
+            ] {
+                assert_eq!(
+                    resolve_project_id(Some(cwd), Some(REMOTE)),
+                    "AgentWorkforce/relayfile",
+                    "worktree {cwd} must resolve to the repo"
+                );
+            }
+        }
+
+        #[test]
+        fn a_subdirectory_resolves_to_the_repo_not_the_subdirectory() {
+            // An agent working in cloud/packages/web filed its work under `web`,
+            // which is why `web` and `sdk` appear as top-level projects.
+            assert_eq!(
+                resolve_project_id(
+                    Some("/Users/k/Projects/AgentWorkforce/cloud/packages/web"),
+                    Some("git@github.com:AgentWorkforce/cloud.git"),
+                ),
+                "AgentWorkforce/cloud"
+            );
+        }
+
+        #[test]
+        fn an_explicit_label_still_wins_over_the_remote() {
+            // A deliberately chosen project id carries intent the repo name does not.
+            // Overriding it would lose information rather than canonicalise it.
+            assert_eq!(
+                resolve_project_id(Some("relayfile-demo-readiness-0901"), Some(REMOTE)),
+                "relayfile-demo-readiness-0901"
+            );
+        }
+
+        #[test]
+        fn a_path_falls_back_to_its_last_component_when_there_is_no_remote() {
+            // Not every checkout has an origin. Previous behaviour is preserved.
+            assert_eq!(
+                resolve_project_id(Some("/Users/k/Projects/AgentWorkforce/relayfile"), None),
+                "relayfile"
+            );
+        }
+
+        #[test]
+        fn an_unparseable_remote_does_not_swallow_the_path() {
+            // A remote that yields nothing must not turn a usable path into `unknown`.
+            assert_eq!(
+                resolve_project_id(
+                    Some("/Users/k/Projects/AgentWorkforce/relayfile"),
+                    Some("   ")
+                ),
+                "relayfile"
+            );
+        }
+
+        #[test]
+        fn nothing_resolvable_is_still_unknown() {
+            assert_eq!(resolve_project_id(None, None), UNKNOWN_PROJECT);
+        }
+
+        #[test]
+        fn https_and_ssh_remotes_agree() {
+            // The same checkout must not change identity with the clone URL used.
+            assert_eq!(
+                resolve_project_id(
+                    Some("/tmp/wt"),
+                    Some("https://github.com/AgentWorkforce/relayfile.git")
+                ),
+                resolve_project_id(Some("/tmp/wt"), Some(REMOTE)),
+            );
+        }
     }
 }
