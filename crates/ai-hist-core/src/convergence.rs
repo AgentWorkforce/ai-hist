@@ -176,10 +176,15 @@ pub fn resolve_project_id(project: Option<&str>, git_remote: Option<&str>) -> St
     }
 
     // Otherwise prefer the remote, which is stable across worktrees and subdirectories.
+    //
+    // `slug_from_git_remote`, NOT `normalize_project_id`: only a value that actually
+    // parses as a repository remote may outrank a usable path. `normalize_project_id`
+    // accepts any non-path string, so a malformed remote (`not-a-git-remote`, or a local
+    // origin like `../repo.git`) would be taken as the project id and would discard a
+    // perfectly good cwd — trading one noncanonical id for another.
     if let Some(remote) = nonempty(git_remote) {
-        let resolved = normalize_project_id(remote);
-        if resolved != UNKNOWN_PROJECT {
-            return resolved;
+        if let Some(slug) = slug_from_git_remote(remote) {
+            return slug;
         }
     }
 
@@ -212,7 +217,7 @@ fn normalize_project_id(raw: &str) -> String {
     raw.trim_end_matches('/').to_string()
 }
 
-fn is_filesystem_path(s: &str) -> bool {
+pub(crate) fn is_filesystem_path(s: &str) -> bool {
     let bytes = s.as_bytes();
     s.starts_with('/')
         || s.starts_with('~')
@@ -1863,14 +1868,23 @@ mod tests {
 
         #[test]
         fn an_unparseable_remote_does_not_swallow_the_path() {
-            // A remote that yields nothing must not turn a usable path into `unknown`.
-            assert_eq!(
-                resolve_project_id(
-                    Some("/Users/k/Projects/AgentWorkforce/relayfile"),
-                    Some("   ")
-                ),
-                "relayfile"
-            );
+            // NON-EMPTY malformed remotes. The earlier version of this test passed
+            // whitespace, which `nonempty` strips before the remote branch is reached —
+            // it asserted nothing about the behaviour it named.
+            //
+            // `normalize_project_id` accepts any non-path string, so without requiring a
+            // parsed slug each of these would become the project id and discard a
+            // perfectly usable path — trading one noncanonical id for another.
+            for bogus in ["not-a-git-remote", "../repo.git", "origin", "   "] {
+                assert_eq!(
+                    resolve_project_id(
+                        Some("/Users/k/Projects/AgentWorkforce/relayfile"),
+                        Some(bogus)
+                    ),
+                    "relayfile",
+                    "remote {bogus:?} does not parse as a repo slug and must not win"
+                );
+            }
         }
 
         #[test]

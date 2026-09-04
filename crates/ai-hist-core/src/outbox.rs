@@ -489,11 +489,16 @@ fn git_remote_for_entry(
     entry: &HistoryEntry,
     remotes: &mut HashMap<String, Option<String>>,
 ) -> Option<String> {
+    // Only an EXPLICIT, non-path project makes the remote unnecessary. When the entry
+    // carries its cwd — the common case, and the one the fragmentation comes from —
+    // the remote is exactly what we need, so returning None here made
+    // `resolve_project_id`'s remote preference unreachable on the publishing path and
+    // the cwd basename went out unchanged.
     if entry
         .project
         .as_deref()
         .map(str::trim)
-        .is_some_and(|s| !s.is_empty())
+        .is_some_and(|s| !s.is_empty() && !crate::convergence::is_filesystem_path(s))
     {
         return None;
     }
@@ -669,6 +674,93 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// A path-valued `project` must NOT suppress the remote lookup.
+    ///
+    /// This is the test whose absence let the first version of the fix ship inert.
+    /// `resolve_project_id` learned to prefer the remote, but `git_remote_for_entry`
+    /// returned `None` for ANY non-empty `project` — and `project` is the cwd in the
+    /// common case, so the publishing path never had a remote to prefer and kept
+    /// emitting the cwd basename. Unit tests on `resolve_project_id` all passed.
+    #[test]
+    fn a_path_valued_project_still_fetches_the_git_remote() {
+        let repo = tempfile::tempdir().unwrap();
+        let cwd = repo.path().to_str().unwrap().to_string();
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:AgentWorkforce/relayfile.git",
+            ],
+        ] {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&cwd)
+                .args(&args)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                return; // no usable git in this environment; nothing to assert
+            }
+        }
+
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd, parser_version) VALUES ('s-path','claude',?1,1)",
+            rusqlite::params![cwd],
+        )
+        .unwrap();
+
+        let mut remotes = HashMap::new();
+        let entry = HistoryEntry {
+            id: 1,
+            source: "claude".into(),
+            session_id: Some("s-path".into()),
+            // The cwd, exactly as the harness records it.
+            project: Some(cwd.clone()),
+            prompt: "hi".into(),
+            prompt_hash: Some("h".into()),
+            timestamp_ms: 0,
+        };
+
+        let remote = git_remote_for_entry(&conn, &entry, &mut remotes);
+        assert!(
+            remote.is_some(),
+            "a path-valued project must still resolve the remote, or the cwd basename goes out unchanged"
+        );
+        assert_eq!(
+            crate::convergence::resolve_project_id(entry.project.as_deref(), remote.as_deref()),
+            "AgentWorkforce/relayfile"
+        );
+    }
+
+    /// The other half: an explicit label is a deliberate choice, so the remote lookup
+    /// stays skipped and the label survives.
+    #[test]
+    fn an_explicit_label_skips_the_remote_lookup() {
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd, parser_version) VALUES ('s-label','claude','/tmp/whatever',1)",
+            [],
+        )
+        .unwrap();
+
+        let mut remotes = HashMap::new();
+        let entry = HistoryEntry {
+            id: 1,
+            source: "claude".into(),
+            session_id: Some("s-label".into()),
+            project: Some("relayfile-demo-readiness-0901".into()),
+            prompt: "hi".into(),
+            prompt_hash: Some("h".into()),
+            timestamp_ms: 0,
+        };
+
+        assert!(git_remote_for_entry(&conn, &entry, &mut remotes).is_none());
     }
 
     fn add_trajectory(conn: &Connection, id: &str, decisions: &str, retro: &str) {
